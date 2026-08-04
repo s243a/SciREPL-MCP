@@ -1,0 +1,61 @@
+{
+  "name": "scirepl-mcp",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Auditable host-side MCP, remote-agent, and optional terminal bridge for SciREPL Pro",
+  "type": "module",
+  "bin": {
+    "scirepl-mcp": "src/broker.mjs"
+  },
+  "files": [
+    "src",
+    "docs",
+    "README.md",
+    "SECURITY.md",
+    "PROVENANCE.md",
+    "THIRD_PARTY_NOTICES.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "start": "node src/broker.mjs",
+    "check": "node --check src/broker.mjs",
+    "test": "node test/security.test.mjs && node test/broker.test.mjs && node test/missing-agent.test.mjs && node test/term.test.mjs",
+    "test:security": "node test/security.test.mjs",
+    "test:broker": "node test/broker.test.mjs",
+    "test:term": "node test/term.test.mjs",
+    "test:agent": "node test/agent.test.mjs",
+    "test:missing-agent": "node test/missing-agent.test.mjs",
+    "test:session": "node test/session.test.mjs",
+    "test:oneshot": "node test/oneshot.test.mjs",
+    "test:oneshot:notebook": "node test/oneshot-notebook.test.mjs",
+    "audit": "npm audit --omit=dev"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "keywords": [
+    "scirepl",
+    "mcp",
+    "model-context-protocol",
+    "notebook",
+    "android",
+    "remote-agent"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/s243a/SciREPL-MCP.git"
+  },
+  "homepage": "https://github.com/s243a/SciREPL-MCP#readme",
+  "bugs": {
+    "url": "https://github.com/s243a/SciREPL-MCP/issues"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "ws": "^8.21.2"
+  },
+  "optionalDependencies": {
+    "node-pty": "^1.1.0"
+  }
+}

@@ -121,8 +121,11 @@ required.
 
 The broker itself is plain ECMAScript and has no compile or bundle step. Default
 setup runs `npm ci --omit=optional`. Terminal setup runs the full `npm ci` and
-then verifies that `node-pty` loads for the target operating system and CPU. Do
-not copy `node_modules` between machines.
+then verifies `node-pty` for the target operating system and CPU by opening a
+real PTY. Do not copy `node_modules` between machines. On macOS, setup also
+repairs a missing execute bit in `node-pty` 1.1.0's packaged helper before that
+smoke test; this repair is platform-guarded and does not alter Linux or Windows
+dependency files.
 
 The token is never printed by setup. Display it locally when pairing a device:
 
@@ -244,12 +247,18 @@ not turn an agent CLI into a sandbox.
 
 ## Platforms
 
-- **Linux, macOS, and WSL:** supported for the core broker. WSL is recommended
-  over native Windows for terminal and agent modes because those paths currently
-  assume POSIX shell behaviour.
+- **Linux and WSL:** supported for the core broker, agent adapters, and optional
+  terminal. The current implementation has been exercised directly under WSL.
+- **macOS:** supported by the same POSIX paths and tested automatically on a
+  GitHub-hosted macOS runner. It has not yet been exercised on a maintainer-owned
+  Mac or as a macOS app.
 - **Android/Termux:** the core broker is JavaScript and can run under a current
-  Termux Node.js package. Build `node-pty` on that same device if terminal mode is
-  required. See the [platform guide](https://github.com/s243a/SciREPL-MCP/blob/main/docs/platforms.md).
+  Termux Node.js package and has been exercised directly in Termux. Build
+  `node-pty` on that same device if terminal mode is required. See the
+  [platform guide](https://github.com/s243a/SciREPL-MCP/blob/main/docs/platforms.md).
+- **Native Windows:** core bridge only. A future Windows terminal profile could
+  use `node-pty`/ConPTY with PowerShell, but it is not implemented; use WSL for
+  agent and terminal modes today.
 - **Other devices:** install Node.js locally, clone the repository, and run
   `npm ci --omit=optional` first. Add `node-pty` only after the core bridge works.
 

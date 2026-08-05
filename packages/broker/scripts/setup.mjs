@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { prepareNodePty } from '../src/node-pty-support.mjs';
 import { preflightWorkspace, randomToken, setupWorkspace, targetState, writePrivateFile } from '../src/workspace.mjs';
 
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
@@ -242,10 +243,33 @@ function verifyCoreDependencies(options) {
 
 function verifyTerminalDependency(options) {
     if (!options.enableTerminal || options.dryRun) return;
-    const result = spawnSync(process.execPath, ['-e', "import('node-pty').catch(error => { console.error(error.message); process.exit(1); })"], {
+    try {
+        prepareNodePty();
+    } catch (error) {
+        throw new Error(`terminal support could not prepare node-pty for this OS/CPU: ${error.message || error}`);
+    }
+    const expression = `
+        import('node-pty').then(module => {
+            const pty = module.default || module;
+            const shell = process.env.SHELL || '/bin/sh';
+            let child;
+            try {
+                child = pty.spawn(shell, ['-c', 'exit 0'], {
+                    name: 'xterm-256color', cols: 80, rows: 24,
+                    cwd: process.cwd(), env: process.env,
+                });
+            } catch (error) {
+                console.error(error.message || error);
+                process.exit(1);
+            }
+            const timer = setTimeout(() => { try { child.kill(); } catch (_) {} process.exit(1); }, 5000);
+            child.onExit(({ exitCode }) => { clearTimeout(timer); process.exit(exitCode === 0 ? 0 : 1); });
+        }).catch(error => { console.error(error.message); process.exit(1); });`;
+    const result = spawnSync(process.execPath, ['-e', expression], {
         cwd: PACKAGE_DIR,
         encoding: 'utf8',
         shell: false,
+        timeout: 10000,
     });
     if (result.status !== 0) {
         throw new Error(`terminal support requires a working node-pty installation for this OS/CPU${result.stderr ? `: ${result.stderr.trim()}` : ''}`);

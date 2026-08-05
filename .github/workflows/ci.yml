@@ -27,6 +27,7 @@ jobs:
           cache-dependency-path: packages/broker/package-lock.json
       - run: npm ci --omit=optional
       - run: npm run check
+      - run: npm run test:node-pty-support
       - run: npm run test:setup
       - run: npm run test:security
       - run: npm run test:unmanaged
@@ -51,10 +52,11 @@ jobs:
           cache-dependency-path: packages/broker/package-lock.json
       - run: npm ci
       - run: npm ls node-pty
-      - run: npm run test:setup
+      - run: npm run test:node-pty-support
       - run: npm run test:term
         env:
           REQUIRE_PTY: "1"
+      - run: npm run test:setup
 
   playwright-driver:
     strategy:

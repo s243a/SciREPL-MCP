@@ -38,16 +38,30 @@ the current command adapters use POSIX shell quoting and process conventions.
 Structured `/agent` adapters do not require `node-pty`; interactive agent/TUI
 sessions exposed through `/term` do.
 
+The current implementation has been exercised directly under WSL. Termux is
+also directly tested as described below; other Linux distributions use the same
+Node/POSIX paths but may differ in package names and native build tooling.
+
 ## macOS
 
 Install a current Node.js release and Xcode Command Line Tools, then run
 `npm ci`. Core broker operation does not require `node-pty`; terminal mode does.
+
+The macOS terminal path is covered by the repository's GitHub-hosted macOS CI,
+including a real PTY relay test. It has not yet been exercised on a
+maintainer-owned Mac, and this project does not build or distribute a macOS app.
+The install/setup path repairs the missing executable bit in `node-pty` 1.1.0's
+macOS prebuilt `spawn-helper`; that repair is not run on Linux or Windows.
 
 ## Native Windows
 
 The HTTP/WebSocket bridge can run under native Node.js, but the terminal and
 agent launch paths are not yet treated as native-Windows compatible. Use WSL for
 those features until Windows-specific adapters and CI coverage are added.
+
+`node-pty` can use Windows ConPTY, so a native PowerShell terminal profile is a
+possible future extension. It would still require Windows-specific command,
+quoting, path, setup, and CI work; it is not a current feature.
 
 For the core bridge in PowerShell:
 

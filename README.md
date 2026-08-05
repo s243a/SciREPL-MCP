@@ -30,7 +30,8 @@ generated launcher retains that validated Node executable.
 
 On native Windows, the core bridge can be prepared with
 `./setup-broker.ps1` from PowerShell. Agent and terminal modes currently use
-POSIX process conventions and should run under WSL.
+POSIX process conventions and should run under WSL. Native PowerShell/ConPTY is
+a possible future terminal profile, not a current feature.
 
 The broker is executed directly by Node.js; it is not compiled. Setup installs
 only its JavaScript dependencies by default. Optional terminal mode installs and

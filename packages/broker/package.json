@@ -16,10 +16,12 @@
     "LICENSE"
   ],
   "scripts": {
+    "postinstall": "node scripts/prepare-node-pty.mjs",
     "setup": "node scripts/setup.mjs",
     "start": "node src/broker.mjs",
-    "check": "node --check src/broker.mjs && node --check src/workspace.mjs && node --check scripts/setup.mjs",
-    "test": "node test/setup.test.mjs && node test/security.test.mjs && node test/unmanaged-workspace.test.mjs && node test/broker.test.mjs && node test/missing-agent.test.mjs && node test/term.test.mjs",
+    "check": "node --check src/broker.mjs && node --check src/workspace.mjs && node --check src/node-pty-support.mjs && node --check scripts/setup.mjs && node --check scripts/prepare-node-pty.mjs",
+    "test": "node test/node-pty-support.test.mjs && node test/setup.test.mjs && node test/security.test.mjs && node test/unmanaged-workspace.test.mjs && node test/broker.test.mjs && node test/missing-agent.test.mjs && node test/term.test.mjs",
+    "test:node-pty-support": "node test/node-pty-support.test.mjs",
     "test:setup": "node test/setup.test.mjs",
     "test:security": "node test/security.test.mjs",
     "test:unmanaged": "node test/unmanaged-workspace.test.mjs",

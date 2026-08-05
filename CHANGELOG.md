@@ -37,3 +37,6 @@
   Tailscale Serve while SSH forwarding is a desktop-client alternative.
 - Record the current transport-identity limitation and the verified-but-not-yet-
   implemented Android WebView attachment path for the Playwright driver.
+- Repair the missing executable bit in `node-pty` 1.1.0's macOS prebuilt
+  `spawn-helper` without changing other platforms, and verify terminal setup by
+  opening a real PTY rather than only importing the dependency.

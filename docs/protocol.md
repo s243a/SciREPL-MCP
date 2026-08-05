@@ -11,7 +11,7 @@ WebSocket connection. JSON examples below omit unrelated fields.
 |---|---|---|---|
 | `/health` | HTTP GET | Version, connection, and enabled-feature status | enabled |
 | `/mcp` | MCP Streamable HTTP | External MCP client interface | enabled |
-| `/doctor` | HTTP GET/POST | Inspect or explicitly repair the managed agent workspace | enabled, token required |
+| `/doctor` | HTTP GET/POST | Inspect or explicitly repair the prepared agent workspace | enabled, token required |
 | `/app` | WebSocket | SciREPL app advertises and executes notebook tools | enabled |
 | `/agent` | WebSocket | App chat to a host-side coding-agent CLI | disabled unless configured |
 | `/term` | WebSocket | App terminal to a host-side PTY | disabled unless configured |
@@ -23,7 +23,13 @@ closed after the configured deadline.
 `/health` is intentionally unauthenticated so clients can diagnose reachability
 before pairing. It reveals broker/protocol versions, whether the app is connected,
 the advertised tool count, and whether agent and terminal features are enabled;
-it does not expose tool definitions, notebook data, tokens, or host paths.
+it also reports whether the exact generated agent workspace is ready. It does
+not expose tool definitions, notebook data, tokens, or host paths.
+
+`GET /doctor` is read-only. `POST /doctor` creates missing generated workspace
+files and backs up/replaces stale ones only when the broker was started with
+`BROKER_MANAGE_WORKSPACE=1`, which the explicit agent setup launcher supplies.
+Ordinary broker startup never seeds agent instructions or provider settings.
 
 ## App bridge (`/app`)
 
@@ -81,7 +87,9 @@ The app first sends:
 
 When enabled, the broker responds with detected CLI names in both `agents`
 (for existing clients) and `availableAgents`, the complete adapter list in
-`configuredAgents`, and the protocol version. The app can then send:
+`configuredAgents`, the `workspaceReady` state, and the protocol version. If the
+workspace is unprepared and the advanced unmanaged override is absent, `agents`
+is empty and a start request fails closed. The app can then send:
 
 ```json
 { "type": "start", "agent": "claude" }
@@ -93,6 +101,11 @@ Broker events use `{"type":"agent","kind":...}`. Kinds include `welcome`,
 `started`, `assistant`, `tool_use`, `result`, `stderr`, `error`, and `exit`.
 Adapter output is normalized, but raw CLI behaviour and privileges remain
 provider-specific.
+
+The structured `/agent` path does not require a PTY. Interactive agent/TUI modes
+use `/term` and therefore require terminal support as well. This includes
+terminal-only conveniences such as `!ls`, interactive slash commands, keyboard
+permission prompts, and full-screen interfaces.
 
 ## Terminal (`/term`)
 

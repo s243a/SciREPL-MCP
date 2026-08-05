@@ -20,6 +20,28 @@ Do not use `BROKER_HOST=0.0.0.0`, Tailscale Funnel, a public reverse proxy, or a
 public tunnel unless you have added a separate internet-facing security layer.
 The pairing token alone is not intended to make this a public service.
 
+## Network and transport identity
+
+Tailscale can distinguish tailnet users. In particular,
+[Tailscale Serve identity headers](https://tailscale.com/docs/features/tailscale-serve#identity-headers)
+can identify the user while Serve strips inbound copies before forwarding to a
+localhost service, and Tailscale exposes identity lookup facilities. The current
+broker does not validate or authorize from that identity.
+
+Both Tailscale Serve and SSH port forwarding normally present their connection
+to the broker as loopback. A loopback source therefore identifies the local
+proxy/tunnel endpoint, not necessarily the original person or device. The broker
+does not currently have “local” and “remote” privilege tiers: the pairing token
+authenticates the connection, while `BROKER_AGENT` and `BROKER_TERM` determine
+which higher-capability endpoints exist.
+
+The setup tool requires `--allow-non-loopback` when it is asked to generate a
+raw non-loopback launcher, but direct use of `BROKER_HOST` remains an advanced
+runtime bypass. That acknowledgement is not transport verification and does not
+supply TLS/WSS. A future hardening mode should validate Tailscale identity or use
+a distinct, explicitly configured SSH listener/profile before assigning any
+transport-dependent privileges.
+
 ## Capabilities
 
 ### Core MCP bridge
@@ -50,6 +72,13 @@ tokens, credentials, passwords, secrets, or profiles. This reduces accidental
 disclosure but is not a sandbox: an authorized JavaScript-kernel call still
 controls the SciREPL page.
 
+Android WebView control is not yet implemented by this package. A future ADB
+attachment mode requires a debuggable APK, which expands the application attack
+surface for computers authorized through ADB. Production/Play builds should keep
+WebView debugging disabled. A separately identified debug build should be used
+only on a development device or profile and should not share sensitive notebook
+data with the release app.
+
 ### Remote agents
 
 `/agent` is disabled unless `BROKER_AGENT=1` is set. Enabling it permits an
@@ -68,6 +97,26 @@ host.
 Run the broker under a dedicated operating-system account, container, or VM if
 you need stronger isolation.
 
+Repository agent instructions are stored under inert `.template` names. Active
+`AGENTS.md`, `CLAUDE.md`, and provider configuration files are created only by
+the explicit agent setup command in its dedicated session workspace, or repaired
+by an authenticated explicit `POST /doctor` when the generated launcher permits
+management. Ordinary startup does not seed them. The unmanaged-workspace bypass
+is an operator acknowledgement, not a safety check.
+
+Running structured `/agent` without `/term` is a valid least-privilege profile:
+it withholds the broker's PTY, direct shell selection, and interactive terminal
+features while retaining supported prompt and MCP workflows. `CLAUDE.md`,
+`AGENTS.md`, and similar context can reinforce an operator's intent, but an agent
+can misunderstand, ignore, or be redirected away from instructions. Treat them
+as guidance, never as authorization. Enforce capability limits with disabled
+endpoints and terminal command/no-shell settings. Complement those broker-level
+controls with provider-native controls—for example Claude tool/permission
+policies or Codex sandbox and approval settings. Those are materially stronger
+than prompt instructions, but remain version- and CLI-specific policy rather
+than an operating-system boundary. Use an appropriately restricted account,
+container, or VM for higher assurance.
+
 ### Terminal
 
 `/term` is disabled unless `BROKER_TERM=1` is set. When enabled, it can provide
@@ -83,8 +132,8 @@ capability, not a complete sandbox.
 
 - Without `BROKER_TOKEN`, the broker creates a random 128-bit token at
   `~/scirepl-broker/broker-token` and enforces mode `0600` where supported.
-- Managed agent configuration files containing the token are also written with
-  mode `0600`.
+- Agent configuration files materialized by explicit setup are written with mode
+  `0600` where supported.
 - The same pairing token currently authenticates `/mcp`, `/doctor`, `/app`,
   `/agent`, and `/term`. Optional high-capability endpoints are therefore gated
   off separately by configuration.

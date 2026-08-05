@@ -3,11 +3,13 @@
  * Deterministic checks for private token and managed-config storage.
  */
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
+import { setupWorkspace } from '../src/workspace.mjs';
 
 const PORT = 8097;
-const root = path.join(process.cwd(), '.test-workspaces', `security-${process.pid}-${PORT}`);
+const root = fs.mkdtempSync(path.join(fs.realpathSync(process.platform === 'win32' ? os.tmpdir() : '/tmp'), 'scirepl-mcp-security-'));
 const tokenFile = path.join(root, 'broker-token');
 const workspace = path.join(root, 'workspace');
 process.env.BROKER_PORT = String(PORT);
@@ -30,10 +32,13 @@ ok(fs.existsSync(tokenFile), 'persistent pairing-token file is created');
 ok(/^[0-9a-f]{32}$/.test(TOKEN) && fs.readFileSync(tokenFile, 'utf8').trim() === TOKEN,
     'generated token has 128 bits of random hexadecimal data');
 ok(privateMode(tokenFile), 'pairing-token file is private (0600 where supported)');
+ok(!fs.existsSync(workspace), 'ordinary broker startup does not seed active agent configuration');
+
+setupWorkspace({ workspace, port: PORT, token: TOKEN, callTimeoutMs: 120000 });
 
 const geminiConfig = path.join(workspace, '.gemini', 'settings.json');
 const codexConfig = path.join(workspace, '.codex', 'config.toml');
-ok(fs.existsSync(geminiConfig) && fs.existsSync(codexConfig), 'managed agent configuration is seeded');
+ok(fs.existsSync(geminiConfig) && fs.existsSync(codexConfig), 'explicit workspace setup creates managed agent configuration');
 ok(privateMode(geminiConfig) && privateMode(codexConfig),
     'managed configuration containing connection details is private (0600 where supported)');
 
@@ -47,4 +52,5 @@ ok(invalid.status !== 0 && /BROKER_PORT must be an integer/.test(invalid.stderr 
 
 console.log(`\n${passed} passed, ${failed} failed`);
 await new Promise(resolve => httpServer.close(resolve));
+fs.rmSync(root, { recursive: true, force: true });
 process.exit(failed ? 1 : 0);

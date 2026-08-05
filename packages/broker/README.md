@@ -31,6 +31,9 @@ MCP client  -- HTTP /mcp -->  SciREPL MCP  <-- WebSocket /app --  SciREPL Pro
   on the broker host.
 - Use Tailscale Serve or an SSH tunnel for remote access. Do not expose the
   broker directly to the public internet.
+- Transport is not currently a privilege signal. Tailscale Serve and an SSH
+  forward both reach the loopback listener, and authenticated callers receive
+  the same configured endpoint capabilities.
 - SciREPL's on-device permissions govern notebook tools; they are not an
   operating-system sandbox for programs spawned on the broker host.
 
@@ -38,35 +41,90 @@ MCP client  -- HTTP /mcp -->  SciREPL MCP  <-- WebSocket /app --  SciREPL Pro
 
 - Node.js 20 or newer; Node.js 22 is recommended.
 - SciREPL Pro with its Remote bridge enabled.
-- Tailscale or SSH when the phone and broker are not on the same trusted host.
+- Tailscale Serve, or another private TLS reverse proxy, for an Android phone to
+  reach a broker on another device. SSH forwarding is an alternative for a
+  desktop MCP client, not a tunnel the Android app creates itself.
 - Optional: `node-pty` and a POSIX-like shell for terminal mode.
 
-## Install from source
+## Explicit setup
+
+Run setup from the repository root. The default creates a private token and
+core-only Bash and PowerShell launchers under `~/scirepl-broker`; it does not
+create active agent instructions.
 
 ```bash
 git clone https://github.com/s243a/SciREPL-MCP.git
-cd SciREPL-MCP/packages/broker
-npm ci
-npm test
+cd SciREPL-MCP
+./setup-broker.sh
+~/scirepl-broker/start-broker.sh
 ```
 
-For the core MCP bridge without terminal support or native compilation:
+Setup requires Node.js 20 or newer and fails before writing if the current shell
+still points to an older system Node. If you use NVM, run `nvm use 22` first.
+Generated launchers retain the exact Node executable that passed this check, so
+a later noninteractive shell cannot silently fall back to an older system Node.
+
+Native Windows can prepare and launch the core bridge from PowerShell:
+
+```powershell
+./setup-broker.ps1
+& "$HOME\scirepl-broker\Start-Broker.ps1"
+```
+
+Agent mode requires an explicit acknowledgement that the selected CLI runs on
+the broker computer and may have that account's host access:
 
 ```bash
-npm ci --omit=optional
+./setup-broker.sh \
+  --enable-agent \
+  --acknowledge-agent-host-access
 ```
 
-Do not copy `node_modules` between machines. `node-pty` contains native code and
-must be built or installed on the target operating system and CPU architecture.
+This enables the structured `/agent` chat adapters. It does not enable the
+interactive terminal/TUI versions of those agents. Interactive conveniences
+such as `!ls`, slash commands, key-driven permission dialogs, and full-screen
+interfaces may therefore be unavailable. A permitted SciREPL Bash cell can
+still run through notebook MCP tools, but that is not a host-side shell escape.
 
-## Start the broker
+Terminal mode requires a separate acknowledgement and installs the optional
+native dependency:
 
 ```bash
-npm start
+./setup-broker.sh \
+  --enable-terminal \
+  --acknowledge-terminal-host-access
 ```
 
-The first start creates a persistent token file. Display it when pairing a
-device:
+Pass both pairs of options to enable both features. Setup refuses a non-empty
+unmarked output directory unless `--adopt` is supplied and refuses to replace
+changed generated files unless `--repair` is supplied. Run
+`./setup-broker.sh --help` for all options.
+
+For the broader remote-agent surface—structured chat plus interactive
+terminal/TUI agent choices—enable and acknowledge both agent and terminal mode:
+
+```bash
+./setup-broker.sh \
+  --enable-agent \
+  --acknowledge-agent-host-access \
+  --enable-terminal \
+  --acknowledge-terminal-host-access
+```
+
+Enabling only structured agent mode is also a valid least-privilege choice when
+the operator intentionally wants to withhold PTYs, shell escapes, and interactive
+host commands. Context files can tell an agent to avoid those capabilities, but
+instructions such as `CLAUDE.md` are not an enforcement boundary. Provider-native
+tool, sandbox, and approval settings in Claude, Codex, or another CLI are useful
+complementary controls; they still do not replace OS isolation when that is
+required.
+
+The broker itself is plain ECMAScript and has no compile or bundle step. Default
+setup runs `npm ci --omit=optional`. Terminal setup runs the full `npm ci` and
+then verifies that `node-pty` loads for the target operating system and CPU. Do
+not copy `node_modules` between machines.
+
+The token is never printed by setup. Display it locally when pairing a device:
 
 ```bash
 cat "$HOME/scirepl-broker/broker-token"
@@ -81,6 +139,28 @@ Check the local service:
 curl http://127.0.0.1:8087/health
 ```
 
+For manual development without generated launchers, run `npm ci --omit=optional`
+and `npm start` from this package. Ordinary startup does not materialize active
+agent context; see the
+[agent-context guide](https://github.com/s243a/SciREPL-MCP/blob/main/docs/agent-context.md).
+
+An already installed package exposes the equivalent `scirepl-mcp-setup`
+command. In that layout dependencies were installed by the package manager, so
+setup verifies them instead of expecting the source checkout's lockfile.
+
+## Private Android access with Tailscale
+
+Keep the broker bound to `127.0.0.1` and separately configure Tailscale Serve:
+
+```bash
+tailscale serve --bg localhost:8087
+tailscale serve status
+```
+
+Serve supplies the private HTTPS/WSS endpoint. Do not use Tailscale Funnel. The
+setup script prints this command but deliberately does not alter the host's
+Tailscale configuration.
+
 ## Connect SciREPL Pro
 
 In **AI Assistant Settings → Remote bridge**, enter:
@@ -91,6 +171,22 @@ In **AI Assistant Settings → Remote bridge**, enter:
 For a local development page served over plain HTTP, `ws://127.0.0.1:8087/app`
 can be used. The Android app is an HTTPS origin and therefore requires `wss://`
 for a remote WebSocket.
+
+### Connection identity and privileges
+
+[Tailscale Serve identity headers](https://tailscale.com/docs/features/tailscale-serve#identity-headers)
+can identify a tailnet user, and Serve strips spoofed inbound copies before
+proxying to a localhost backend. Tailscale also offers identity lookup
+facilities. The current broker does not consume those headers or assign different
+privileges from them. An SSH forward likewise appears to the broker as a loopback
+connection.
+
+Consequently, “loopback” means where the proxy or tunnel reached the broker; it
+does not prove that the original user was physically local. Capability is
+determined by the pairing token plus the explicit agent/terminal feature flags.
+Transport-aware authorization—validated Tailscale identity or a distinct SSH
+listener/profile—remains a future hardening item. See the
+[network section of the security policy](https://github.com/s243a/SciREPL-MCP/blob/main/SECURITY.md#network-and-transport-identity).
 
 ## Connect an MCP client
 
@@ -115,11 +211,17 @@ server. If no app is connected, the broker has no notebook tools to advertise.
 ## Optional remote-agent chat
 
 The `/agent` endpoint lets the SciREPL Pro panel converse with a coding-agent CLI
-installed on the broker host:
+through a structured, non-PTY adapter. Use the acknowledged `--enable-agent`
+setup shown above, then start its generated launcher. Setup materializes notebook
+guidance only in its dedicated session workspace. A direct `BROKER_AGENT=1`
+launch fails closed when that workspace is not prepared unless the operator
+explicitly uses `BROKER_ALLOW_UNMANAGED_AGENT_WORKSPACE=1` for self-managed
+context. Provider support varies; Claude is the verified persistent adapter,
+while the Codex, Gemini, and Agy structured profiles are experimental.
 
-```bash
-BROKER_AGENT=1 npm start
-```
+Structured mode is appropriate for prompts and MCP tool calls. If a workflow
+depends on terminal syntax such as `!ls`, interactive slash commands, a TUI, or
+keyboard responses to CLI prompts, enable terminal mode too.
 
 This is a host-trust decision. Claude supports a broker-supplied tool allowlist;
 Codex, Gemini, and Agy may retain their normal ability to read files or run tools
@@ -130,11 +232,11 @@ broker passes a restricted environment by default; setting
 ## Optional terminal
 
 Terminal mode requires the optional `node-pty` dependency and exposes a PTY to
-the connected app:
-
-```bash
-BROKER_TERM=1 npm start
-```
+the connected app. Use the acknowledged `--enable-terminal` setup shown above.
+A terminal-only setup exposes only the `shell` choice. Enabling both features
+makes the configured interactive agent/TUI choices available as well as the
+structured `/agent` chat adapters. Those interactive modes cannot work without
+`node-pty` and a compatible shell.
 
 Use `BROKER_TERM_NO_SHELL=1` to remove the standalone shell option and prevent an
 agent from dropping to a shell after it exits. This reduces convenience but does
@@ -162,6 +264,7 @@ terms. The broker cannot make a third-party model service "on-device."
 
 ## Documentation
 
+- [Agent context and explicit workspace setup](https://github.com/s243a/SciREPL-MCP/blob/main/docs/agent-context.md)
 - [Configuration reference](https://github.com/s243a/SciREPL-MCP/blob/main/docs/configuration.md)
 - [Wire protocol](https://github.com/s243a/SciREPL-MCP/blob/main/docs/protocol.md)
 - [Platform and device builds](https://github.com/s243a/SciREPL-MCP/blob/main/docs/platforms.md)

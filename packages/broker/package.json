@@ -5,18 +5,24 @@
   "description": "Auditable app-connected MCP, remote-agent, and optional terminal bridge for SciREPL Pro",
   "type": "module",
   "bin": {
-    "scirepl-mcp-broker": "src/broker.mjs"
+    "scirepl-mcp-broker": "src/broker.mjs",
+    "scirepl-mcp-setup": "scripts/setup.mjs"
   },
   "files": [
     "src",
+    "scripts",
+    "templates",
     "README.md",
     "LICENSE"
   ],
   "scripts": {
+    "setup": "node scripts/setup.mjs",
     "start": "node src/broker.mjs",
-    "check": "node --check src/broker.mjs",
-    "test": "node test/security.test.mjs && node test/broker.test.mjs && node test/missing-agent.test.mjs && node test/term.test.mjs",
+    "check": "node --check src/broker.mjs && node --check src/workspace.mjs && node --check scripts/setup.mjs",
+    "test": "node test/setup.test.mjs && node test/security.test.mjs && node test/unmanaged-workspace.test.mjs && node test/broker.test.mjs && node test/missing-agent.test.mjs && node test/term.test.mjs",
+    "test:setup": "node test/setup.test.mjs",
     "test:security": "node test/security.test.mjs",
+    "test:unmanaged": "node test/unmanaged-workspace.test.mjs",
     "test:broker": "node test/broker.test.mjs",
     "test:term": "node test/term.test.mjs",
     "test:agent": "node test/agent.test.mjs",

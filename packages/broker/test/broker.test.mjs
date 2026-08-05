@@ -12,6 +12,8 @@
 import { WebSocket } from 'ws';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
+import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 
 const PORT = 8099, TOKEN = 'test-token';
@@ -19,7 +21,8 @@ process.env.BROKER_PORT = String(PORT);
 process.env.BROKER_TOKEN = TOKEN;
 process.env.BROKER_MAX_HTTP_BODY_BYTES = '8192';
 process.env.BROKER_MAX_AGENT_WS_PAYLOAD_BYTES = '1024';
-process.env.BROKER_WORKSPACE = path.join(process.cwd(), '.test-workspaces', `${process.pid}-${PORT}`);
+const testRoot = fs.mkdtempSync(path.join(fs.realpathSync(process.platform === 'win32' ? os.tmpdir() : '/tmp'), 'scirepl-mcp-broker-'));
+process.env.BROKER_WORKSPACE = path.join(testRoot, 'workspace');
 
 let passed = 0, failed = 0;
 const ok = (c, m) => { if (c) { console.log('  ✓ ' + m); passed++; } else { console.log('  ✗ ' + m); failed++; } };
@@ -164,4 +167,5 @@ try {
 
 console.log(`\n${passed} passed, ${failed} failed`);
 try { app.close(); } catch (_) {}
+fs.rmSync(testRoot, { recursive: true, force: true });
 process.exit(failed ? 1 : 0);

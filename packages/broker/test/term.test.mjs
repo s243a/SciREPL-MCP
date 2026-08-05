@@ -10,6 +10,8 @@
  */
 import { WebSocket } from 'ws';
 import { spawnSync } from 'node:child_process';
+import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 
 let passed = 0, failed = 0;
@@ -29,7 +31,9 @@ const PORT = 8091, TOKEN = 'term-test';
 process.env.BROKER_PORT = String(PORT);
 process.env.BROKER_TOKEN = TOKEN;
 process.env.BROKER_TERM = '1';
-process.env.BROKER_WORKSPACE = path.join(process.cwd(), '.test-workspaces', `${process.pid}-${PORT}`);
+const testRoot = fs.mkdtempSync(path.join(fs.realpathSync(process.platform === 'win32' ? os.tmpdir() : '/tmp'), 'scirepl-mcp-term-'));
+process.env.BROKER_WORKSPACE = path.join(testRoot, 'workspace');
+fs.mkdirSync(process.env.BROKER_WORKSPACE, { recursive: true });
 
 const { termBridge } = await import('../src/broker.mjs');
 await sleep(300);
@@ -61,4 +65,5 @@ try {
 
 console.log(`\n${passed} passed, ${failed} failed`);
 try { termBridge.stop(); t.close(); } catch (_) {}
+fs.rmSync(testRoot, { recursive: true, force: true });
 process.exit(failed ? 1 : 0);

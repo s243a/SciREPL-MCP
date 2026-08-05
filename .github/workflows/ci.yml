@@ -27,7 +27,9 @@ jobs:
           cache-dependency-path: packages/broker/package-lock.json
       - run: npm ci --omit=optional
       - run: npm run check
+      - run: npm run test:setup
       - run: npm run test:security
+      - run: npm run test:unmanaged
       - run: npm run test:broker
       - run: npm run test:missing-agent
 
@@ -49,6 +51,7 @@ jobs:
           cache-dependency-path: packages/broker/package-lock.json
       - run: npm ci
       - run: npm ls node-pty
+      - run: npm run test:setup
       - run: npm run test:term
         env:
           REQUIRE_PTY: "1"

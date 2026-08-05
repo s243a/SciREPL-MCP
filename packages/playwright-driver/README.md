@@ -151,6 +151,27 @@ used by tooling that explicitly supports attaching with `connectOverCDP`.
 Navigating an unrelated browser to the CDP URL does not attach it to the
 SciREPL session.
 
+### Android WebView status
+
+Playwright can automate a running SciREPL Android WebView over ADB when WebView
+debugging is enabled. A SciREPL debug APK can expose that interface; normal
+release and Play Store builds deliberately disable it.
+
+The current MCP driver does **not** yet support Android attachment. Its CDP path
+creates or navigates a browser page, whereas an Android mode must discover and
+forward the app process's `webview_devtools_remote` socket, connect to the
+browser-level CDP endpoint, and reuse the existing SciREPL page. Workbook export
+also needs an Android-aware path because Capacitor uses native Filesystem/Share
+rather than a browser download.
+
+Until that work and an Android smoke test land, use the repository's driver for
+browser/PWA sessions only. Any optional debug APK should be clearly identified
+as a developer artifact, preferably with a separate application ID and label so
+it can coexist with the Play-signed app. WebView debugging lets an ADB-authorized
+computer inspect and modify application state; use it only on a development
+device or profile, avoid sensitive notebooks and credentials, and remove ADB
+forwards when testing is complete.
+
 ## Local package development
 
 Set `SCIREPL_DEV_PACKAGES` to a directory containing package zip files. When a

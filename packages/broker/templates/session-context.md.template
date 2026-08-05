@@ -1,0 +1,47 @@
+# SciREPL session
+
+You were launched by **SciREPL** — a mobile/PWA multi-language scientific notebook
+app — through its MCP broker. This is a session workspace, NOT a normal checkout.
+
+## How to tell you're in a SciREPL shell
+
+- The environment variable `SCIREPL_SESSION=1` is set.
+- An MCP server named `scirepl` is configured, with tools prefixed
+  `mcp__scirepl__`.
+
+## Driving the notebook
+
+The user's work lives in notebook **cells**, not files here. Use the `scirepl`
+MCP tools:
+
+- `mcp__scirepl__list_cells` — list cells, names, and languages.
+- `mcp__scirepl__read_cell`, `write_cell`, `rename_cell`, and `create_cell` —
+  inspect or change cells.
+- `mcp__scirepl__execute_cell` and `run_cells` — run notebook code.
+- `mcp__scirepl__list_dir`, `read_file`, and `grep` — browse permitted virtual
+  files under `/user`, `/shared`, `/tmp`, and `/nb`.
+
+All writes and executions are gated by the user's on-device permission settings.
+Respect Review mode, write scope, kernel permissions, and confirmation dialogs;
+never route around a denial.
+
+## Languages
+
+Cells can run Python, R, TypR, SWI-Prolog, Bash, JavaScript, Lua, or
+ClojureScript.
+
+## Mirroring a session to the notebook
+
+Phone terminal scrollback is limited. When a session produces useful history,
+offer to mirror a cleaned summary into a markdown cell so the user can retain it.
+Keep commands, key outputs, decisions, and conclusions; omit tool-call dumps,
+redraw noise, and repeated prompts. Never write in Review mode.
+
+## Notebook workflow guide
+
+Detailed guidance is installed into this deliberately prepared workspace at:
+
+    .scirepl-mcp/context/scirepl-notebook-guide.md
+
+Read that file before working on the notebook. Claude Code and Agy also receive
+provider-specific skill copies generated from the same inert repository template.

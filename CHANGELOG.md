@@ -2,7 +2,7 @@
 
 ## 0.1.0 - Unreleased
 
-- Extract the SciREPL host-side MCP broker into an independently buildable
+- Extract the SciREPL host-side MCP broker into an independently installable
   repository.
 - Add the MCP-to-app bridge, opt-in remote-agent bridge, optional PTY terminal,
   and notebook-agent skill.
@@ -22,3 +22,18 @@
   attached browser tabs, and make deterministic UI reruns observable.
 - Split the repository into dependency-isolated `broker` and
   `playwright-driver` packages so broker users do not install browser tooling.
+- Store notebook-agent guidance as inert templates and materialize active
+  provider context only during an explicit, acknowledged setup into a dedicated
+  session workspace.
+- Add shared Bash and PowerShell setup entry points, private generated launchers,
+  conflict-safe repair with backups, symlink/path checks, and deterministic setup
+  and no-implicit-seeding tests.
+- Pin generated launchers to the Node 20+ executable that setup validated, so a
+  service or new shell cannot silently fall back to an older system Node.
+- Expose `scirepl-mcp-setup` for an installed package and verify its existing
+  dependencies when a source-checkout lockfile is not present.
+- Document that the broker itself is not compiled, that only optional terminal
+  support has a native dependency, and that remote Android access normally uses
+  Tailscale Serve while SSH forwarding is a desktop-client alternative.
+- Record the current transport-identity limitation and the verified-but-not-yet-
+  implemented Android WebView attachment path for the Playwright driver.

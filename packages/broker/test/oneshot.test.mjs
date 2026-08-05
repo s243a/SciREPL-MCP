@@ -15,19 +15,25 @@
  */
 import { WebSocket } from 'ws';
 import { spawnSync } from 'node:child_process';
+import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 
 const PORT = 8088, TOKEN = 'oneshot-test';
 process.env.BROKER_PORT = String(PORT);
 process.env.BROKER_TOKEN = TOKEN;
 process.env.BROKER_AGENT = '1';
-process.env.BROKER_WORKSPACE = path.join(process.cwd(), '.test-workspaces', `${process.pid}-${PORT}`);
+process.env.BROKER_ALLOW_UNMANAGED_AGENT_WORKSPACE = '1';
 
 let passed = 0, failed = 0;
 const ok = (c, m) => { if (c) { console.log('  ' + (c ? '✓' : '✗') + ' ' + m); c ? passed++ : failed++; } else { console.log('  ✗ ' + m); failed++; } };
 const has = (c) => { try { return spawnSync('sh', ['-c', `command -v ${c}`]).status === 0; } catch { return false; } };
 
 if (process.env.RUN_AGENT_E2E !== '1') { console.log('one-shot agents e2e — SKIPPED (set RUN_AGENT_E2E=1)'); process.exit(0); }
+
+const testRoot = fs.mkdtempSync(path.join(fs.realpathSync(process.platform === 'win32' ? os.tmpdir() : '/tmp'), 'scirepl-mcp-oneshot-'));
+process.env.BROKER_WORKSPACE = path.join(testRoot, 'workspace');
+fs.mkdirSync(process.env.BROKER_WORKSPACE, { recursive: true });
 
 await import('../src/broker.mjs');
 await new Promise(r => setTimeout(r, 300));
@@ -63,4 +69,5 @@ console.log('one-shot agents (codex / gemini / agy) — real calls');
 for (const a of ['codex', 'gemini', 'agy']) { if (has(a)) await runAgent(a); else console.log(`\n${a}: SKIPPED (CLI not found)`); }
 
 console.log(`\n${passed} passed, ${failed} failed`);
+fs.rmSync(testRoot, { recursive: true, force: true });
 process.exit(failed ? 1 : 0);

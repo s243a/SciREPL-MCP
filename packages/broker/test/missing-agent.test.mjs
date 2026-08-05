@@ -4,17 +4,20 @@
  * the app, not crash the broker through an unhandled ChildProcess error event.
  */
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { WebSocket } from 'ws';
 
 const PORT = 8096, TOKEN = 'missing-agent-test-token';
-const root = path.join(process.cwd(), '.test-workspaces', `missing-agent-${process.pid}-${PORT}`);
+const root = fs.mkdtempSync(path.join(fs.realpathSync(process.platform === 'win32' ? os.tmpdir() : '/tmp'), 'scirepl-mcp-missing-agent-'));
 const emptyBin = path.join(root, 'empty-bin');
 fs.mkdirSync(emptyBin, { recursive: true });
 process.env.BROKER_PORT = String(PORT);
 process.env.BROKER_TOKEN = TOKEN;
 process.env.BROKER_AGENT = '1';
+process.env.BROKER_ALLOW_UNMANAGED_AGENT_WORKSPACE = '1';
 process.env.BROKER_WORKSPACE = path.join(root, 'workspace');
+fs.mkdirSync(process.env.BROKER_WORKSPACE, { recursive: true });
 process.env.TMPDIR = path.join(root, 'tmp');
 process.env.PATH = emptyBin;
 
@@ -79,4 +82,5 @@ try {
 console.log(`\n${passed} passed, ${failed} failed`);
 try { ws.close(); } catch (_) {}
 await new Promise(resolve => httpServer.close(resolve));
+fs.rmSync(root, { recursive: true, force: true });
 process.exit(failed ? 1 : 0);

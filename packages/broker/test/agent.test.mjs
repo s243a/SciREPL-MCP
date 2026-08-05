@@ -16,13 +16,15 @@
  */
 import { WebSocket } from 'ws';
 import { spawnSync } from 'node:child_process';
+import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 
 const PORT = 8098, TOKEN = 'agent-test-token';
 process.env.BROKER_PORT = String(PORT);
 process.env.BROKER_TOKEN = TOKEN;
 process.env.BROKER_AGENT = '1';
-process.env.BROKER_WORKSPACE = path.join(process.cwd(), '.test-workspaces', `${process.pid}-${PORT}`);
+process.env.BROKER_ALLOW_UNMANAGED_AGENT_WORKSPACE = '1';
 
 const SENTINEL = 'NOTEBOOK_SENTINEL_4242';
 
@@ -36,6 +38,10 @@ if (process.env.RUN_AGENT_E2E !== '1' || !hasClaude) {
         (hasClaude ? ' (set RUN_AGENT_E2E=1 to run a real claude call)' : ' (claude CLI not found)'));
     process.exit(0);
 }
+
+const testRoot = fs.mkdtempSync(path.join(fs.realpathSync(process.platform === 'win32' ? os.tmpdir() : '/tmp'), 'scirepl-mcp-agent-'));
+process.env.BROKER_WORKSPACE = path.join(testRoot, 'workspace');
+fs.mkdirSync(process.env.BROKER_WORKSPACE, { recursive: true });
 
 const { agentBridge } = await import('../src/broker.mjs');
 await new Promise(r => setTimeout(r, 300));
@@ -96,4 +102,5 @@ try {
 
 console.log(`\n${passed} passed, ${failed} failed`);
 try { agentBridge.stop(); ag.close(); app.close(); } catch (_) {}
+fs.rmSync(testRoot, { recursive: true, force: true });
 process.exit(failed ? 1 : 0);

@@ -1,12 +1,14 @@
 # Platform and device builds
 
-The core broker is JavaScript. The only optional native component is
+The broker is executed directly as JavaScript; it is not compiled, transpiled,
+or included in the Android APK. The only optional native component is
 `node-pty`, used for terminal mode. Install dependencies on the device where the
 broker will run; never move a populated `node_modules` directory between CPUs or
 operating systems.
 
-The commands in this guide are for the app-connected broker and assume the
-current directory is `SciREPL-MCP/packages/broker`.
+The commands in this guide are for the app-connected broker. Explicit setup
+commands run from the `SciREPL-MCP` repository root; manual dependency and test
+commands identify when they run from `packages/broker`.
 
 ## Linux and WSL
 
@@ -15,12 +17,17 @@ Node.js 22 is the recommended baseline:
 ```bash
 nvm install 22
 nvm use 22
-npm ci
-npm test
+cd SciREPL-MCP
+./setup-broker.sh
 ```
 
+Setup checks the Node version before it writes anything. If a newly opened WSL
+shell still selects the distribution's older `/usr/bin/node`, run `nvm use 22`
+before setup or configure NVM's default alias.
+
 If `node-pty` must compile locally, install the platform's C/C++ build tools,
-Python, and `make`. The core bridge can be installed without native packages:
+Python, and `make`. Manual core installation from `packages/broker` needs no
+native toolchain:
 
 ```bash
 npm ci --omit=optional
@@ -28,6 +35,8 @@ npm ci --omit=optional
 
 WSL is the recommended Windows environment for agent and terminal modes because
 the current command adapters use POSIX shell quoting and process conventions.
+Structured `/agent` adapters do not require `node-pty`; interactive agent/TUI
+sessions exposed through `/term` do.
 
 ## macOS
 
@@ -43,9 +52,8 @@ those features until Windows-specific adapters and CI coverage are added.
 For the core bridge in PowerShell:
 
 ```powershell
-npm ci --omit=optional
-npm run test:broker
-npm start
+./setup-broker.ps1
+& "$HOME\scirepl-broker\Start-Broker.ps1"
 ```
 
 In another PowerShell window, read the generated pairing token with:
@@ -65,23 +73,30 @@ Prefer a current Termux build from the project's documented
 Termux distributions use different signing keys, so do not mix packages from
 different channels without uninstalling the old installation first.
 
-Install a local toolchain:
+Install the core requirements first:
 
 ```bash
 pkg update
-pkg install git nodejs-lts python make clang
+pkg install git nodejs-lts
 git clone https://github.com/s243a/SciREPL-MCP.git
-cd SciREPL-MCP/packages/broker
-npm ci --omit=optional
-npm test
+cd SciREPL-MCP
+./setup-broker.sh
 ```
 
 Start with the core bridge. If terminal mode is required, build the native
 dependency on that same Android device:
 
 ```bash
+pkg install python make clang
+cd packages/broker
 npm install node-pty --build-from-source
 npm run test:term
+cd ../..
+./setup-broker.sh \
+  --enable-terminal \
+  --acknowledge-terminal-host-access \
+  --no-install \
+  --repair
 ```
 
 Android and Termux versions vary; a successful core test does not guarantee
@@ -107,6 +122,8 @@ tailscale serve status
 Tailscale documents Serve as tailnet-only sharing. **Serve** and **Funnel** are
 not interchangeable; do not enable Funnel for this broker. See the official
 [Tailscale Serve reference](https://tailscale.com/docs/reference/tailscale-cli/serve).
+Setup prints the Serve command as guidance but does not inspect or change an
+existing Serve configuration.
 
 The resulting HTTPS hostname is used as:
 
@@ -126,6 +143,11 @@ ssh -N -L 8087:127.0.0.1:8087 user@broker-host
 The MCP client then connects to `http://127.0.0.1:8087/mcp`. An Android WebView
 does not create this SSH tunnel itself, so the phone normally still uses a
 private `wss://` endpoint such as Tailscale Serve.
+
+Tailscale Serve and SSH forwarding both appear to the broker as loopback. The
+current protocol uses the pairing token and feature flags, not transport identity,
+for authorization. See the security policy before designing different “local”
+and “remote” privilege levels.
 
 ## Reproducible release direction
 

@@ -22,11 +22,11 @@ import os from 'node:os';
 import fs from 'node:fs';
 import path from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
-import { fileURLToPath } from 'node:url';
 import { WebSocketServer } from 'ws';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { ListToolsRequestSchema, CallToolRequestSchema } from '@modelcontextprotocol/sdk/types.js';
+import { inspectWorkspace, setupWorkspace, writePrivateFile } from './workspace.mjs';
 
 const PACKAGE_METADATA = JSON.parse(fs.readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
 const BROKER_VERSION = PACKAGE_METADATA.version;
@@ -100,141 +100,76 @@ const AGENT_ALLOWED_TOOLS = process.env.BROKER_AGENT_ALLOWED_TOOLS || 'mcp__scir
 const AGENT_FULL_ACCESS = process.env.BROKER_AGENT_FULL === '1'; // Claude-specific allowlist bypass
 const AGENT_USE_API_KEY = process.env.BROKER_AGENT_USE_API_KEY === '1';
 const AGENT_INHERIT_ENV = process.env.BROKER_AGENT_INHERIT_ENV === '1';
-// Spawned agents/terminals run in a dedicated session workspace (not the SciREPL
-// source repo) seeded with CLAUDE.md/AGENTS.md describing the environment. Only
-// auto-seed when using our default dir — never clobber a user-chosen cwd.
+// Spawned agents/terminals use a dedicated session workspace (not the SciREPL
+// source repo). Active CLAUDE.md/AGENTS.md files are created only by the explicit
+// setup command. Ordinary broker startup is deliberately read-only toward it.
 // NON-hidden path: Antigravity (agy) excludes any workspace whose path contains a
 // hidden component (a dir starting with '.'), so '~/.scirepl-broker/...' was never
 // recognized as an active workspace. Keep the workspace root non-hidden.
 const DEFAULT_WORKSPACE = process.env.BROKER_WORKSPACE || path.join(os.homedir(), 'scirepl-broker', 'workspace');
 const AGENT_CWD = process.env.BROKER_AGENT_CWD || DEFAULT_WORKSPACE;
-const MANAGE_WORKSPACE = !process.env.BROKER_AGENT_CWD;
+const MANAGE_WORKSPACE = process.env.BROKER_MANAGE_WORKSPACE === '1';
+const ALLOW_UNMANAGED_AGENT_WORKSPACE = process.env.BROKER_ALLOW_UNMANAGED_AGENT_WORKSPACE === '1';
+const WORKSPACE_OPTIONS = { workspace: AGENT_CWD, port: PORT, token: TOKEN, callTimeoutMs: CALL_TIMEOUT_MS };
 
-// Context handed to every spawned coding agent (read from cwd as CLAUDE.md /
-// AGENTS.md). Tells it it's in a SciREPL session and how to drive the notebook.
-const SCIREPL_CONTEXT_MD = `# SciREPL session
-
-You were launched by **SciREPL** — a mobile/PWA multi-language scientific notebook
-app — through its MCP broker. This is a session workspace, NOT a normal checkout.
-
-## How to tell you're in a SciREPL shell
-- The env var \`SCIREPL_SESSION=1\` is set.
-- An MCP server named \`scirepl\` is configured (tools prefixed \`mcp__scirepl__\`).
-
-## Driving the notebook
-The user's work lives in notebook **cells**, not files here. Use the \`scirepl\` MCP tools:
-- \`mcp__scirepl__list_cells\` — list cells (index, name, language)
-- \`mcp__scirepl__read_cell\` / \`write_cell\` / \`rename_cell\` / \`create_cell\`
-- \`mcp__scirepl__execute_cell\` — run a cell
-- \`mcp__scirepl__list_dir\` / \`read_file\` / \`grep\` — browse shared/project files (\`/user\`, \`/shared\`, \`/tmp\`, \`/nb\`)
-
-All writes and executions are gated by the user's on-device permission settings
-(Review mode, write scope, confirm dialogs). Respect them — don't try to work around a denial.
-
-## Languages
-Cells run Python (Pyodide), R (webR), Prolog (SWI-WASM), Lua, Bash, JavaScript, or TypR.
-
-## Mirroring a session to the notebook
-The user is often on a phone where terminal scrollback is limited (and a full-screen
-TUI has none). When a session produces useful history, **mirror a cleaned summary
-into a notebook cell** (\`create_cell\` markdown, or append to a dedicated "Session
-log" cell) so they can scroll and keep it. Strip the noise — drop verbose tool-call
-dumps, redraw spam, and repeated prompts; keep the commands run, key outputs,
-decisions, and conclusions. Ask before writing large logs, and respect Review mode.
-
-## Notebook workflow guide — READ THIS
-Detailed guidance for driving the notebook (full tool list, the cell model,
-per-language conventions, common workflows) lives in a plain markdown file:
-
-    .claude/skills/scirepl-notebook/SKILL.md   (Claude Code)
-    .agents/skills/scirepl-notebook/SKILL.md   (Antigravity / agy)
-
-If your CLI auto-loads Agent Skills (e.g. Claude Code) it's already available as the
-\`scirepl-notebook\` skill. **Otherwise (e.g. codex/gemini), read that file** with
-your file-read tool before working on the notebook — it's just markdown.
-`;
-
-const BROKER_DIR = path.dirname(fileURLToPath(import.meta.url));
-
-// The set of broker-managed workspace files and their canonical content. The
-// markdown comes from SCIREPL_CONTEXT_MD; the skill tree is mirrored from
-// src/skills/. Used by both the doctor (status) and the seeder (create/update).
-function managedTargets() {
-    const targets = [
-        { rel: 'CLAUDE.md', abs: path.join(AGENT_CWD, 'CLAUDE.md'), content: Buffer.from(SCIREPL_CONTEXT_MD) },  // claude
-        { rel: 'AGENTS.md', abs: path.join(AGENT_CWD, 'AGENTS.md'), content: Buffer.from(SCIREPL_CONTEXT_MD) },  // codex + generic
-        { rel: 'GEMINI.md', abs: path.join(AGENT_CWD, 'GEMINI.md'), content: Buffer.from(SCIREPL_CONTEXT_MD) },  // gemini
-        { rel: '.agents/AGENTS.md', abs: path.join(AGENT_CWD, '.agents', 'AGENTS.md'), content: Buffer.from(SCIREPL_CONTEXT_MD) },  // antigravity (agy) rules
-        { rel: '.codex/config.toml', abs: path.join(AGENT_CWD, '.codex', 'config.toml'), content: Buffer.from(codexProjectConfig()), dynamic: true },  // codex MCP
-        { rel: '.gemini/settings.json', abs: path.join(AGENT_CWD, '.gemini', 'settings.json'), content: Buffer.from(geminiSettings()), dynamic: true },  // gemini MCP
-    ];
-    // Seed the skill under BOTH conventions: .claude/skills (Claude Code) and
-    // .agents/skills (Antigravity). codex/gemini read the markdown via the context files.
-    const skillsSrc = path.join(BROKER_DIR, 'skills');
-    const walk = (dir, base) => {
-        if (!fs.existsSync(dir)) return;
-        for (const ent of fs.readdirSync(dir, { withFileTypes: true })) {
-            const s = path.join(dir, ent.name), under = base ? `${base}/${ent.name}` : ent.name;
-            if (ent.isDirectory()) { walk(s, under); continue; }
-            const buf = fs.readFileSync(s);
-            targets.push({ rel: `.claude/skills/${under}`, abs: path.join(AGENT_CWD, '.claude', 'skills', under), content: buf });
-            targets.push({ rel: `.agents/skills/${under}`, abs: path.join(AGENT_CWD, '.agents', 'skills', under), content: buf });
-        }
-    };
-    walk(skillsSrc, '');
-    return targets;
+function workspaceInspection() {
+    try { return inspectWorkspace(WORKSPACE_OPTIONS); }
+    catch (error) {
+        return { ready: false, files: {}, missing: [], outdated: [], unsafe: [], error: error.message || String(error) };
+    }
 }
-function targetState(t) { try { if (!fs.existsSync(t.abs)) return 'missing'; return fs.readFileSync(t.abs).equals(t.content) ? 'current' : 'outdated'; } catch { return 'missing'; } }
-function writePrivateFile(p, content) {
-    fs.mkdirSync(path.dirname(p), { recursive: true, mode: 0o700 });
-    fs.writeFileSync(p, content, { mode: 0o600 });
-    try { fs.chmodSync(p, 0o600); } catch (_) {}
-}
-function backupFile(p) {
+
+function workspaceDirectoryProblem() {
     try {
-        const ts = new Date().toISOString().replace(/[:.]/g, '-');
-        const bak = `${p}.bak-${ts}`;
-        fs.copyFileSync(p, bak);
-        try { fs.chmodSync(bak, 0o600); } catch (_) {}
-        return bak;
-    } catch { return null; }
+        if (!fs.existsSync(AGENT_CWD) || !fs.statSync(AGENT_CWD).isDirectory()) {
+            return 'agent workspace does not exist — run the explicit broker setup command first';
+        }
+    } catch (_) {
+        return 'agent workspace cannot be accessed safely';
+    }
+    return null;
 }
 
-// Seed the workspace. overwrite=false (startup): create missing files only, except
-// dynamic client configs that must track the current broker port/token. overwrite=true
-// (explicit doctor fix): also update OUTDATED files, backing up each one first.
-function seedWorkspace({ overwrite } = {}) {
-    const result = { created: [], updated: [], backups: [], skipped: [] };
-    if (!MANAGE_WORKSPACE) return result;
-    try {
-        for (const t of managedTargets()) {
-            const st = targetState(t);
-            if (st === 'missing') { writePrivateFile(t.abs, t.content); result.created.push(t.rel); }
-            else if (st === 'outdated' && (overwrite || t.dynamic)) {
-                if (overwrite && !t.dynamic) { const b = backupFile(t.abs); if (b) result.backups.push(path.basename(b)); }
-                writePrivateFile(t.abs, t.content); result.updated.push(t.rel);
-            }
-            else result.skipped.push(t.rel);
-        }
-    } catch (e) { console.warn('[broker] workspace seed failed:', e.message); }
-    return result;
+function agentWorkspaceProblem() {
+    const directoryProblem = workspaceDirectoryProblem();
+    if (directoryProblem) return directoryProblem;
+    if (ALLOW_UNMANAGED_AGENT_WORKSPACE || workspaceInspection().ready) return null;
+    return 'agent workspace is not prepared — run setup-broker.sh or setup-broker.ps1 with --enable-agent, or explicitly set BROKER_ALLOW_UNMANAGED_AGENT_WORKSPACE=1 for a self-managed workspace';
 }
-function ensureWorkspace() { try { fs.mkdirSync(AGENT_CWD, { recursive: true, mode: 0o700 }); } catch (_) {} return seedWorkspace({ overwrite: false }); }
 
 // ── Doctor: report remote-environment deficiencies (read-only). Fixes happen
 //    only on an explicit POST, which backs up any file it changes. ─────────────
 function hasCmd(c) { try { return spawnSync('sh', ['-c', `command -v ${c}`], { timeout: 4000 }).status === 0; } catch { return false; } }
 function doctorReport() {
-    const files = {}, missing = [], outdated = [];
-    if (MANAGE_WORKSPACE) for (const t of managedTargets()) { const st = targetState(t); files[t.rel] = st; if (st === 'missing') missing.push(t.rel); else if (st === 'outdated') outdated.push(t.rel); }
+    const inspection = workspaceInspection();
     const agents = { claude: hasCmd('claude'), codex: hasCmd('codex'), gemini: hasCmd('gemini'), agy: hasCmd('agy') };
     const deficiencies = [];
-    for (const m of missing) deficiencies.push(`missing ${m}`);
-    if (!MANAGE_WORKSPACE) deficiencies.push("custom BROKER_AGENT_CWD — broker won't auto-manage workspace files");
+    const directoryProblem = workspaceDirectoryProblem();
+    if (AGENT_ENABLED && directoryProblem) deficiencies.push(directoryProblem);
+    else if (AGENT_ENABLED && !inspection.ready && !ALLOW_UNMANAGED_AGENT_WORKSPACE) {
+        for (const m of inspection.missing) deficiencies.push(`missing ${m}`);
+        for (const m of inspection.outdated) deficiencies.push(`outdated ${m}`);
+        for (const m of inspection.unsafe) deficiencies.push(`unsafe ${m}`);
+        if (inspection.error) deficiencies.push(`workspace inspection failed: ${inspection.error}`);
+    }
     if (AGENT_ENABLED && !Object.values(agents).some(Boolean)) deficiencies.push('remote agents enabled, but no supported agent CLI was found on PATH');
-    // "fixable" = things a POST /doctor can actually resolve (managed files only).
-    const fixable = MANAGE_WORKSPACE ? [...missing, ...outdated] : [];
-    return { ok: deficiencies.length === 0 && outdated.length === 0, workspace: AGENT_CWD, managed: MANAGE_WORKSPACE, files, agents, agentEnabled: AGENT_ENABLED, termEnabled: TERM_ENABLED, missing, outdated, fixable, deficiencies };
+    const fixable = MANAGE_WORKSPACE ? [...inspection.missing, ...inspection.outdated] : [];
+    return {
+        ok: deficiencies.length === 0,
+        workspace: AGENT_CWD,
+        managed: MANAGE_WORKSPACE,
+        allowUnmanaged: ALLOW_UNMANAGED_AGENT_WORKSPACE,
+        workspaceReady: inspection.ready,
+        files: inspection.files,
+        agents,
+        agentEnabled: AGENT_ENABLED,
+        termEnabled: TERM_ENABLED,
+        missing: inspection.missing,
+        outdated: inspection.outdated,
+        unsafe: inspection.unsafe,
+        fixable,
+        deficiencies,
+    };
 }
 
 // Spawned processes receive a small environment allowlist by default. Set
@@ -258,25 +193,6 @@ function spawnEnv() {
     Object.assign(env, { SCIREPL_SESSION: '1', SCIREPL_BROKER_PORT: String(PORT), SCIREPL_MCP: 'scirepl', SCIREPL_MCP_BEARER: TOKEN });
     return env;
 }
-// gemini reads MCP servers from <cwd>/.gemini/settings.json (trusted http server,
-// so its tools run without an interactive prompt). Token inline (local file).
-function geminiSettings() {
-    return JSON.stringify({ mcpServers: { scirepl: { url: `http://127.0.0.1:${PORT}/mcp`, type: 'http', headers: { Authorization: `Bearer ${TOKEN}` }, trust: true } } }, null, 2) + '\n';
-}
-// codex reads project-scoped .codex/config.toml from the terminal cwd. Keep the
-// token in the inherited environment so this file is stable across broker restarts.
-function codexProjectConfig() {
-    return [
-        '[mcp_servers.scirepl]',
-        `url = "http://127.0.0.1:${PORT}/mcp"`,
-        'bearer_token_env_var = "SCIREPL_MCP_BEARER"',
-        'required = true',
-        'default_tools_approval_mode = "approve"',
-        `tool_timeout_sec = ${Math.ceil(CALL_TIMEOUT_MS / 1000)}`,
-        '',
-    ].join('\n');
-}
-
 // ── Terminal config (§14C). /term exposes a REAL PTY (full shell) on this
 //    machine, so it is OFF unless explicitly enabled. ──────────────────────────
 const TERM_ENABLED = process.env.BROKER_TERM === '1';
@@ -452,6 +368,8 @@ const agentBridge = {
     running() { return !!this.child; },
     start(ws, name) {
         if (!AGENT_ENABLED) { sendWsJson(ws, { type: 'agent', kind: 'error', text: 'remote agents disabled — restart with BROKER_AGENT=1 after reviewing the host-access warning' }, MAX_AGENT_BUFFER_BYTES); return; }
+        const workspaceProblem = agentWorkspaceProblem();
+        if (workspaceProblem) { sendWsJson(ws, { type: 'agent', kind: 'error', text: workspaceProblem }, MAX_AGENT_BUFFER_BYTES); return; }
         const prof = AGENT_PROFILES[name];
         if (!prof) { sendWsJson(ws, { type: 'agent', kind: 'error', text: `unknown agent: ${name}` }, MAX_AGENT_BUFFER_BYTES); return; }
         // One-shot agents (codex/gemini): no long-lived process — each turn spawns a
@@ -659,9 +577,17 @@ const termBridge = {
         }
         const spec = resolveTermCmd(opts.cmd);
         if (!spec) { send0({ kind: 'error', text: `command not allowed: ${opts.cmd} (allowed: ${TERM_CMDS.join(', ')})` }); return; }
+        if ((opts.cmd || 'shell').trim() !== 'shell') {
+            const workspaceProblem = agentWorkspaceProblem();
+            if (workspaceProblem) { send0({ kind: 'error', text: workspaceProblem }); return; }
+        }
         let ptyLib;
         try { ptyLib = (await import('node-pty')).default || (await import('node-pty')); }
         catch (e) { send0({ kind: 'error', text: 'node-pty not installed on the broker host' }); return; }
+        if (!fs.existsSync(AGENT_CWD) || !fs.statSync(AGENT_CWD).isDirectory()) {
+            send0({ kind: 'error', text: 'terminal workspace does not exist — run the explicit broker setup command first' });
+            return;
+        }
         const env = { ...spawnEnv(), TERM: 'xterm-256color' };
         this.cols = opts.cols || 80; this.rows = opts.rows || 24;
         let p;
@@ -762,6 +688,7 @@ const httpServer = http.createServer(async (req, res) => {
     const url = new URL(req.url, `http://127.0.0.1:${PORT}`);
 
     if (url.pathname === '/health') {
+        const workspaceReady = workspaceInspection().ready;
         res.writeHead(200, { 'content-type': 'application/json' });
         res.end(JSON.stringify({
             ok: true,
@@ -771,6 +698,7 @@ const httpServer = http.createServer(async (req, res) => {
             tools: appBridge.tools.length,
             agentEnabled: AGENT_ENABLED,
             termEnabled: TERM_ENABLED,
+            workspaceReady,
         }));
         return;
     }
@@ -782,7 +710,19 @@ const httpServer = http.createServer(async (req, res) => {
     if (url.pathname === '/doctor') {
         if (!tokenMatches(bearer(req))) { res.writeHead(401, { 'content-type': 'application/json' }); res.end(JSON.stringify({ error: 'unauthorized' })); return; }
         let applied = null;
-        if (req.method === 'POST') applied = seedWorkspace({ overwrite: true });
+        if (req.method === 'POST') {
+            if (!MANAGE_WORKSPACE) {
+                res.writeHead(409, { 'content-type': 'application/json' });
+                res.end(JSON.stringify({ error: 'workspace repair is disabled; use the explicit setup command or start its generated launcher' }));
+                return;
+            }
+            try { applied = setupWorkspace(WORKSPACE_OPTIONS, { repair: true }); }
+            catch (error) {
+                res.writeHead(409, { 'content-type': 'application/json' });
+                res.end(JSON.stringify({ error: error.message || String(error), ...doctorReport() }));
+                return;
+            }
+        }
         res.writeHead(200, { 'content-type': 'application/json' });
         res.end(JSON.stringify({ applied, ...doctorReport() }));
         return;
@@ -892,9 +832,10 @@ agentWss.on('connection', (ws) => {
             authed = true;
             const configuredAgents = Object.keys(AGENT_PROFILES);
             const availableAgents = configuredAgents.filter(name => hasCmd(AGENT_PROFILES[name].cmd));
+            const workspaceReady = !agentWorkspaceProblem();
             // Existing Pro clients read only `agents`, so make that the usable
             // subset. `configuredAgents` preserves discovery/debug information.
-            sendWsJson(ws, { type: 'agent', kind: 'welcome', protocolVersion: PROTOCOL_VERSION, agents: availableAgents, availableAgents, configuredAgents, running: agentBridge.running() && agentBridge.name }, MAX_AGENT_BUFFER_BYTES);
+            sendWsJson(ws, { type: 'agent', kind: 'welcome', protocolVersion: PROTOCOL_VERSION, agents: workspaceReady ? availableAgents : [], availableAgents, configuredAgents, workspaceReady, running: agentBridge.running() && agentBridge.name }, MAX_AGENT_BUFFER_BYTES);
             return;
         }
         if (!authed) return;
@@ -929,15 +870,18 @@ termWss.on('connection', (ws) => {
     ws.on('close', () => termBridge.detach(ws)); // keep PTY alive for reconnect
 });
 
-ensureWorkspace();
 httpServer.listen(PORT, HOST, () => {
-    console.log(`[broker] listening on ${HOST}:${PORT}${HOST === '127.0.0.1' ? ' (loopback only — reach via tailscale serve or ssh -L)' : ''}`);
-    console.log(`[broker]   workspace:     ${AGENT_CWD}${MANAGE_WORKSPACE ? ' (seeded CLAUDE.md/AGENTS.md)' : ''}`);
-    console.log(`[broker]   MCP endpoint:  http://127.0.0.1:${PORT}/mcp   (Authorization: Bearer <token>)`);
-    console.log(`[broker]   app WebSocket: ws://127.0.0.1:${PORT}/app`);
-    console.log(`[broker]   agent WS:      ${AGENT_ENABLED ? 'ENABLED ws://127.0.0.1:' + PORT + '/agent (agents: ' + Object.keys(AGENT_PROFILES).join(', ') + ')' : 'disabled (set BROKER_AGENT=1 after reviewing SECURITY.md)'}`);
+    const workspace = workspaceInspection();
+    const loopback = HOST === '127.0.0.1' || HOST === '::1' || HOST === 'localhost';
+    const displayHostname = HOST === '0.0.0.0' || HOST === '::' ? '127.0.0.1' : HOST;
+    const displayHost = displayHostname.includes(':') ? `[${displayHostname}]` : displayHostname;
+    console.log(`[broker] listening on ${HOST}:${PORT}${loopback ? ' (loopback only — reach via tailscale serve or ssh -L)' : ''}`);
+    console.log(`[broker]   workspace:     ${AGENT_CWD} (${workspace.ready ? 'prepared' : 'not prepared'}${MANAGE_WORKSPACE ? ', explicit repair enabled' : ''})`);
+    console.log(`[broker]   MCP endpoint:  http://${displayHost}:${PORT}/mcp   (Authorization: Bearer <token>)`);
+    console.log(`[broker]   app WebSocket: ws://${displayHost}:${PORT}/app`);
+    console.log(`[broker]   agent WS:      ${AGENT_ENABLED ? 'ENABLED ws://' + displayHost + ':' + PORT + '/agent (agents: ' + Object.keys(AGENT_PROFILES).join(', ') + ')' : 'disabled (set BROKER_AGENT=1 after reviewing SECURITY.md)'}`);
     if (AGENT_ENABLED) console.log(`[broker]   agent access:  Claude ${AGENT_FULL_ACCESS ? 'full host tools' : 'allowlist ' + AGENT_ALLOWED_TOOLS}; other CLIs may retain normal host capabilities; environment ${AGENT_INHERIT_ENV ? 'inherited' : 'restricted'}`);
-    console.log(`[broker]   terminal:      ${TERM_ENABLED ? 'ENABLED ws://127.0.0.1:' + PORT + '/term (cmds: ' + TERM_CMDS.join(', ') + ')' + (TERM_NO_SHELL ? ' [no-shell: agents only, no shell escape]' : '') : 'disabled (set BROKER_TERM=1 to expose a PTY)'}`);
+    console.log(`[broker]   terminal:      ${TERM_ENABLED ? 'ENABLED ws://' + displayHost + ':' + PORT + '/term (cmds: ' + TERM_CMDS.join(', ') + ')' + (TERM_NO_SHELL ? ' [no-shell: agents only, no shell escape]' : '') : 'disabled (set BROKER_TERM=1 to expose a PTY)'}`);
     console.log(`[broker]   pairing token: ${TOKEN_INFO.source === 'BROKER_TOKEN' ? 'provided by BROKER_TOKEN (not printed)' : 'stored in ' + TOKEN_INFO.source + ' (mode 0600)'}`);
     console.log('[broker] For remote access, keep loopback binding and use Tailscale Serve or an SSH tunnel.');
 });

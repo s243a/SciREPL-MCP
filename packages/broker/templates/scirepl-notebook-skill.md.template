@@ -1,0 +1,72 @@
+---
+name: scirepl-notebook
+description: Use when working inside a SciREPL session to inspect, edit, run, or create notebook cells, or browse the permitted virtual filesystem.
+---
+
+# Driving a SciREPL notebook
+
+SciREPL is a mobile/PWA multi-language scientific notebook. You were launched by
+it through its MCP broker, so the user's work lives in **notebook cells on their
+device**, not in files in this working directory. You act on the notebook through
+the `scirepl` MCP tools, shown as `mcp__scirepl__<tool>`.
+
+## When this applies
+
+- `SCIREPL_SESSION=1` is set in the environment, or
+- an MCP server named `scirepl` is configured.
+
+If neither holds, do not use these tools. If the session variable is present but
+the MCP tools are absent, ask the user to reconnect the Remote bridge and restart
+or reselect the remote agent. Do not substitute shell files for notebook cells.
+
+## The cell model
+
+A notebook is an ordered list of cells. Each has a one-based index, optional
+name, language, code, and—after execution—output. Reference cells by name or
+index.
+
+## Tools
+
+- `list_cells` — begin here to understand the notebook.
+- `read_cell` and `read_cells` — inspect code, output, language, or type. Prefer
+  a batch read when loading several cells.
+- `write_cell`, `create_cell`, and `rename_cell` — change notebook content.
+- `execute_cell` and `run_cells` — run one cell or an ordered prefix.
+- `inspect_namespace` — inspect live Python or R values without adding a cell.
+- `list_dir`, `read_file`, and `grep` — read permitted virtual files under
+  `/user`, `/shared`, `/tmp`, and `/nb`.
+
+## Working etiquette
+
+- Look before acting: list and read cells before editing.
+- Device permissions are authoritative. Respect Review mode, write scope,
+  per-tool and per-kernel rules, remote-data consent, and confirmation prompts.
+- Creating or editing a cell does not authorize running it. Execute separately
+  only when requested and permitted.
+- Keep edits minimal and match the existing language and style.
+- JavaScript runs in the browser context, and some other kernels can bridge to
+  browser APIs. Kernel permission is authorization, not a complete sandbox.
+
+## Language notes
+
+- Python runs through Pyodide; pure-Python packages can be installed with
+  `%pip`. Use notebook helpers for plots and cross-cell data.
+- TypR compiles to R, so TypR execution also requires permission for R.
+- Cross-language data sharing uses notebook cell properties and the shared VFS,
+  not ordinary in-process globals.
+
+## Mobile-friendly session logs
+
+When useful, offer to create or update a concise markdown session-log cell.
+Retain key commands, results, decisions, and conclusions. Remove terminal redraw
+noise and verbose tool traces. Ask before writing a large log and never write in
+Review mode.
+
+## Typical workflows
+
+- Review: `list_cells`, batch-read relevant cells, then summarize and suggest.
+- Add analysis: inspect context, create a cell, and let the user run it unless
+  execution was requested.
+- Fix a bug: read code and output, make the smallest correction, then optionally
+  execute and verify.
+- Use project source: ground changes with `grep` and `read_file` under `/user`.

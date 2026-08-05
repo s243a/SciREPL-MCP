@@ -29,6 +29,27 @@ reads, writes, and execution are then governed by the app's own permission
 settings. Those settings protect the notebook; they do not control the broker
 host.
 
+### Playwright driver
+
+The Playwright package is a stdio MCP server and does not listen on a network
+port itself. It trusts the MCP client that launches it and inherits the host
+account's operating-system permissions. Its tools intentionally can:
+
+- navigate Chromium to a user-selected URL and control the resulting page;
+- read host files named in workbook import, local-package, and VFS-overlay
+  requests;
+- enumerate host directories selected for a VFS overlay;
+- write screenshots and workbook downloads to host paths;
+- automatically accept JavaScript dialogs; and
+- control the complete browser profile supplied through a CDP connection.
+
+Use a dedicated browser profile and a minimally privileged host account. Do not
+attach it to a personal browsing session or expose the launching MCP client to
+untrusted users. The settings tool redacts values whose names indicate API keys,
+tokens, credentials, passwords, secrets, or profiles. This reduces accidental
+disclosure but is not a sandbox: an authorized JavaScript-kernel call still
+controls the SciREPL page.
+
 ### Remote agents
 
 `/agent` is disabled unless `BROKER_AGENT=1` is set. Enabling it permits an

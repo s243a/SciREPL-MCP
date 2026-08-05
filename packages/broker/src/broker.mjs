@@ -13,7 +13,7 @@
  * in a private file) is required on both links — Bearer on /mcp and in the
  * initial WebSocket hello.
  *
- * See docs/configuration.md for environment settings.
+ * See ../../../docs/configuration.md for environment settings in the source tree.
  * Run: npm start
  */
 import http from 'node:http';

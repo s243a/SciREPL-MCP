@@ -13,6 +13,22 @@ Initial extraction source:
 - License: MIT, copyright 2026 UnifyWeaver Project
 
 The extracted broker was then adapted for standalone packaging and hardened
-before publication. The public repository is intended to become the canonical
-source for the host-side broker. SciREPL Pro remains the source for the Android
-app and its app-side bridge.
+before publication.
+
+The Playwright driver was migrated from the public UnifyWeaver repository:
+
+- UnifyWeaver commit: `82e0766555b42c6399e4f69c1155af101b4d2e5d`
+- Commit date: 2026-04-15
+- Original implementation: `examples/sci-repl/scirepl-mcp-server.js`
+- Original documentation: `examples/sci-repl/MCP_README.md` and
+  `skills/skill_scirepl_mcp_claude.md`
+- License: MIT, copyright 2026 UnifyWeaver Project
+
+During migration the driver was repackaged, its documentation and skill were
+made client-neutral, and compatibility and security defects were corrected.
+The imported code does not include the SciREPL application, the UnifyWeaver
+source tree, or the adjacent SciREPL Git submodule.
+
+This repository is intended to become the canonical source for both host-side
+servers. SciREPL Pro remains the source for the Android app and its app-side
+bridge.

@@ -1,0 +1,50 @@
+{
+  "name": "scirepl-mcp-playwright-driver",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Playwright-based stdio MCP server for SciREPL browser and workbook automation",
+  "type": "commonjs",
+  "main": "src/server.cjs",
+  "bin": {
+    "scirepl-mcp-playwright": "src/server.cjs"
+  },
+  "files": [
+    "src",
+    "skills",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "start": "node src/server.cjs",
+    "check": "node --check src/server.cjs",
+    "test": "node --test test/driver.test.cjs test/stdio.test.mjs",
+    "test:browser": "node --test test/browser.smoke.cjs",
+    "test:scirepl": "node --test test/scirepl.smoke.cjs",
+    "audit": "npm audit --omit=dev"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "keywords": [
+    "scirepl",
+    "mcp",
+    "model-context-protocol",
+    "playwright",
+    "notebook",
+    "browser-automation"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/s243a/SciREPL-MCP.git",
+    "directory": "packages/playwright-driver"
+  },
+  "homepage": "https://github.com/s243a/SciREPL-MCP/tree/main/packages/playwright-driver#readme",
+  "bugs": {
+    "url": "https://github.com/s243a/SciREPL-MCP/issues"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "playwright": "^1.62.1"
+  }
+}

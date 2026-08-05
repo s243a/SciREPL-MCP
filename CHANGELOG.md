@@ -15,3 +15,10 @@
   agent output/backpressure without limiting normal multi-megabyte plot results.
 - Document the protocol, security model, configuration, supported platforms,
   and source provenance.
+- Import the existing public Playwright/CDP driver as an independently
+  installable package with a real stdio protocol test and Chromium smoke test.
+- Add TypR and ClojureScript to the Playwright tool schemas, redact stored API
+  keys and pairing data, validate tool arguments, fix directory globs, preserve
+  attached browser tabs, and make deterministic UI reruns observable.
+- Split the repository into dependency-isolated `broker` and
+  `playwright-driver` packages so broker users do not install browser tooling.

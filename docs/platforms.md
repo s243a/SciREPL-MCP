@@ -5,6 +5,9 @@ The core broker is JavaScript. The only optional native component is
 broker will run; never move a populated `node_modules` directory between CPUs or
 operating systems.
 
+The commands in this guide are for the app-connected broker and assume the
+current directory is `SciREPL-MCP/packages/broker`.
+
 ## Linux and WSL
 
 Node.js 22 is the recommended baseline:
@@ -68,7 +71,7 @@ Install a local toolchain:
 pkg update
 pkg install git nodejs-lts python make clang
 git clone https://github.com/s243a/SciREPL-MCP.git
-cd SciREPL-MCP
+cd SciREPL-MCP/packages/broker
 npm ci --omit=optional
 npm test
 ```
@@ -130,7 +133,6 @@ Before the first public binary or npm release, the project should add:
 
 - signed Git tags;
 - source-archive SHA-256 checksums;
-- a CI matrix for supported Node versions and operating systems;
 - a recorded `node-pty` build matrix for tested devices;
 - dependency-license and vulnerability reports attached to each release.
 

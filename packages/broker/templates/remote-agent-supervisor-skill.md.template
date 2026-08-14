@@ -1,0 +1,91 @@
+---
+name: remote-agent-supervisor
+description: Use when driving a coding agent (agy, gemini, codex) through the SciREPL-MCP broker's /agent or /term surfaces as its supervisor — sending it tasks, reviewing its permission prompts per action, and verifying its output. For the CONTROLLING agent, not the spawned one.
+---
+
+# Supervising a remote coding agent through the broker
+
+You are the controller. A cheaper or more specialised agent does the volume
+work inside a repository; you send it tasks, review what it asks permission
+for, and verify what it produced. The broker sits between you: it spawns the
+agent on its host, and you speak to it over authenticated WebSockets.
+
+## Broker configuration to require
+
+Ask the operator to start the broker with the agent named explicitly and no
+shell on the terminal surface:
+
+```bash
+BROKER_HOST=<tailscale-ip> \
+BROKER_AGENT=1 \
+BROKER_TERM=1 \
+BROKER_TERM_CMDS=agy \
+BROKER_AGENT_CWD=<repo the agent may modify> \
+BROKER_ALLOW_UNMANAGED_AGENT_WORKSPACE=1 \
+node packages/broker/src/broker.mjs
+```
+
+`BROKER_TERM_CMDS` with a single agent name — never `shell` — is the point:
+the PTY can only ever become that agent, and the agent's own per-action
+permission prompts become the review surface. General shell access would skip
+every prompt. `BROKER_AGENT_CWD` should be a **git repository**: git is the
+audit trail and the rollback, and the diff is your highest-bandwidth view of
+what the agent actually did.
+
+## Choosing a surface
+
+| Surface | Protocol | Use when |
+| --- | --- | --- |
+| `/agent` | `hello{token}` → `start{agent}` → `input{text}`; reply arrives as one buffered blob per turn | The spawned agent needs no permissions (pure Q&A, or grants already exist). Simple, but output is all-or-nothing and permission denials fail silently into stderr. |
+| `/term` | `hello{token}` → `start{cmd,cols,rows}` → `input{data}` / `data` events | The agent will need file or command permissions. Its interactive prompts appear in the stream and you answer each one. This is the supervised path — prefer it. |
+
+Driver scripts for both live in `packages/broker/scripts/` (`agent-drive.mjs`,
+`term-drive.mjs`). The PTY survives WebSocket disconnects, so a
+connect–act–read–detach loop from blocking tool calls works; expect the TUI to
+redraw the current screen on reattach.
+
+## Permission review policy
+
+Apply per prompt, no exceptions:
+
+1. **Never choose an "always allow" option**, and never one that persists to
+   the agent's settings. Plain yes or plain no, every time. Standing grants
+   are the operator's decision, not yours.
+2. **Never approve what you cannot fully see.** If the prompt shows
+   `⋯ (N lines hidden)`, expand it first (ctrl+g in agy). An unrecognised or
+   partially visible request defaults to deny.
+3. **Approve**: read-only inspection inside the workspace; writes whose target
+   is inside the workspace subtree the task owns and whose shown diff matches
+   the task.
+4. **Deny**: git commands (committing is the controller's job, after review);
+   writes outside the workspace; network access; edits to files the task
+   declared read-only; anything else. After denying, tell the agent why in one
+   line so it can take another approach.
+5. **Audit every decision**: one line per prompt — what was requested,
+   approved/denied, why. The audit trail is part of your deliverable.
+
+## Delegation pattern
+
+The review loop is chatty (many small PTY reads). If your platform supports
+subagents, hand the loop to one — give it the driver invocation, this policy
+verbatim, the task description, and the audit obligation — and keep only its
+final report in your context. Reserve for yourself:
+
+- **Verification.** Never let the spawned agent (or the reviewing subagent)
+  verify its own work. Check the produced files mechanically — diffs against
+  sources, structural invariants, whatever the task defines as correct.
+- **Commits.** Review `git status` and `git diff` yourself before anything is
+  committed.
+- **Privilege changes.** If the loop is blocked on a permission the policy
+  cannot approve, stop and surface it to the human. Do not edit the spawned
+  agent's permission configuration.
+
+## Security honesty
+
+Restricting `BROKER_TERM_CMDS` to one agent is defence-in-depth, not a
+sandbox. A token holder who drives the PTY can approve the agent's own
+command prompts, so the effective ceiling of a stolen token is still command
+execution as the broker's user — reached noisily, through an agent that
+refuses obvious abuse and a stream that is fully loggable, but reached.
+Treat the token like an SSH key: 0600 file, never clipboard, tailnet ACLs,
+loopback + tunnel where possible.

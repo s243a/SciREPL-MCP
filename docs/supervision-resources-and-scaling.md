@@ -62,6 +62,19 @@ verify each batch") reads as a sequential plan. Parallelism, if wanted,
 should come from explicit parallel lanes (previous section), which keeps
 each approval stream attributable to one supervisor.
 
+**Session reuse is the largest single speedup measured.** Repeating the
+same task shape in a continued worker session (second 15-file locale in
+the same conversation as the first) took ~10 minutes and 7 approvals
+against the fresh session's ~39 minutes and 30: the worker skipped all
+format probing and went straight to its proven script templates. Two
+caveats keep this from being free: conversational context accumulates
+(per-turn input cost grows with history, and limits eventually bite), and
+the knowledge is session-scoped — it evaporates on restart. Mitigation:
+make task files self-contained (terminology, format rules, and
+constraints in the file, not the conversation) so restarting costs one
+re-probing run, not a knowledge loss; continue sessions while they stay
+fast and treat slowdown as the restart signal.
+
 ## The cost of review
 
 Supervisor context spend, per session (Claude tokens, tool calls):

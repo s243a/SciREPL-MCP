@@ -275,6 +275,7 @@ terms. The broker cannot make a third-party model service "on-device."
 
 - [Agent context and explicit workspace setup](https://github.com/s243a/SciREPL-MCP/blob/main/docs/agent-context.md)
 - [Controlling a remote coding agent, with supervision](https://github.com/s243a/SciREPL-MCP/blob/main/docs/remote-agent-control.md)
+- [Supervised runs: resources, scaling, and the cost of review](https://github.com/s243a/SciREPL-MCP/blob/main/docs/supervision-resources-and-scaling.md)
 - [Configuration reference](https://github.com/s243a/SciREPL-MCP/blob/main/docs/configuration.md)
 - [Wire protocol](https://github.com/s243a/SciREPL-MCP/blob/main/docs/protocol.md)
 - [Platform and device builds](https://github.com/s243a/SciREPL-MCP/blob/main/docs/platforms.md)

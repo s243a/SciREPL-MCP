@@ -97,6 +97,16 @@ Tokens per approval fall as sessions grow — the sublinear-review claim in a
 single column. ~6k tokens per reviewed permission is a useful planning
 figure for large sessions.
 
+Both falling curves (chars/min rising, tokens/approval falling) are
+measured over a narrow range and must saturate: amortization runs out of
+fixed cost to spread, leaving floors set by irreducible per-unit work —
+reading each script and diff, the worker's per-turn generation, provider
+rate limits, PTY/disk I/O, and coordination overhead between supervisor
+turns. Treat the trend as "bigger sessions are cheaper per unit up to the
+measured sizes," not as an invitation to extrapolate to arbitrarily large
+batches — especially since a single approval's risk grows with the batch
+it covers.
+
 Observations:
 
 - **Review is the serial path.** Worker generation time between prompts is

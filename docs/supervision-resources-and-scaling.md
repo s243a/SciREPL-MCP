@@ -99,18 +99,33 @@ Observations:
 
 ## Costs this document does not capture
 
-- Worker-side (Gemini) token/quota consumption — observed only as a weekly
-  quota percentage, too coarse to attribute per session. Two paths to real
-  numbers exist, neither exercised yet: (1) agy's TUI `/usage` command can
-  be sent through the PTY between sessions and its output captured —
-  bracketing a session with two readings gives a per-session delta at
-  whatever granularity the command reports; (2) CLIs running in JSON mode
-  report per-turn stats the broker already parses — the `gemini` one-shot
-  profile surfaces `o.stats` in its result events — so a worker driven in
-  JSON mode would yield exact per-turn token counts for free. agy's
-  plain-text mode reports nothing per turn; if token accounting matters,
-  that is an argument for teaching the agy adapter a JSON mode if one
-  becomes available.
+- Worker-side (Gemini) token/quota consumption per *supervised* session —
+  observed only as a weekly quota percentage during the runs. Paths to real
+  numbers, in order of quality:
+  1. **Headless JSON mode — verified working.** `agy --output-format json
+     -p "…"` returns `{conversation_id, status, response, duration_seconds,
+     num_turns, usage}` with `input_tokens`, `output_tokens`,
+     `thinking_tokens`, `cache_read_tokens`, `total_tokens`. A trivial
+     probe measured **~15.2k input tokens of fixed overhead per
+     invocation** (system prompt + tools) against 29 output tokens — the
+     token-level view of why fewer, larger sessions beat many small ones.
+     The broker's agy adapter predates this flag (its comment says "no
+     JSON mode"); teaching the one-shot profile `--output-format json` and
+     parsing `usage` would give per-turn accounting on the `/agent`
+     surface. **But note what headless costs in trust:** it cannot prompt,
+     so anything beyond read-only work needs standing grants or
+     `--dangerously-skip-permissions` — and recovering safety then means
+     sandboxing (isolated worktrees, containers, throwaway users), i.e.
+     the resource cost the supervised PTY path avoids. Headless JSON mode
+     is the right tool for *bounded read-only* jobs where exact token
+     accounting matters; for work that writes, per-action supervision
+     with coarser accounting remains the cheaper total package.
+  2. **TUI slash commands through the PTY.** `/term` is a real PTY, so
+     `/usage` and `/context` are just keystrokes — bracketing a session
+     with `/usage` readings yields a per-session quota delta, at
+     whatever coarseness the backend reports.
+  Interactive PTY sessions (the supervised path) still lack per-turn
+  numbers; slash-command bracketing is the available instrument there.
 - Controller-side orchestration tokens (task authoring, verification,
   commits) — interleaved with unrelated work in the same context.
 - Translation *quality* review by native speakers — deferred by design;

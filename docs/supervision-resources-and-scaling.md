@@ -24,8 +24,11 @@ Measured mid-run (`ps`/`free`, steady state):
 | Supervisor (Claude subagent) | **~0 local** | — | cloud context; its only local footprint is the transient driver process |
 
 **Rule of thumb: one parallel supervision lane ≈ +700 MB RAM and +20–25% of
-one core** (its own broker on another port, its own PTY, its own agy). The
-reference machine could host 3–4 lanes before memory pressure; in practice
+one core** (its own broker on another port, its own PTY, its own agy). That
+figure is orchestration RAM only — it excludes OS/WSL2 VM overhead and any
+co-resident workloads (browser test suites, builds), which on the reference
+machine are the larger and lumpier consumers. With that caveat the machine
+could host 3–4 lanes before memory pressure; in practice
 the ceiling is the controller's attention across interleaved reports, not
 hardware. Workers writing to disjoint directories need no git worktrees —
 partition by path and give the shared index a single writer.
@@ -48,7 +51,10 @@ byte-identical), increasing size. "md chars" is the translatable volume:
 | Batch of 5 (medium) | 5 | 11,642 | 19.4 min | 16 | ~600 chars/min |
 | **Whole locale (15 files)** | 15 | 27,922 | ~39 min | 30 | **~715 chars/min** |
 
-**Throughput rises with task size.** Session fixed costs — spin-up, the
+**Throughput rises with task size.** (The chars/min metric is
+translation-specific; expect different absolute numbers — though the same
+amortization shape — for code generation, refactoring, or analysis tasks.)
+Session fixed costs — spin-up, the
 worker probing file formats, writing its batch scripts — amortize across
 more files. The 15-file session did the same volume as four small sessions
 in roughly 60% of their combined time. Approvals also scale sublinearly
@@ -79,13 +85,17 @@ fast and treat slowdown as the restart signal.
 
 Supervisor context spend, per session (Claude tokens, tool calls):
 
-| Session | Approvals | Supervisor tokens | Tool calls | Duration |
-| --- | --- | --- | --- | --- |
-| Pilot (Opus) | 3 | 44k | 29 | 11 min |
-| Batch of 5 | 16 | 118k | 55 | 19 min |
-| Batch of 5 | 8 | 74k | 32 | 15 min |
-| Batch of 4 | 13 | 106k | 58 | 21 min |
-| Whole locale | 30 | 178k | 127 | 39 min |
+| Session | Approvals | Supervisor tokens | Tokens/approval | Tool calls | Duration |
+| --- | --- | --- | --- | --- | --- |
+| Pilot (Opus) | 3 | 44k | ~14.7k | 29 | 11 min |
+| Batch of 5 | 16 | 118k | ~7.4k | 55 | 19 min |
+| Batch of 5 | 8 | 74k | ~9.3k | 32 | 15 min |
+| Batch of 4 | 13 | 106k | ~8.2k | 58 | 21 min |
+| Whole locale | 30 | 178k | ~5.9k | 127 | 39 min |
+
+Tokens per approval fall as sessions grow — the sublinear-review claim in a
+single column. ~6k tokens per reviewed permission is a useful planning
+figure for large sessions.
 
 Observations:
 
@@ -140,6 +150,11 @@ Observations:
   Interactive PTY sessions (the supervised path) still lack per-turn
   numbers; slash-command bracketing is the available instrument there.
 - Controller-side orchestration tokens (task authoring, verification,
-  commits) — interleaved with unrelated work in the same context.
+  commits) — interleaved with unrelated work in the same context. Rough
+  order of magnitude from this campaign: per locale, noticeably below one
+  supervisor session's spend — verification is mechanical (gate scripts,
+  not reading translations) and task files are generated, so the
+  controller's marginal cost per repetition is small and front-loaded in
+  the first run.
 - Translation *quality* review by native speakers — deferred by design;
   the pipeline's gates prove structure, not prose.

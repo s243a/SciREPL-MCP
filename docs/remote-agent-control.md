@@ -219,10 +219,14 @@ value order:
    review referenced scripts (policy rule 3) without filesystem access to
    the broker host. Until it exists, remote supervisors must deny
    script-by-reference prompts.
-6. Token hardening, in ascending order of cost and honesty about limits: a
-   secret's confidentiality is bounded by the most-exposed principal that
-   legitimately reads it, so these raise attacker cost rather than create
-   boundaries. (a) Group-readable token file (`640`, dedicated group)
+6. Token hardening, in ascending order of cost and honesty about limits.
+   The bound that governs the whole ladder:
+
+   > **A secret's confidentiality is limited by the most-exposed principal
+   > that legitimately reads it.**
+
+   Every rung below therefore raises attacker cost rather than creating a
+   boundary. (a) Group-readable token file (`640`, dedicated group)
    only helps once broker and controller run as separate users — which is
    itself the first cheap sandboxing step. (b) Per-surface or short-lived
    tokens scope what a stolen string grants. (c) Tailscale Serve identity

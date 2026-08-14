@@ -154,6 +154,48 @@ bind to a tailnet address or loopback-plus-tunnel; treat tailnet ACLs as part
 of the perimeter; and rotate the token (delete the file; the broker
 regenerates) after any suspected exposure.
 
+### Design for post-compromise, not just prevention
+
+Every prevention measure above is friction — raising an attacker's cost,
+never zeroing their probability. In a system where agents act autonomously
+at machine speed, the properties that decide how bad a bad day gets are the
+post-compromise ones, and they are the ones most often left unbuilt:
+
+- **Audit trails.** Every worker action in this pattern passes through a
+  prompt that a supervisor logged with a verdict and a reason, and every
+  file change lands in git. When something goes wrong, "what exactly
+  happened, in what order, approved by whom" is a query, not a forensic
+  reconstruction. An audit trail that attributes actions to an identity
+  (see the tailnet-identity follow-up) is worth more than one that
+  attributes them to "whoever held the token".
+- **Revocation speed.** How long from "something is wrong" to "it can no
+  longer act"? Here: delete the token file and restart the broker —
+  seconds, one person, no coordination. Measure this in your own setup;
+  if revocation requires a meeting, the design is wrong.
+- **Blast-radius scoping.** The worker writes one directory subtree of one
+  git repository; the supervisor holds no standing grants; the index has a
+  single writer; commits happen only after verification. Assume the worker
+  (or its supervisor) goes fully hostile and ask what the maximum damage
+  is — then check whether that damage is (a) visible in the logs,
+  (b) reversible from git, (c) contained to the declared scope. If any
+  answer is no, fix the scope before adding more prevention.
+
+The pattern's honest security claim is not "attackers cannot act" — it is
+"every action is prompted, logged, attributed, and reversible." For
+autonomous-agent systems, that accountability property is usually the
+highest-value security investment available, and the easiest to skip.
+
+### Scope of this document
+
+These notes document one working pattern and the reasoning behind its
+choices. They are practitioner field notes, not a security review, a threat
+model, or a compliance artifact — and they are not a substitute for
+security expertise proportional to what the system protects. If the broker
+host touches production credentials, sensitive data, or systems whose
+compromise carries real-world consequences, have someone whose job is
+security review the deployment; nothing in these documents should be read
+as making that unnecessary.
+
 ## Known rough edges (both fixable in the broker)
 
 Observed in the first production run; candidate improvements, roughly in

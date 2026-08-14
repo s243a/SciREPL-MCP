@@ -86,14 +86,26 @@ carries the same rules for installation into a controller's skill directory.
    worker's settings file. Standing grants are a human decision.
 2. Never approve a partially hidden command. agy truncates long commands with
    `⋯ (N lines hidden)`; expand (ctrl+g) and read all of it first.
-3. Approve reads inside the workspace, and writes whose target and shown diff
-   match the task.
-4. Deny git commands (the controller commits, after review), writes outside
+3. Scripts by reference need reading, not trusting. Mid-task, workers switch
+   from inline commands to "run this helper script" with only a path in the
+   prompt (agy writes them under
+   `~/.gemini/antigravity-cli/brain/<session>/scratch/`). Read the file
+   yourself, in full, directly from the filesystem — never through the
+   worker. **The supervisor therefore needs read access to the worker's
+   scratch directory, not just the workspace.** A supervisor that cannot
+   read the referenced file must deny and ask the worker to inline the
+   command. (Observed in production: a 285-line `translate_all.py` reviewed
+   this way and approved; blind approval and reflexive denial were both the
+   wrong answer.)
+4. Approve reads inside the workspace, and writes whose target and shown diff
+   match the task — including referenced scripts read in full that only read
+   declared inputs and write inside the task's target subtree.
+5. Deny git commands (the controller commits, after review), writes outside
    the workspace, network access, and anything not understood. Tell the
    worker why in one line; let it adapt.
-5. Log every decision — request, verdict, reason. The audit trail is a
+6. Log every decision — request, verdict, reason. The audit trail is a
    deliverable.
-6. Verification of the produced work is the controller's job, never the
+7. Verification of the produced work is the controller's job, never the
    worker's claim. Diff against sources; check the invariants the task
    defined. Commit only after that.
 
@@ -150,3 +162,8 @@ value order:
    explanations can be cut mid-sentence.
 4. A per-turn reply-verbosity hint (full / summary / files-only) that
    controllers could set per request rather than an env var.
+5. A read-only, token-authenticated file-fetch endpoint scoped to the
+   workspace and the worker's scratch directory, so a REMOTE supervisor can
+   review referenced scripts (policy rule 3) without filesystem access to
+   the broker host. Until it exists, remote supervisors must deny
+   script-by-reference prompts.

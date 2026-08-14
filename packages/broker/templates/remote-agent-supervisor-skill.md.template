@@ -54,14 +54,24 @@ Apply per prompt, no exceptions:
 2. **Never approve what you cannot fully see.** If the prompt shows
    `⋯ (N lines hidden)`, expand it first (ctrl+g in agy). An unrecognised or
    partially visible request defaults to deny.
-3. **Approve**: read-only inspection inside the workspace; writes whose target
+3. **Scripts by reference need reading, not trusting.** Workers switch from
+   inline commands to "run this helper script" mid-task (agy writes them to
+   `~/.gemini/antigravity-cli/brain/<session>/scratch/`), and the prompt then
+   shows only a path. Read the referenced file yourself, in full, directly
+   from the filesystem — never through the worker — and re-read it if the
+   worker edits and retries. This means the supervisor **requires read access
+   to the worker's scratch directory as well as the workspace**; plan for
+   that when placing the supervisor. If you cannot read the file, the answer
+   is deny — ask the worker to inline the command instead.
+4. **Approve**: read-only inspection inside the workspace; writes whose target
    is inside the workspace subtree the task owns and whose shown diff matches
-   the task.
-4. **Deny**: git commands (committing is the controller's job, after review);
+   the task; referenced scripts you have read in full that only read declared
+   inputs and write inside the task's target subtree.
+5. **Deny**: git commands (committing is the controller's job, after review);
    writes outside the workspace; network access; edits to files the task
    declared read-only; anything else. After denying, tell the agent why in one
    line so it can take another approach.
-5. **Audit every decision**: one line per prompt — what was requested,
+6. **Audit every decision**: one line per prompt — what was requested,
    approved/denied, why. The audit trail is part of your deliverable.
 
 ## Delegation pattern

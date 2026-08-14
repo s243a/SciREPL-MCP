@@ -211,6 +211,15 @@ claude mcp add --transport http scirepl \
 The tools advertised by the connected app then appear under the `scirepl` MCP
 server. If no app is connected, the broker has no notebook tools to advertise.
 
+### Planned direct-to-file workbook transfer
+
+The app's workbook tools can carry canonical `.srwb` or `.ipynb` content through
+MCP. A broker-owned, allowlisted direct-to-file variant is designed to keep that
+content out of an agent's model context during larger translation campaigns. It
+is **not implemented or enabled by configuration today**. See the authoritative
+[workbook file-transfer design](https://github.com/s243a/SciREPL-MCP/blob/main/docs/workbook-file-transfer.md)
+for the proposed tools, receipts, limits, and filesystem security rules.
+
 ## Optional remote-agent chat
 
 The `/agent` endpoint lets the SciREPL Pro panel converse with a coding-agent CLI

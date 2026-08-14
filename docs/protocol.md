@@ -77,6 +77,16 @@ is mapped to an MCP image content block.
 Only one app bridge is logically active. Tool definitions are supplied by the
 app, not hard-coded into this repository.
 
+### Planned broker-owned workbook file tools
+
+A future, explicitly configured broker can add synthetic
+`export_workbook_to_file` and `import_workbook_from_file` tools when the app
+advertises their base workbook tools. These wrappers relocate bytes through an
+allowlisted host directory and return a content-free receipt; they are **not
+implemented in protocol version 1 today**. The authoritative security, schema,
+path, and transport design is [Workbook file transfer through the
+broker](workbook-file-transfer.md).
+
 ## Remote agent (`/agent`)
 
 The app first sends:

@@ -86,14 +86,36 @@ carries the same rules for installation into a controller's skill directory.
    worker's settings file. Standing grants are a human decision.
 2. Never approve a partially hidden command. agy truncates long commands with
    `⋯ (N lines hidden)`; expand (ctrl+g) and read all of it first.
-3. Approve reads inside the workspace, and writes whose target and shown diff
-   match the task.
-4. Deny git commands (the controller commits, after review), writes outside
-   the workspace, network access, and anything not understood. Tell the
-   worker why in one line; let it adapt.
-5. Log every decision — request, verdict, reason. The audit trail is a
+3. Scripts by reference need reading, not trusting. Mid-task, workers switch
+   from inline commands to "run this helper script" with only a path in the
+   prompt (agy writes them under
+   `~/.gemini/antigravity-cli/brain/<session>/scratch/`). Read the file
+   yourself, in full, directly from the filesystem — never through the
+   worker. **The supervisor therefore needs read access to the worker's
+   scratch directory, not just the workspace.** A supervisor that cannot
+   read the referenced file must deny and ask the worker to inline the
+   command. (Observed in production: a 285-line `translate_all.py` reviewed
+   this way and approved; blind approval and reflexive denial were both the
+   wrong answer.)
+4. Approve reads inside the workspace, and writes whose target and shown diff
+   match the task — including referenced scripts read in full that only read
+   declared inputs and write inside the task's target subtree.
+5. Deny git commands (the controller commits, after review), writes outside
+   the workspace, undeclared network access, and anything not understood.
+   Tell the worker why in one line; let it adapt. Network access is a
+   *declarable* scope, not a category ban: when the task brief says the
+   worker may consult the web (documentation lookups, API references),
+   the supervisor gates each request like any other prompt — but the
+   review criterion differs from file writes. A URL is an egress channel:
+   approve requests to well-known documentation hosts with plainly
+   readable paths; deny opaque endpoints, parameter-heavy URLs that could
+   carry encoded workspace data out, and any request whose destination
+   the task did not foreseeably need. When in doubt, deny and ask the
+   worker to state what it is looking for — the reformulated request is
+   usually easier to judge.
+6. Log every decision — request, verdict, reason. The audit trail is a
    deliverable.
-6. Verification of the produced work is the controller's job, never the
+7. Verification of the produced work is the controller's job, never the
    worker's claim. Diff against sources; check the invariants the task
    defined. Commit only after that.
 
@@ -132,6 +154,48 @@ bind to a tailnet address or loopback-plus-tunnel; treat tailnet ACLs as part
 of the perimeter; and rotate the token (delete the file; the broker
 regenerates) after any suspected exposure.
 
+### Design for post-compromise, not just prevention
+
+Every prevention measure above is friction — raising an attacker's cost,
+never zeroing their probability. In a system where agents act autonomously
+at machine speed, the properties that decide how bad a bad day gets are the
+post-compromise ones, and they are the ones most often left unbuilt:
+
+- **Audit trails.** Every worker action in this pattern passes through a
+  prompt that a supervisor logged with a verdict and a reason, and every
+  file change lands in git. When something goes wrong, "what exactly
+  happened, in what order, approved by whom" is a query, not a forensic
+  reconstruction. An audit trail that attributes actions to an identity
+  (see the tailnet-identity follow-up) is worth more than one that
+  attributes them to "whoever held the token".
+- **Revocation speed.** How long from "something is wrong" to "it can no
+  longer act"? Here: delete the token file and restart the broker —
+  seconds, one person, no coordination. Measure this in your own setup;
+  if revocation requires a meeting, the design is wrong.
+- **Blast-radius scoping.** The worker writes one directory subtree of one
+  git repository; the supervisor holds no standing grants; the index has a
+  single writer; commits happen only after verification. Assume the worker
+  (or its supervisor) goes fully hostile and ask what the maximum damage
+  is — then check whether that damage is (a) visible in the logs,
+  (b) reversible from git, (c) contained to the declared scope. If any
+  answer is no, fix the scope before adding more prevention.
+
+The pattern's honest security claim is not "attackers cannot act" — it is
+"every action is prompted, logged, attributed, and reversible." For
+autonomous-agent systems, that accountability property is usually the
+highest-value security investment available, and the easiest to skip.
+
+### Scope of this document
+
+These notes document one working pattern and the reasoning behind its
+choices. They are practitioner field notes, not a security review, a threat
+model, or a compliance artifact — and they are not a substitute for
+security expertise proportional to what the system protects. If the broker
+host touches production credentials, sensitive data, or systems whose
+compromise carries real-world consequences, have someone whose job is
+security review the deployment; nothing in these documents should be read
+as making that unnecessary.
+
 ## Known rough edges (both fixable in the broker)
 
 Observed in the first production run; candidate improvements, roughly in
@@ -150,3 +214,22 @@ value order:
    explanations can be cut mid-sentence.
 4. A per-turn reply-verbosity hint (full / summary / files-only) that
    controllers could set per request rather than an env var.
+5. A read-only, token-authenticated file-fetch endpoint scoped to the
+   workspace and the worker's scratch directory, so a REMOTE supervisor can
+   review referenced scripts (policy rule 3) without filesystem access to
+   the broker host. Until it exists, remote supervisors must deny
+   script-by-reference prompts.
+6. Token hardening, in ascending order of cost and honesty about limits.
+   The bound that governs the whole ladder:
+
+   > **A secret's confidentiality is limited by the most-exposed principal
+   > that legitimately reads it.**
+
+   Every rung below therefore raises attacker cost rather than creating a
+   boundary. (a) Group-readable token file (`640`, dedicated group)
+   only helps once broker and controller run as separate users — which is
+   itself the first cheap sandboxing step. (b) Per-surface or short-lived
+   tokens scope what a stolen string grants. (c) Tailscale Serve identity
+   headers replace the bearer secret with asserted tailnet identity:
+   nothing copyable to steal, revocation via ACLs, and actions attribute
+   to a node in the audit trail instead of to "whoever had the string".

@@ -86,6 +86,14 @@ agent setup materializes conventional `AGENTS.md`, `CLAUDE.md`, and provider
 settings inside a dedicated private session workspace; ordinary broker startup
 does not create them. See the [agent-context guide](docs/agent-context.md).
 
+The broker's agent and terminal surfaces can also be driven by another agent
+acting as a supervisor — reviewing the worker CLI's permission prompts one by
+one instead of granting standing permissions. The pattern, its driver scripts,
+and its security trade-offs are documented in
+[Controlling a remote coding agent](docs/remote-agent-control.md); the
+controller-side rules ship as
+`packages/broker/templates/remote-agent-supervisor-skill.md.template`.
+
 ## Project relationship
 
 This standalone repository is intended to be the canonical public home for both

@@ -1,0 +1,152 @@
+# Controlling a remote coding agent, with supervision
+
+The broker was built so the SciREPL app can drive a coding agent on a desktop.
+The same two surfaces let **another agent** be the driver: a strong model
+(the *controller*) sends tasks to a cheaper or more specialised CLI agent (the
+*worker*), reviews every permission the worker requests, and verifies what it
+produced. This page documents that pattern as field-tested: the first
+production use was Claude (controller) driving the Antigravity CLI `agy`
+(worker) to translate notebook workbooks, with an Opus subagent handling the
+per-prompt review loop.
+
+The short version of the trust model: **the worker does the volume, the
+controller does the judgment, the human does the privilege changes.**
+
+## Start the broker for supervision
+
+```bash
+BROKER_HOST=<tailscale-ip> \
+BROKER_AGENT=1 \
+BROKER_TERM=1 \
+BROKER_TERM_CMDS=agy \
+BROKER_AGENT_CWD=/path/to/target-repo \
+BROKER_ALLOW_UNMANAGED_AGENT_WORKSPACE=1 \
+node packages/broker/src/broker.mjs
+```
+
+Decisions encoded there:
+
+- **Name the worker, exclude `shell`.** `BROKER_TERM_CMDS=agy` means the PTY
+  can only become that one CLI. With a shell in the list, a token holder gets
+  a terminal and every other safeguard is moot; with only an agent CLI, every
+  consequential action still has to pass that agent's own permission prompt.
+- **Point `BROKER_AGENT_CWD` at a git repository.** The repo is the shared
+  state between worker and controller. `git status`/`git diff` after a turn
+  is the controller's precise, verbosity-controlled view of what actually
+  happened — far better than trusting the worker's own summary. It is also
+  the rollback.
+- Tailscale binding keeps the broker off the open internet while allowing a
+  controller on another tailnet machine. The bearer token
+  (`~/scirepl-broker/broker-token`, mode 0600) is still required on every
+  connection.
+
+## Two surfaces, one choice
+
+**`/agent` (headless one-shot).** The broker spawns the CLI per turn
+(`agy --add-dir <cwd> [-c] -p <text>`), buffers its stdout, and delivers one
+blob at exit. Session context persists across turns via the CLI's own resume.
+Good for pure Q&A. Two sharp edges, learned the hard way:
+
+- A permission the CLI needs but cannot prompt for in headless mode is
+  **auto-denied**, and the only trace is a clipped stderr line — the turn
+  otherwise looks like a success with empty output.
+- Output beyond the buffer cap kills the whole turn.
+
+**`/term` (interactive PTY).** The broker spawns the CLI under a PTY; its
+full TUI — including permission prompts, with target paths and diffs — is the
+event stream, and the controller answers each prompt. The PTY survives
+WebSocket disconnects, so a blocking connect–act–read–detach loop works.
+This is the supervised path: prefer it whenever the worker will need file or
+command permissions.
+
+Driver scripts for both live in `packages/broker/scripts/`:
+
+```bash
+# one-shot turn
+node packages/broker/scripts/agent-drive.mjs \
+  --url ws://HOST:8087/agent --token-file ~/scirepl-broker/broker-token \
+  --agent agy --prompt-file task.txt
+
+# supervised session, one step at a time
+node packages/broker/scripts/term-drive.mjs \
+  --url ws://HOST:8087/term --token-file ~/scirepl-broker/broker-token \
+  --send 'the task text'            # then repeatedly:
+node packages/broker/scripts/term-drive.mjs ... --read-ms 8000          # look
+node packages/broker/scripts/term-drive.mjs ... --send-raw '1'          # answer a menu
+node packages/broker/scripts/term-drive.mjs ... --send-raw "$(printf '\x07')"  # expand (agy ctrl+g)
+```
+
+## The review policy
+
+This is the controller's contract; the supervisor skill template
+(`packages/broker/templates/remote-agent-supervisor-skill.md.template`)
+carries the same rules for installation into a controller's skill directory.
+
+1. Never pick an "always allow" option, and never one that persists to the
+   worker's settings file. Standing grants are a human decision.
+2. Never approve a partially hidden command. agy truncates long commands with
+   `⋯ (N lines hidden)`; expand (ctrl+g) and read all of it first.
+3. Approve reads inside the workspace, and writes whose target and shown diff
+   match the task.
+4. Deny git commands (the controller commits, after review), writes outside
+   the workspace, network access, and anything not understood. Tell the
+   worker why in one line; let it adapt.
+5. Log every decision — request, verdict, reason. The audit trail is a
+   deliverable.
+6. Verification of the produced work is the controller's job, never the
+   worker's claim. Diff against sources; check the invariants the task
+   defined. Commit only after that.
+
+If the worker is blocked on a permission the policy cannot grant, the loop
+stops and a human decides. In the first production run, the controller's own
+safety layer refused to let it edit the worker's `permissions.allow` file —
+that boundary (no agent expands another agent's standing privileges) is the
+correct shape, and this workflow exists so it never needs to be crossed:
+per-action approval makes standing grants unnecessary.
+
+### Delegating the loop
+
+The review loop is many small reads of a redrawing TUI — cheap decisions,
+expensive context. If the controller platform supports subagents, spawn one
+with: the driver invocation, the policy above verbatim, the task description,
+and the audit obligation. The parent keeps verification and commits. This
+splits cost from judgment cleanly: the parent context pays once for the
+outcome and the audit trail, not for every screen redraw.
+
+## Security: what the agent-only restriction buys, and what it does not
+
+Restricting the terminal surface to one agent CLI is **defence-in-depth, not
+a sandbox**. Be precise about the difference:
+
+- Against *accidents* and *casual token exposure*, it is a real improvement:
+  there is no shell prompt to type into, the worker starts in the target
+  repo, refuses obviously destructive requests, and every action is visible
+  in one loggable stream.
+- Against a *determined* token holder, it is friction, not a boundary: they
+  can drive the worker to request a command and approve the prompt
+  themselves. The ceiling of a stolen token is still command execution as
+  the broker's user — noisier and slower than a shell, but reachable.
+
+So: keep the token in its 0600 file, never in a clipboard or shell history;
+bind to a tailnet address or loopback-plus-tunnel; treat tailnet ACLs as part
+of the perimeter; and rotate the token (delete the file; the broker
+regenerates) after any suspected exposure.
+
+## Known rough edges (both fixable in the broker)
+
+Observed in the first production run; candidate improvements, roughly in
+value order:
+
+1. `/agent` turns have no structured outcome. A permission auto-deny, an
+   empty answer, and a buffer-cap kill all arrive as `result` with little or
+   no text. A `turn` envelope (exit code, duration, bytes, truncated flag,
+   denied-permission name when detectable) would let a controller react
+   mechanically instead of parsing stderr.
+2. The broker could report **files changed per turn** by diffing
+   `BROKER_AGENT_CWD` before/after (it already knows the directory). That
+   would make the controller independent of the worker's self-reporting even
+   on the headless surface.
+3. stderr pass-through is clipped to 500 bytes per chunk; permission-denial
+   explanations can be cut mid-sentence.
+4. A per-turn reply-verbosity hint (full / summary / files-only) that
+   controllers could set per request rather than an env var.

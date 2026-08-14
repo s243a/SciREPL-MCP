@@ -19,6 +19,15 @@ Configuration is read from environment variables when the broker starts.
 | `BROKER_MAX_WS_CONNECTIONS` | `4` | Connection cap for each WebSocket endpoint. |
 | `BROKER_WS_AUTH_TIMEOUT_MS` | `5000` | Time allowed for a WebSocket client to send an authenticated hello. |
 
+### Planned workbook file configuration
+
+`BROKER_WORKBOOK_IO_CONFIG` is reserved by the workbook file-transfer design for
+an absolute, immutable-at-runtime JSON allowlist. It is **not read by the current
+broker**, and setting it does not enable any tools yet. The proposed file format,
+8 MiB maximum, private placement, cross-platform path rules, and generated-
+launcher requirements are specified in [Workbook file transfer through the
+broker](workbook-file-transfer.md).
+
 ## Remote agents
 
 | Variable | Default | Purpose |

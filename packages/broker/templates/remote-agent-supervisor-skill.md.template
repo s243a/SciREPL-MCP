@@ -68,9 +68,15 @@ Apply per prompt, no exceptions:
    the task; referenced scripts you have read in full that only read declared
    inputs and write inside the task's target subtree.
 5. **Deny**: git commands (committing is the controller's job, after review);
-   writes outside the workspace; network access; edits to files the task
-   declared read-only; anything else. After denying, tell the agent why in one
-   line so it can take another approach.
+   writes outside the workspace; network access the task did not declare;
+   edits to files the task declared read-only; anything else. After denying,
+   tell the agent why in one line so it can take another approach.
+   When the task DOES declare network use (documentation lookups and the
+   like), gate each request individually with an egress-aware eye: a URL
+   can carry workspace data out in its parameters. Approve well-known
+   documentation hosts with plainly readable paths; deny opaque endpoints
+   and parameter-heavy URLs; when unsure, deny and ask the worker to state
+   what it is looking for.
 6. **Audit every decision**: one line per prompt — what was requested,
    approved/denied, why. The audit trail is part of your deliverable.
 

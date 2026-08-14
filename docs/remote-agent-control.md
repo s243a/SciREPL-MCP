@@ -101,8 +101,18 @@ carries the same rules for installation into a controller's skill directory.
    match the task — including referenced scripts read in full that only read
    declared inputs and write inside the task's target subtree.
 5. Deny git commands (the controller commits, after review), writes outside
-   the workspace, network access, and anything not understood. Tell the
-   worker why in one line; let it adapt.
+   the workspace, undeclared network access, and anything not understood.
+   Tell the worker why in one line; let it adapt. Network access is a
+   *declarable* scope, not a category ban: when the task brief says the
+   worker may consult the web (documentation lookups, API references),
+   the supervisor gates each request like any other prompt — but the
+   review criterion differs from file writes. A URL is an egress channel:
+   approve requests to well-known documentation hosts with plainly
+   readable paths; deny opaque endpoints, parameter-heavy URLs that could
+   carry encoded workspace data out, and any request whose destination
+   the task did not foreseeably need. When in doubt, deny and ask the
+   worker to state what it is looking for — the reformulated request is
+   usually easier to judge.
 6. Log every decision — request, verdict, reason. The audit trail is a
    deliverable.
 7. Verification of the produced work is the controller's job, never the

@@ -99,6 +99,27 @@ if (process.platform === 'win32') {
         'repair backs up and restores an edited generated instruction file');
 }
 
+const missingReverseAck = path.join(testRoot, 'missing-reverse-ack');
+const rejectedReverse = run('--output', missingReverseAck, '--no-install', '--enable-reverse-worker');
+ok(rejectedReverse.status !== 0 && /acknowledge-reverse-worker-command-relay/.test(rejectedReverse.stderr) && !fs.existsSync(missingReverseAck),
+    'reverse-worker setup fails before writing unless command relay is acknowledged');
+
+if (process.platform !== 'win32') {
+    const reverse = path.join(testRoot, 'reverse');
+    const reverseRun = run('--output', reverse, '--no-install', '--enable-reverse-worker', '--acknowledge-reverse-worker-command-relay');
+    const reverseLauncher = reverseRun.status === 0 ? fs.readFileSync(path.join(reverse, 'start-broker.sh'), 'utf8') : '';
+    const reverseWorkerLauncher = reverseRun.status === 0 ? fs.readFileSync(path.join(reverse, 'start-reverse-worker.sh'), 'utf8') : '';
+    const reverseToken = reverseRun.status === 0 ? fs.readFileSync(path.join(reverse, 'broker-token'), 'utf8').trim() : '';
+    const reverseWorkerToken = reverseRun.status === 0 ? fs.readFileSync(path.join(reverse, 'worker-token'), 'utf8').trim() : '';
+    ok(reverseRun.status === 0 && /BROKER_REVERSE_WORKER='1'/.test(reverseLauncher) &&
+        /BROKER_WORKER_TOKEN_FILE/.test(reverseLauncher) && !reverseLauncher.includes(reverseWorkerToken) &&
+        !reverseLauncher.includes('BROKER_AGENT=') &&
+        reverseWorkerToken && reverseWorkerToken !== reverseToken &&
+        /^[0-9a-f]{32}$/.test(reverseWorkerToken) &&
+        reverseWorkerLauncher.includes('reverse-worker.mjs') && !reverseWorkerLauncher.includes(reverseWorkerToken),
+        'acknowledged reverse-worker setup writes a distinct worker token and launchers that never embed it');
+}
+
 const dangerous = run('--output', path.join(repoDir, 'generated-setup'), '--no-install');
 ok(dangerous.status !== 0 && /dangerous setup directory/.test(dangerous.stderr),
     'setup refuses to generate active configuration inside the source repository');

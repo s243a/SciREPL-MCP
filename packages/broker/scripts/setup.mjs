@@ -30,6 +30,10 @@ Options:
   --enable-terminal                     Enable the host-side PTY/shell bridge;
                                         combine with agent mode for TUIs/! commands
   --acknowledge-terminal-host-access    Required with --enable-terminal
+  --enable-reverse-worker               Accept outbound workers and relay
+                                        /agent and /term commands to them
+  --acknowledge-reverse-worker-command-relay
+                                        Required with --enable-reverse-worker
   --no-install                          Do not install npm dependencies
   --adopt                               Allow an existing unmarked setup directory
   --repair                              Back up and replace changed generated files
@@ -51,6 +55,8 @@ function parseArgs(argv) {
         acknowledgeAgent: false,
         enableTerminal: false,
         acknowledgeTerminal: false,
+        enableReverseWorker: false,
+        acknowledgeReverseWorker: false,
         install: true,
         adopt: false,
         repair: false,
@@ -70,6 +76,8 @@ function parseArgs(argv) {
         else if (arg === '--acknowledge-agent-host-access') options.acknowledgeAgent = true;
         else if (arg === '--enable-terminal') options.enableTerminal = true;
         else if (arg === '--acknowledge-terminal-host-access') options.acknowledgeTerminal = true;
+        else if (arg === '--enable-reverse-worker') options.enableReverseWorker = true;
+        else if (arg === '--acknowledge-reverse-worker-command-relay') options.acknowledgeReverseWorker = true;
         else if (arg === '--no-install') options.install = false;
         else if (arg === '--adopt') options.adopt = true;
         else if (arg === '--repair') options.repair = true;
@@ -103,8 +111,11 @@ function validate(options) {
     if (options.enableTerminal && !options.acknowledgeTerminal) {
         throw new Error('--enable-terminal requires --acknowledge-terminal-host-access because it exposes a host PTY or shell');
     }
-    if (process.platform === 'win32' && (options.enableAgent || options.enableTerminal)) {
-        throw new Error('agent and terminal modes currently require Linux, macOS, or WSL; use the PowerShell setup for the core broker only');
+    if (options.enableReverseWorker && !options.acknowledgeReverseWorker) {
+        throw new Error('--enable-reverse-worker requires --acknowledge-reverse-worker-command-relay because the broker will forward /agent and /term commands to whoever authenticates as that worker');
+    }
+    if (process.platform === 'win32' && (options.enableAgent || options.enableTerminal || options.enableReverseWorker)) {
+        throw new Error('agent, terminal, and reverse-worker modes currently require Linux, macOS, or WSL; use the PowerShell setup for the core broker only');
     }
 
     options.output = path.resolve(options.output.replace(/^~(?=$|[\\/])/, os.homedir()));
@@ -151,6 +162,10 @@ function environment(options, tokenFile, workspace) {
         env.BROKER_TERM = '1';
         if (!options.enableAgent) env.BROKER_TERM_CMDS = 'shell';
     }
+    if (options.enableReverseWorker) {
+        env.BROKER_REVERSE_WORKER = '1';
+        env.BROKER_WORKER_TOKEN_FILE = options.workerTokenFile;
+    }
     return env;
 }
 
@@ -178,8 +193,37 @@ function setupManifest(options, files) {
         port: options.port,
         agentEnabled: options.enableAgent,
         terminalEnabled: options.enableTerminal,
+        reverseWorkerEnabled: options.enableReverseWorker,
         generatedFiles: files,
     }, null, 2) + '\n';
+}
+
+function workerDialHost(host) {
+    return host === '0.0.0.0' || host === '::' ? '127.0.0.1' : host;
+}
+
+function bashWorkerLauncher(options, workerTokenFile) {
+    const host = workerDialHost(options.host);
+    const url = `ws://${host}:${options.port}/worker`;
+    const shim = path.join(PACKAGE_DIR, 'scripts', 'reverse-worker.mjs');
+    return [
+        '#!/usr/bin/env bash',
+        'set -euo pipefail',
+        `exec ${shQuote(process.execPath)} ${shQuote(shim)} --url ${shQuote(url)} --token-file ${shQuote(workerTokenFile)} --name worker --surfaces term,agent --cmds shell,claude,codex,gemini,agy --agents claude,codex,gemini,agy --cwd ${shQuote(path.join(options.output, 'workspace'))}`,
+        '',
+    ].join('\n');
+}
+
+function powerShellWorkerLauncher(options, workerTokenFile) {
+    const host = workerDialHost(options.host);
+    const url = `ws://${host}:${options.port}/worker`;
+    const shim = path.join(PACKAGE_DIR, 'scripts', 'reverse-worker.mjs');
+    return [
+        "$ErrorActionPreference = 'Stop'",
+        `& ${psQuote(process.execPath)} ${psQuote(shim)} --url ${psQuote(url)} --token-file ${psQuote(workerTokenFile)} --name worker --surfaces term,agent --cmds shell,claude,codex,gemini,agy --agents claude,codex,gemini,agy --cwd ${psQuote(path.join(options.output, 'workspace'))}`,
+        'exit $LASTEXITCODE',
+        '',
+    ].join('\r\n');
 }
 
 function generatedTargets(options, env) {
@@ -187,6 +231,10 @@ function generatedTargets(options, env) {
         ['start-broker.sh', bashLauncher(env)],
         ['Start-Broker.ps1', powerShellLauncher(env)],
     ];
+    if (options.enableReverseWorker) {
+        definitions.push(['start-reverse-worker.sh', bashWorkerLauncher(options, options.workerTokenFile)]);
+        definitions.push(['Start-Reverse-Worker.ps1', powerShellWorkerLauncher(options, options.workerTokenFile)]);
+    }
     definitions.push([SETUP_MARKER, setupManifest(options, definitions.map(([rel]) => rel))]);
     return definitions.map(([rel, content]) => ({
         rel,
@@ -321,7 +369,9 @@ function main() {
     prepareOutput(options);
 
     const tokenFile = path.join(options.output, 'broker-token');
+    const workerTokenFile = path.join(options.output, 'worker-token');
     const workspace = path.join(options.output, 'workspace');
+    options.workerTokenFile = workerTokenFile;
     const token = ensureToken(tokenFile, true);
     const env = environment(options, tokenFile, workspace);
     const targets = generatedTargets(options, env);
@@ -338,7 +388,15 @@ function main() {
         fs.mkdirSync(options.output, { recursive: true, mode: 0o700 });
         try { fs.chmodSync(options.output, 0o700); } catch (_) {}
         ensureToken(tokenFile, false, token);
-        if (options.enableTerminal) {
+        if (options.enableReverseWorker) {
+            let workerToken = randomToken();
+            while (workerToken === token) workerToken = randomToken();
+            ensureToken(workerTokenFile, false, workerToken);
+            if (fs.readFileSync(workerTokenFile, 'utf8').trim() === token) {
+                throw new Error('worker token must be distinct from the pairing token; replace worker-token and rerun');
+            }
+        }
+        if (options.enableTerminal || options.enableReverseWorker) {
             fs.mkdirSync(workspace, { recursive: true, mode: 0o700 });
             try { fs.chmodSync(workspace, 0o700); } catch (_) {}
         }
@@ -352,6 +410,7 @@ function main() {
     console.log(`[setup] broker: ${options.host}:${options.port} (${isLoopbackHost(options.host) ? 'loopback' : 'non-loopback — no transport verification is enforced'})`);
     console.log(`[setup] agent: ${options.enableAgent ? 'enabled with an explicit session workspace' : 'disabled'}`);
     console.log(`[setup] terminal: ${options.enableTerminal ? 'enabled' : 'disabled'}`);
+    console.log(`[setup] reverse worker: ${options.enableReverseWorker ? 'enabled (command relay; worker token stored privately)' : 'disabled'}`);
     if (workspaceResult) console.log(`[setup] agent context: ${workspaceResult.created.length} created, ${workspaceResult.updated.length} repaired`);
     if (!options.dryRun) {
         console.log(`[setup] start with ${process.platform === 'win32' ? path.join(options.output, 'Start-Broker.ps1') : path.join(options.output, 'start-broker.sh')}`);

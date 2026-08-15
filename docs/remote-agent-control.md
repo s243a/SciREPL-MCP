@@ -40,6 +40,25 @@ Decisions encoded there:
   (`~/scirepl-broker/broker-token`, mode 0600) is still required on every
   connection.
 
+## Reverse workers: same surfaces, other host
+
+The pattern above assumes the broker **spawns** the worker CLI on its own
+machine. [Reverse-worker mode](reverse-worker.md) is a transport swap behind
+the same `/term` and `/agent` messages: a shim on another machine, container,
+or VM dials `/worker` with a **worker** credential and the broker relays
+commands to it. `term-drive.mjs` and `agent-drive.mjs` do not change.
+
+Enable it only with the setup acknowledgement
+`--acknowledge-reverse-worker-command-relay`. Point the shim's `--cwd` at the
+git repository that remains the shared state. The worker token authorizes "be
+commanded" and must stay distinct from the pairing token; a stolen worker
+credential is impersonation of a commanded host, not a second controller.
+
+The supervision claim — every action prompted, logged, attributed — survives
+because relayed starts appear in the same `[broker]` audit trail, attributed
+to the worker's registered name. Local-spawn lines are unchanged when the
+mode is off.
+
 ## Two surfaces, one choice
 
 **`/agent` (headless one-shot).** The broker spawns the CLI per turn

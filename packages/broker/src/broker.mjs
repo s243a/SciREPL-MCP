@@ -27,6 +27,7 @@ import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { ListToolsRequestSchema, CallToolRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import { inspectWorkspace, setupWorkspace, writePrivateFile } from './workspace.mjs';
+import { createReverseWorkerHub, loadWorkerToken } from './reverse-worker.mjs';
 
 const PACKAGE_METADATA = JSON.parse(fs.readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
 const BROKER_VERSION = PACKAGE_METADATA.version;
@@ -205,6 +206,26 @@ const TERM_CMDS = (process.env.BROKER_TERM_CMDS || 'shell,claude,codex,gemini,ag
     .filter(c => !(TERM_NO_SHELL && c === 'shell'));
 const TERM_SHELL = process.env.BROKER_TERM_SHELL || process.env.SHELL || 'bash';
 const TERM_GRACE_MS = integerSetting('BROKER_TERM_GRACE_MS', 600000, 0, 86400000); // keep PTY alive this long after a WS drop
+
+// Reverse-worker mode: a worker dials /worker and the broker relays the existing
+// /agent and /term controller messages to it. Default off. Worker-specific
+// settings are read only when enabled so an unflagged broker ignores typos here.
+const REVERSE_WORKER_ENABLED = process.env.BROKER_REVERSE_WORKER === '1';
+const WORKER_TOKEN_INFO = REVERSE_WORKER_ENABLED ? loadWorkerToken({ controllerToken: TOKEN }) : null;
+const WORKER_TOKEN = WORKER_TOKEN_INFO ? WORKER_TOKEN_INFO.value : '';
+const MAX_WORKER_WS_PAYLOAD_BYTES = REVERSE_WORKER_ENABLED
+    ? integerSetting('BROKER_MAX_WORKER_WS_PAYLOAD_BYTES', 1048576, 1024, 16777216)
+    : 1048576;
+const reverseWorkerHub = createReverseWorkerHub({
+    enabled: REVERSE_WORKER_ENABLED,
+    workerToken: WORKER_TOKEN,
+    protocolVersion: PROTOCOL_VERSION,
+    maxPayloadBytes: MAX_WORKER_WS_PAYLOAD_BYTES,
+    maxConnections: MAX_WS_CONNECTIONS,
+    authTimeoutMs: WS_AUTH_TIMEOUT_MS,
+    sendJson: sendWsJson,
+    audit: (msg) => console.log(`[broker] ${msg}`),
+});
 
 // ── App bridge: the single connected SciREPL app (WS) and its advertised tools ──
 const appBridge = {
@@ -699,6 +720,7 @@ const httpServer = http.createServer(async (req, res) => {
             agentEnabled: AGENT_ENABLED,
             termEnabled: TERM_ENABLED,
             workspaceReady,
+            ...reverseWorkerHub.healthFields(),
         }));
         return;
     }
@@ -765,7 +787,11 @@ const agentWss = new WebSocketServer({ noServer: true, maxPayload: MAX_AGENT_WS_
 const termWss = new WebSocketServer({ noServer: true, maxPayload: MAX_TERM_WS_PAYLOAD_BYTES, perMessageDeflate: false });
 httpServer.on('upgrade', (req, socket, head) => {
     const { pathname } = new URL(req.url, `http://127.0.0.1:${PORT}`);
-    const route = pathname === '/app' ? wss : pathname === '/agent' ? agentWss : pathname === '/term' ? termWss : null;
+    const route = pathname === '/app' ? wss
+        : pathname === '/agent' ? agentWss
+        : pathname === '/term' ? termWss
+        : (REVERSE_WORKER_ENABLED && pathname === '/worker') ? reverseWorkerHub.wss
+        : null;
     if (!route || route.clients.size >= MAX_WS_CONNECTIONS) { socket.destroy(); return; }
     route.handleUpgrade(req, socket, head, (ws) => {
         // ws surfaces protocol/payload failures as 'error' events. Always consume
@@ -828,22 +854,42 @@ agentWss.on('connection', (ws) => {
         if (msg.type === 'hello') {
             if (!tokenMatches(msg.token)) { sendWsJson(ws, { type: 'agent', kind: 'error', text: 'unauthorized' }, MAX_AGENT_BUFFER_BYTES); ws.close(1008, 'unauthorized'); return; }
             authenticated();
-            if (!AGENT_ENABLED) { sendWsJson(ws, { type: 'agent', kind: 'error', text: 'remote agents disabled — restart with BROKER_AGENT=1 after reviewing the host-access warning' }, MAX_AGENT_BUFFER_BYTES); ws.close(1008, 'remote agents disabled'); return; }
+            if (!AGENT_ENABLED && !REVERSE_WORKER_ENABLED) { sendWsJson(ws, { type: 'agent', kind: 'error', text: 'remote agents disabled — restart with BROKER_AGENT=1 after reviewing the host-access warning' }, MAX_AGENT_BUFFER_BYTES); ws.close(1008, 'remote agents disabled'); return; }
             authed = true;
             const configuredAgents = Object.keys(AGENT_PROFILES);
             const availableAgents = configuredAgents.filter(name => hasCmd(AGENT_PROFILES[name].cmd));
             const workspaceReady = !agentWorkspaceProblem();
+            const workerAgents = reverseWorkerHub.advertisedAgents();
             // Existing Pro clients read only `agents`, so make that the usable
             // subset. `configuredAgents` preserves discovery/debug information.
-            sendWsJson(ws, { type: 'agent', kind: 'welcome', protocolVersion: PROTOCOL_VERSION, agents: workspaceReady ? availableAgents : [], availableAgents, configuredAgents, workspaceReady, running: agentBridge.running() && agentBridge.name }, MAX_AGENT_BUFFER_BYTES);
+            // Reverse workers contribute advertised CLIs even when the broker
+            // host has no prepared workspace and is not spawning locally.
+            const agents = [...new Set([
+                ...(AGENT_ENABLED && workspaceReady ? availableAgents : []),
+                ...workerAgents,
+            ])];
+            const availableMerged = [...new Set([
+                ...(AGENT_ENABLED ? availableAgents : []),
+                ...workerAgents,
+            ])];
+            sendWsJson(ws, { type: 'agent', kind: 'welcome', protocolVersion: PROTOCOL_VERSION, agents, availableAgents: availableMerged, configuredAgents, workspaceReady, running: agentBridge.running() && agentBridge.name }, MAX_AGENT_BUFFER_BYTES);
             return;
         }
         if (!authed) return;
-        if (msg.type === 'start') agentBridge.start(ws, msg.agent || 'claude');
-        else if (msg.type === 'input') { if (!agentBridge.input(String(msg.text || ''))) sendWsJson(ws, { type: 'agent', kind: 'error', text: 'no agent running' }, MAX_AGENT_BUFFER_BYTES); }
-        else if (msg.type === 'stop') agentBridge.stop();
+        if (msg.type === 'start') {
+            if (!reverseWorkerHub.tryStart('agent', ws, msg)) agentBridge.start(ws, msg.agent || 'claude');
+        } else if (msg.type === 'input') {
+            if (!reverseWorkerHub.tryRelay('agent', ws, { type: 'input', text: String(msg.text || '') })) {
+                if (!agentBridge.input(String(msg.text || ''))) sendWsJson(ws, { type: 'agent', kind: 'error', text: 'no agent running' }, MAX_AGENT_BUFFER_BYTES);
+            }
+        } else if (msg.type === 'stop') {
+            if (!reverseWorkerHub.tryStop('agent', ws)) agentBridge.stop();
+        }
     });
-    ws.on('close', () => { if (agentBridge.ws === ws) agentBridge.stop(); });
+    ws.on('close', () => {
+        if (reverseWorkerHub.detach('agent', ws)) return;
+        if (agentBridge.ws === ws) agentBridge.stop();
+    });
 });
 
 // /term: the app connects out to a real PTY (xterm.js front-end).
@@ -858,16 +904,30 @@ termWss.on('connection', (ws) => {
             if (!tokenMatches(msg.token)) { sendWsJson(ws, { type: 'term', kind: 'error', text: 'unauthorized' }, MAX_TERM_WS_PAYLOAD_BYTES); ws.close(1008, 'unauthorized'); return; }
             authenticated();
             authed = true;
-            sendWsJson(ws, { type: 'term', kind: 'welcome', protocolVersion: PROTOCOL_VERSION, enabled: TERM_ENABLED, cmds: TERM_ENABLED ? TERM_CMDS : [] }, MAX_TERM_WS_PAYLOAD_BYTES);
+            const workerCmds = reverseWorkerHub.advertisedTermCmds();
+            const termOn = TERM_ENABLED || workerCmds.length > 0;
+            const cmds = [...new Set([
+                ...(TERM_ENABLED ? TERM_CMDS : []),
+                ...workerCmds,
+            ])];
+            sendWsJson(ws, { type: 'term', kind: 'welcome', protocolVersion: PROTOCOL_VERSION, enabled: termOn, cmds: termOn ? cmds : [] }, MAX_TERM_WS_PAYLOAD_BYTES);
             return;
         }
         if (!authed) return;
-        if (msg.type === 'start') termBridge.start(ws, { cmd: msg.cmd, cols: msg.cols, rows: msg.rows });
-        else if (msg.type === 'input') termBridge.input(String(msg.data || ''));
-        else if (msg.type === 'resize') termBridge.resize(msg.cols, msg.rows);
-        else if (msg.type === 'stop') termBridge.stop();
+        if (msg.type === 'start') {
+            if (!reverseWorkerHub.tryStart('term', ws, msg)) termBridge.start(ws, { cmd: msg.cmd, cols: msg.cols, rows: msg.rows });
+        } else if (msg.type === 'input') {
+            if (!reverseWorkerHub.tryRelay('term', ws, { type: 'input', data: String(msg.data || '') })) termBridge.input(String(msg.data || ''));
+        } else if (msg.type === 'resize') {
+            if (!reverseWorkerHub.tryRelay('term', ws, { type: 'resize', cols: msg.cols, rows: msg.rows })) termBridge.resize(msg.cols, msg.rows);
+        } else if (msg.type === 'stop') {
+            if (!reverseWorkerHub.tryStop('term', ws)) termBridge.stop();
+        }
     });
-    ws.on('close', () => termBridge.detach(ws)); // keep PTY alive for reconnect
+    ws.on('close', () => {
+        reverseWorkerHub.detach('term', ws);
+        termBridge.detach(ws);
+    }); // keep PTY alive for reconnect
 });
 
 httpServer.listen(PORT, HOST, () => {
@@ -882,8 +942,9 @@ httpServer.listen(PORT, HOST, () => {
     console.log(`[broker]   agent WS:      ${AGENT_ENABLED ? 'ENABLED ws://' + displayHost + ':' + PORT + '/agent (agents: ' + Object.keys(AGENT_PROFILES).join(', ') + ')' : 'disabled (set BROKER_AGENT=1 after reviewing SECURITY.md)'}`);
     if (AGENT_ENABLED) console.log(`[broker]   agent access:  Claude ${AGENT_FULL_ACCESS ? 'full host tools' : 'allowlist ' + AGENT_ALLOWED_TOOLS}; other CLIs may retain normal host capabilities; environment ${AGENT_INHERIT_ENV ? 'inherited' : 'restricted'}`);
     console.log(`[broker]   terminal:      ${TERM_ENABLED ? 'ENABLED ws://' + displayHost + ':' + PORT + '/term (cmds: ' + TERM_CMDS.join(', ') + ')' + (TERM_NO_SHELL ? ' [no-shell: agents only, no shell escape]' : '') : 'disabled (set BROKER_TERM=1 to expose a PTY)'}`);
+    console.log(`[broker]   reverse worker:${REVERSE_WORKER_ENABLED ? ' ENABLED ws://' + displayHost + ':' + PORT + '/worker (worker token ' + (WORKER_TOKEN_INFO.source === 'BROKER_WORKER_TOKEN' ? 'provided by BROKER_WORKER_TOKEN (not printed)' : 'stored in ' + WORKER_TOKEN_INFO.source + ' (mode 0600)') + ')' : ' disabled (set BROKER_REVERSE_WORKER=1 after --acknowledge-reverse-worker-command-relay)'}`);
     console.log(`[broker]   pairing token: ${TOKEN_INFO.source === 'BROKER_TOKEN' ? 'provided by BROKER_TOKEN (not printed)' : 'stored in ' + TOKEN_INFO.source + ' (mode 0600)'}`);
     console.log('[broker] For remote access, keep loopback binding and use Tailscale Serve or an SSH tunnel.');
 });
 
-export { httpServer, appBridge, agentBridge, termBridge, TOKEN, PORT, PROTOCOL_VERSION };
+export { httpServer, appBridge, agentBridge, termBridge, reverseWorkerHub, TOKEN, PORT, PROTOCOL_VERSION };

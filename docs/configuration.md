@@ -69,6 +69,19 @@ host-side shell escape.
 | `BROKER_TERM_SHELL` | `$SHELL` or `bash` | POSIX-like shell used by the PTY adapter. |
 | `BROKER_TERM_GRACE_MS` | `600000` | How long a disconnected PTY is retained for reattachment. |
 
+## Reverse workers
+
+Disabled unless explicitly enabled. The worker credential is distinct from the
+controller pairing token and authenticates `/worker` only. See
+[Reverse-worker mode](reverse-worker.md).
+
+| Variable | Default | Purpose |
+|---|---:|---|
+| `BROKER_REVERSE_WORKER` | `0` | Set to `1` to accept `/worker` connections and relay matching `/agent` and `/term` starts. |
+| `BROKER_WORKER_TOKEN` | unset | Explicit worker credential. When set, it takes precedence over the worker token file. |
+| `BROKER_WORKER_TOKEN_FILE` | `~/scirepl-broker/worker-token` | Persistent worker-token location. Created with mode `0600` where supported, only when reverse-worker mode is on. |
+| `BROKER_MAX_WORKER_WS_PAYLOAD_BYTES` | `1048576` | Maximum inbound `/worker` message payload. Read only when reverse-worker mode is on. |
+
 ## Setup options
 
 The shared Bash and PowerShell entry points call the same Node.js implementation.
@@ -79,6 +92,7 @@ Important command-line options are:
 | `--output PATH` | Place the private token, generated launchers, and optional workspace under this dedicated directory. |
 | `--enable-agent --acknowledge-agent-host-access` | Enable structured, non-PTY `/agent` adapters and materialize their explicit session context. |
 | `--enable-terminal --acknowledge-terminal-host-access` | Enable `/term`, install/verify `node-pty`, and create its working directory. Combine it with agent mode for interactive agent/TUI choices. |
+| `--enable-reverse-worker --acknowledge-reverse-worker-command-relay` | Accept outbound workers and relay `/agent` and `/term` commands to them. Writes a distinct worker token and worker launchers. Does not imply local spawn. |
 | `--repair` | Back up and replace edited or stale generated files. |
 | `--adopt` | Allow setup to use an existing non-empty directory that has no setup marker. |
 | `--host ADDRESS --allow-non-loopback` | Explicitly accept raw non-loopback binding. This does not prove Tailscale/SSH or provide TLS. |
@@ -118,3 +132,13 @@ To restrict this to Claude and Codex without a shell fallback, add
 `BROKER_TERM_NO_SHELL=1` and `BROKER_TERM_CMDS=claude,codex` to the private
 launcher. A later `--repair` may replace edited generated launchers after making
 a timestamped backup.
+
+Relay `/agent` and `/term` to a worker that dials out (no local spawn implied):
+
+```bash
+./setup-broker.sh \
+  --enable-reverse-worker \
+  --acknowledge-reverse-worker-command-relay
+~/scirepl-broker/start-broker.sh
+~/scirepl-broker/start-reverse-worker.sh
+```

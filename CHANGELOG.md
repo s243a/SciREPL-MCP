@@ -2,6 +2,12 @@
 
 ## 0.1.0 - Unreleased
 
+- Add optional reverse-worker mode: a worker dials `/worker` with a distinct
+  credential and the broker relays the existing `/agent` and `/term` controller
+  messages to it. Default off; setup requires
+  `--acknowledge-reverse-worker-command-relay`. Local spawn is unchanged when
+  the flag is unset.
+
 - Extract the SciREPL host-side MCP broker into an independently installable
   repository.
 - Add the MCP-to-app bridge, opt-in remote-agent bridge, optional PTY terminal,

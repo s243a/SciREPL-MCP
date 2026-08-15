@@ -137,6 +137,13 @@ capability, not a complete sandbox.
 - The same pairing token currently authenticates `/mcp`, `/doctor`, `/app`,
   `/agent`, and `/term`. Optional high-capability endpoints are therefore gated
   off separately by configuration.
+- Reverse-worker mode (`BROKER_REVERSE_WORKER=1`) adds a second secret, the
+  worker token, which authenticates `/worker` only. It authorizes a client to
+  be commanded — register, receive `/agent` and `/term` relays, send stream
+  events — and nothing else. A stolen worker token must not grant controller
+  powers; a stolen pairing token still cannot register a worker. The two
+  secrets must differ or startup fails. See
+  [Reverse-worker mode](docs/reverse-worker.md).
 - SciREPL Pro stores its connection settings on the device. Notebook JavaScript
   and other same-origin app code should be treated as potentially able to access
   browser-managed application state.

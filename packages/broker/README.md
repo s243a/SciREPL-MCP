@@ -254,6 +254,26 @@ Use `BROKER_TERM_NO_SHELL=1` to remove the standalone shell option and prevent a
 agent from dropping to a shell after it exits. This reduces convenience but does
 not turn an agent CLI into a sandbox.
 
+## Optional reverse worker
+
+Reverse-worker mode lets the CLI run on another machine, container, or VM while
+controllers keep speaking `/agent` and `/term` at this broker. A worker shim
+dials `/worker` with a **worker** token that cannot drive controller surfaces.
+Setup requires a separate acknowledgement because the broker becomes a
+command-relay hub:
+
+```bash
+./setup-broker.sh \
+  --enable-reverse-worker \
+  --acknowledge-reverse-worker-command-relay
+```
+
+That writes `worker-token` and `start-reverse-worker.sh` (or
+`Start-Reverse-Worker.ps1`). It does not enable local spawn; add the agent and
+terminal pairs if the broker host should still be able to run CLIs itself.
+`term-drive.mjs` and `agent-drive.mjs` are unchanged. See
+[Reverse-worker mode](https://github.com/s243a/SciREPL-MCP/blob/main/docs/reverse-worker.md).
+
 ## Platforms
 
 - **Linux and WSL:** supported for the core broker, agent adapters, and optional

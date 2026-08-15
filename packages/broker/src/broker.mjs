@@ -27,6 +27,7 @@ import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { ListToolsRequestSchema, CallToolRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import { inspectWorkspace, setupWorkspace, writePrivateFile } from './workspace.mjs';
+import { createWorkbookFileTransfer } from './workbook-files.mjs';
 
 const PACKAGE_METADATA = JSON.parse(fs.readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
 const BROKER_VERSION = PACKAGE_METADATA.version;
@@ -111,6 +112,14 @@ const AGENT_CWD = process.env.BROKER_AGENT_CWD || DEFAULT_WORKSPACE;
 const MANAGE_WORKSPACE = process.env.BROKER_MANAGE_WORKSPACE === '1';
 const ALLOW_UNMANAGED_AGENT_WORKSPACE = process.env.BROKER_ALLOW_UNMANAGED_AGENT_WORKSPACE === '1';
 const WORKSPACE_OPTIONS = { workspace: AGENT_CWD, port: PORT, token: TOKEN, callTimeoutMs: CALL_TIMEOUT_MS };
+const workbookFiles = createWorkbookFileTransfer({
+    configPath: process.env.BROKER_WORKBOOK_IO_CONFIG,
+    agentWorkspace: AGENT_CWD,
+    maxAppWsPayloadBytes: MAX_APP_WS_PAYLOAD_BYTES,
+    log(record) {
+        console.log(`[broker] workbook-file ${JSON.stringify(record)}`);
+    },
+});
 
 function workspaceInspection() {
     try { return inspectWorkspace(WORKSPACE_OPTIONS); }
@@ -220,17 +229,25 @@ const appBridge = {
         }
         this.pending.clear();
     },
-    call(name, args) {
+    call(name, args, options = {}) {
         if (!this.connected()) return Promise.reject(new Error('SciREPL app not connected to broker'));
         if (this.pending.size >= MAX_PENDING_CALLS) return Promise.reject(new Error(`too many pending tool calls (limit ${MAX_PENDING_CALLS})`));
         const id = crypto.randomUUID();
+        const payload = { type: 'call', id, name, args };
+        if (options.maxWireBytes !== undefined) {
+            const wireLimit = Math.min(MAX_APP_WS_PAYLOAD_BYTES, options.maxWireBytes);
+            const wireBytes = Buffer.byteLength(JSON.stringify(payload), 'utf8');
+            if (!Number.isSafeInteger(wireLimit) || wireLimit < 1 || wireBytes > wireLimit) {
+                return Promise.reject(new Error(`app tool call exceeds the configured /app wire limit (${MAX_APP_WS_PAYLOAD_BYTES} bytes)`));
+            }
+        }
         return new Promise((resolve, reject) => {
             const timer = setTimeout(() => {
                 this.pending.delete(id);
                 reject(new Error(`tool '${name}' timed out after ${CALL_TIMEOUT_MS}ms`));
             }, CALL_TIMEOUT_MS);
             this.pending.set(id, { resolve, reject, timer });
-            if (!sendWsJson(this.ws, { type: 'call', id, name, args }, MAX_APP_WS_PAYLOAD_BYTES)) {
+            if (!sendWsJson(this.ws, payload, MAX_APP_WS_PAYLOAD_BYTES)) {
                 clearTimeout(timer);
                 this.pending.delete(id);
                 reject(new Error('SciREPL app connection could not accept the tool call'));
@@ -624,10 +641,43 @@ function makeMcpServer() {
             const f = d.function || d;
             return { name: f.name, description: f.description || '', inputSchema: f.parameters || { type: 'object', properties: {} } };
         });
+        if (workbookFiles) tools.push(...workbookFiles.getToolDefinitions(appBridge.tools || []));
         return { tools };
     });
-    server.setRequestHandler(CallToolRequestSchema, async (req) => {
+    server.setRequestHandler(CallToolRequestSchema, async (req, extra) => {
         const { name, arguments: args } = req.params;
+        if (workbookFiles?.isSyntheticTool(name)) {
+            const available = workbookFiles.getToolDefinitions(appBridge.tools || [])
+                .some(definition => definition.name === name);
+            if (!available) {
+                return { content: [{ type: 'text', text: `Error: tool '${name}' is not available from the connected SciREPL app` }], isError: true };
+            }
+            try {
+                const receipt = await workbookFiles.handleTool(name, args || {}, {
+                    toolCallId: extra?.requestId,
+                    callApp: (baseName, baseArgs, callOptions) => appBridge.call(baseName, baseArgs, callOptions),
+                });
+                return { content: [{ type: 'text', text: JSON.stringify(receipt) }] };
+            } catch (e) {
+                return { content: [{ type: 'text', text: 'Error: ' + (e.message || e) }], isError: true };
+            }
+        }
+        // brokerRoot/brokerPath are reserved evidence from the broker's own
+        // validated synthetic tools. Ordinary callers may still use the base
+        // in-context workbook tools, but cannot spoof a host destination/source
+        // in the app's per-call confirmation UI.
+        if ((name === 'export_workbook' || name === 'import_workbook')
+            && args && typeof args === 'object'
+            && (Object.prototype.hasOwnProperty.call(args, 'brokerRoot')
+                || Object.prototype.hasOwnProperty.call(args, 'brokerPath'))) {
+            return {
+                content: [{
+                    type: 'text',
+                    text: 'Error: brokerRoot and brokerPath are reserved for broker-owned workbook file tools',
+                }],
+                isError: true,
+            };
+        }
         const advertised = (appBridge.tools || []).some(definition => {
             const tool = definition.function || definition;
             return tool && tool.name === name;
@@ -792,6 +842,13 @@ wss.on('connection', (ws) => {
         let msg; try { msg = JSON.parse(buf.toString()); } catch { return; }
         if (msg.type === 'hello') {
             if (!tokenMatches(msg.token)) { sendWsJson(ws, { type: 'error', error: 'unauthorized' }, MAX_APP_WS_PAYLOAD_BYTES); ws.close(1008, 'unauthorized'); return; }
+            const proposedTools = Array.isArray(msg.tools) ? msg.tools : [];
+            try { workbookFiles?.assertNoCollisions(proposedTools); }
+            catch (error) {
+                sendWsJson(ws, { type: 'error', error: error.message || String(error) }, MAX_APP_WS_PAYLOAD_BYTES);
+                ws.close(1008, 'reserved workbook tool name');
+                return;
+            }
             authenticated();
             authed = true;
             if (appBridge.ws && appBridge.ws !== ws) {
@@ -799,7 +856,7 @@ wss.on('connection', (ws) => {
                 try { appBridge.ws.close(1000, 'replaced by a new app connection'); } catch (_) {}
             }
             appBridge.ws = ws;
-            appBridge.tools = Array.isArray(msg.tools) ? msg.tools : [];
+            appBridge.tools = proposedTools;
             sendWsJson(ws, { type: 'welcome', protocolVersion: PROTOCOL_VERSION, tools: appBridge.tools.length }, MAX_APP_WS_PAYLOAD_BYTES);
             console.log(`[broker] app connected — ${appBridge.tools.length} tools`);
             return;
@@ -879,6 +936,7 @@ httpServer.listen(PORT, HOST, () => {
     console.log(`[broker]   workspace:     ${AGENT_CWD} (${workspace.ready ? 'prepared' : 'not prepared'}${MANAGE_WORKSPACE ? ', explicit repair enabled' : ''})`);
     console.log(`[broker]   MCP endpoint:  http://${displayHost}:${PORT}/mcp   (Authorization: Bearer <token>)`);
     console.log(`[broker]   app WebSocket: ws://${displayHost}:${PORT}/app`);
+    console.log(`[broker]   workbook I/O:  ${workbookFiles ? 'enabled by an immutable allowlist' : 'disabled (set BROKER_WORKBOOK_IO_CONFIG to an audited allowlist)'}`);
     console.log(`[broker]   agent WS:      ${AGENT_ENABLED ? 'ENABLED ws://' + displayHost + ':' + PORT + '/agent (agents: ' + Object.keys(AGENT_PROFILES).join(', ') + ')' : 'disabled (set BROKER_AGENT=1 after reviewing SECURITY.md)'}`);
     if (AGENT_ENABLED) console.log(`[broker]   agent access:  Claude ${AGENT_FULL_ACCESS ? 'full host tools' : 'allowlist ' + AGENT_ALLOWED_TOOLS}; other CLIs may retain normal host capabilities; environment ${AGENT_INHERIT_ENV ? 'inherited' : 'restricted'}`);
     console.log(`[broker]   terminal:      ${TERM_ENABLED ? 'ENABLED ws://' + displayHost + ':' + PORT + '/term (cmds: ' + TERM_CMDS.join(', ') + ')' + (TERM_NO_SHELL ? ' [no-shell: agents only, no shell escape]' : '') : 'disabled (set BROKER_TERM=1 to expose a PTY)'}`);

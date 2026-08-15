@@ -211,14 +211,39 @@ claude mcp add --transport http scirepl \
 The tools advertised by the connected app then appear under the `scirepl` MCP
 server. If no app is connected, the broker has no notebook tools to advertise.
 
-### Planned direct-to-file workbook transfer
+### Allowlisted direct-to-file workbook transfer
 
-The app's workbook tools can carry canonical `.srwb` or `.ipynb` content through
-MCP. A broker-owned, allowlisted direct-to-file variant is designed to keep that
-content out of an agent's model context during larger translation campaigns. It
-is **not implemented or enabled by configuration today**. See the authoritative
-[workbook file-transfer design](https://github.com/s243a/SciREPL-MCP/blob/main/docs/workbook-file-transfer.md)
-for the proposed tools, receipts, limits, and filesystem security rules.
+When `BROKER_WORKBOOK_IO_CONFIG` names a valid private allowlist and the app
+advertises its base workbook tools, the broker adds
+`export_workbook_to_file` and `import_workbook_from_file`. They relocate exact
+canonical `.srwb` or `.ipynb` bytes through a named host root while returning a
+content-free receipt to the MCP client. The app's separate, default-Off
+**Workbook import/export** permission is evaluated anew on every call; the
+broker adds only the host-path boundary and never caches or pre-answers that app
+decision.
+The broker also passes the validated root alias and relative path to the app as
+reserved display context; destination-aware Pro confirmation strings are an
+app-side follow-up.
+
+Use the setup option to validate and retain the allowlist in both private
+launchers:
+
+```bash
+./setup-broker.sh --workbook-io-config /absolute/private/workbook-io.json
+```
+
+The config file itself must be outside every allowlisted root and the agent
+workspace. Parent directories and roots must already exist. A root can set
+`denyGitIgnoredWrites:true` to prevent exports into paths Git considers ignored;
+use that project-scoped guard for the Catalog root, but not for a non-project
+scratch root. The recommended campaign configuration and its deliberate
+cross-session trust decision allowlist
+`/home/s243a/Projects/SciREPL-Catalog` and the stable
+`/home/s243a/.gemini/antigravity-cli/brain` parent. Enforcement is identical for
+every MCP client; the latter pathname does not make the policy agent- or
+model-specific. See the authoritative
+[workbook file-transfer specification](https://github.com/s243a/SciREPL-MCP/blob/main/docs/workbook-file-transfer.md)
+for the schemas, receipts, limits, audit fields, and filesystem security rules.
 
 ## Optional remote-agent chat
 

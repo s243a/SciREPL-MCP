@@ -47,6 +47,31 @@ if (process.platform !== 'win32') {
 ok(!fs.existsSync(path.join(core, 'workspace', 'AGENTS.md')),
     'core-only setup does not create active agent instruction files');
 
+const workbookArtifacts = path.join(testRoot, 'workbook-artifacts');
+const workbookPrivate = path.join(testRoot, 'workbook-private');
+const workbookSetup = path.join(testRoot, 'workbook-setup');
+fs.mkdirSync(workbookArtifacts);
+fs.mkdirSync(workbookPrivate);
+const workbookConfig = path.join(workbookPrivate, 'workbook-io.json');
+fs.writeFileSync(workbookConfig, JSON.stringify({
+    schemaVersion: 1,
+    maxContentBytes: 1048576,
+    roots: [{ name: 'artifacts', path: workbookArtifacts, read: true, write: true, allowOverwrite: false }],
+}), { mode: 0o600 });
+const workbookRun = run('--output', workbookSetup, '--no-install', '--workbook-io-config', workbookConfig);
+const workbookLaunchers = workbookRun.status === 0
+    ? fs.readFileSync(path.join(workbookSetup, 'start-broker.sh'), 'utf8') +
+      fs.readFileSync(path.join(workbookSetup, 'Start-Broker.ps1'), 'utf8')
+    : '';
+ok(workbookRun.status === 0 && workbookLaunchers.includes('BROKER_WORKBOOK_IO_CONFIG') &&
+    workbookLaunchers.includes(workbookConfig) && workbookLaunchers.includes('BROKER_MAX_APP_WS_PAYLOAD_BYTES'),
+    'setup validates and preserves an absolute workbook allowlist plus its required wire budget');
+const relativeWorkbook = run('--output', path.join(testRoot, 'relative-workbook'), '--no-install',
+    '--workbook-io-config', 'relative-config.json');
+ok(relativeWorkbook.status !== 0 && /absolute path/.test(relativeWorkbook.stderr) &&
+    !fs.existsSync(path.join(testRoot, 'relative-workbook')),
+    'setup rejects a relative workbook allowlist before writing');
+
 const terminal = path.join(testRoot, 'terminal');
 const terminalRun = run('--output', terminal, '--no-install', '--enable-terminal', '--acknowledge-terminal-host-access');
 if (process.platform === 'win32') {

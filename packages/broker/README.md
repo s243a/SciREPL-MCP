@@ -274,8 +274,9 @@ the capabilities that host has. Pass `--worker-url` so the enrollment
 names a reachable dial address; loopback setup writes a `BROKER_HOST`
 placeholder instead of this machine's Node path or `127.0.0.1`. Setup
 does not generate a same-host worker launcher beside `broker-token`.
-Upgrading a directory that still has `start-reverse-worker.sh` disables
-it and rotates the worker token — restart the broker and stop any old
+Upgrading a `b3f8f99` same-host layout requires `--repair` so leftover
+`start-reverse-worker.sh` / `Start-Reverse-Worker.ps1` can be retired and
+the worker token rotated — then restart the broker and stop any old
 shim. It does not enable
 local spawn; add the agent and
 terminal pairs if the broker host should still be able to run CLIs itself.

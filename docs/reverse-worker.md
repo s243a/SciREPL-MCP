@@ -314,22 +314,26 @@ not remote workers.
 
 ### One worker per name
 
-A second hello with an already-connected name **replaces** the first
-connection only when the new hello claims a live session or the current
-registration is older than five seconds. Rapid competing hellos for the
-same name without a live claim are rejected with `worker name is already
-connected` so two reconnecting shims cannot replace each other in a tight
-loop. When replacement is allowed:
+A second hello with an already-connected name is **rejected** with
+`worker name is already connected` for as long as that name's socket is
+still open. Connection age and a `sessions` live claim are not permission
+to replace it: two real shims with the same name must not interrupt an
+active session. There is no securely verifiable reconnection identity in
+version 1, so the hub fails closed while the existing socket is open.
 
-- The previous socket is closed with code 1000 and reason
-  `replaced by a new worker connection`.
-- In-flight controller sessions bound to the replaced socket are treated
-  as a worker disconnect (see [Failure modes](#failure-modes)) unless the
-  new hello's `sessions` object claims the corresponding surface is still
-  live. A live claim rebinds the existing controller session to the new
-  socket; the next controller `start` is forwarded and the worker may
-  answer `reattached: true`.
-- Health shows one entry for that name.
+A dropped socket that later redials is a new registration for that name.
+If the previous socket has already closed:
+
+- The new hello is accepted. Health still shows one entry for that name.
+- In-flight controller sessions that still pointed at the dead worker are
+  treated as a worker disconnect (see [Failure modes](#failure-modes))
+  unless the new hello's `sessions` object claims the corresponding
+  surface is still live. A live claim rebinds the existing controller
+  session to the new socket; the next controller `start` is forwarded and
+  the worker may answer `reattached: true`.
+- The previous (already-closed) socket is not a live session to steal.
+  The close reason `replaced by a new worker connection` is reserved for
+  that unregister race, not for kicking a still-open peer.
 
 Different names may advertise the same CLI. Controllers using the existing
 surfaces cannot choose among them.
@@ -381,12 +385,12 @@ the 1 MiB `bufferedAmount` cap close the socket with code 1013, matching
 the hub. Caps that are not safe integers (`NaN`, `Infinity`) are
 rejected at shim startup.
 
-`/app` replacement of a still-open previous socket is the model for a
-second worker hello with the same name while the first socket is still
-up. A dropped socket that later redials is the same name, same
-replacement rule, with the optional `sessions` live claim as the only
-addition — `/app` has no equivalent because the app does not hold a PTY
-for the broker.
+`/app` replacement of a still-open previous socket is **not** the model
+for `/worker`. A second worker hello with the same name while the first
+socket is still up is rejected. A dropped socket that later redials is
+accepted because the previous socket is gone; a `sessions` live claim may
+then rebind a surviving controller session. Version 1 has no signed
+reconnect identity that would make kicking a live socket safe.
 
 ## Audit continuity
 
@@ -485,16 +489,22 @@ the pairing token. It writes `worker-enroll.txt` describing how to copy
 that token to **another** account, container, or host and run the shim
 there with the capabilities that host actually has. The example uses
 `node scripts/reverse-worker.mjs` (not this broker's Node path or
-checkout). `--worker-url` bakes in a reachable `ws://` or `wss://` URL
+checkout) and an `--agents <cli-this-host-has>` placeholder rather than a
+hardcoded CLI. `--worker-url` bakes in a reachable `ws://` or `wss://` URL
 ending in `/worker`; loopback binds otherwise write a `BROKER_HOST`
 placeholder. It does **not** generate a same-host
 `start-reverse-worker.sh` beside `broker-token`. Upgrading a directory
-that still has that launcher (or `Start-Reverse-Worker.ps1`) disables
-the file and rotates the worker token; stop any old shim and restart the
-broker so the previous token is no longer accepted. It does **not**
+from the old same-host layout (commit `b3f8f99`: marker lists
+`start-reverse-worker.sh` / `Start-Reverse-Worker.ps1`, no
+`worker-enroll.txt`) **requires `--repair`**. Without it, setup refuses so
+it cannot retire those launchers or rotate the worker token. With
+`--repair` it disables the leftover launchers and rotates the worker
+token; stop any old shim and restart the broker so the previous token is
+no longer accepted. It does **not**
 create a workspace or advertise terminal support merely because reverse
 mode is on. Worker installation is separate; `node-pty` is a worker-host
-dependency when `--surfaces` includes `term`.
+dependency when `--surfaces` includes `term`, and the shim smoke-checks
+the native module before advertising terminal support.
 
 It does **not** imply `BROKER_AGENT=1` or `BROKER_TERM=1`. Those flags
 still mean "this broker may spawn locally." Reverse-only enablement is a
@@ -533,17 +543,23 @@ It connects out, sends the registration hello, supervises a local CLI or
 PTY on `start`, relays streams, and on socket drop keeps a live PTY for
 the terminal grace period while it reconnects. Welcome does **not** cancel
 that grace; a later `start` does (reattach). `/agent` children are sent
-`SIGTERM` then `SIGKILL` (process group on POSIX, `taskkill /t` on
+`SIGTERM` then `SIGKILL` (process group on POSIX, `taskkill /t /f` on
 Windows) when the worker link drops, and adapter `sessionId` is cleared
-so a later CLI cannot resume unrelated context. Persistent `started` is
+so a later CLI cannot resume unrelated context. Process-group `SIGKILL`
+is scheduled independently of the group leader's exit so a descendant
+that ignores `SIGTERM` is still reaped. Persistent `started` is
 emitted only after the OS `spawn` event. Session preservation is the
 shim's job for `/term` only. The shim defaults to `--surfaces agent` and
 PATH-detected agents; it does not advertise `term` or every CLI unless
-asked, and it refuses `term` when `node-pty` is missing. Hub-to-worker
+asked, and it refuses `term` unless `node-pty` loads and a throwaway PTY
+spawn succeeds. Hub-to-worker
 `detach` is the signal to start term grace; controllers never send it.
 
 Child processes get a restricted environment by default (the same class of
-allowlist as local spawn: `HOME`, `PATH`, locale, temp dirs, XDG). That
+allowlist as local spawn: `HOME`, `PATH`, locale, temp dirs, XDG). On
+Windows the shim also preserves and canonicalizes `Path`/`PATH` and
+`PATHEXT` (plus `SystemRoot` / `ComSpec` needed to launch `.cmd`) without
+inheriting provider secrets. That
 is enough for interactive `/term` logins that authenticate from config
 files. One-shot `/agent` adapters that authenticate from the environment
 need an explicit opt-in, matching the broker's local flags:
@@ -686,15 +702,18 @@ a supervisor believes it is driving `agy-box` and is instead driving the
 attacker. Audit lines will say `via worker 'agy-box'`, and relayed
 `started` events will carry `"via":"agy-box"`.
 
-The highest-value form of that impersonation is **live-session rebind**.
-A replacement hello for an already-connected name that claims
+The highest-value form of that impersonation is **live-session rebind
+after the legitimate socket has dropped**. A second hello cannot kick a
+still-open worker of the same name, even with a `sessions` live claim.
+Once the previous socket is gone, a redial that claims
 `sessions.term.live` (or `sessions.agent.live`) inherits the in-flight
 controller session: the broker rebinds the existing controller socket to
 the new worker and does **not** send the controller a disconnect. The
 controller keeps talking to what it thinks is the same PTY. Anyone
-holding the worker token can do this — it is how a legitimate shim
-reconnects after a network blip, and it is how a token thief slides into
-a live supervised turn. Forging a fresh `started` stream after the
+holding the worker token can do this after a disconnect — it is how a
+legitimate shim reconnects after a network blip, and it is how a token
+thief slides into a live supervised turn if they win the reconnect.
+Forging a fresh `started` stream after the
 controller has to `start` again is noisier; this path is quiet. The
 bound is still the worker token, not host identity. Revocation is
 delete-the-worker-token-file and restart, the same "seconds, one person"
@@ -755,7 +774,9 @@ Implementation covers at least:
 - controller token rejected on `/worker`;
 - equal secrets refused at startup;
 - registration welcome, health listing without host fields, one-name
-  replacement;
+  occupancy (a second connection for a live name is rejected even with a
+  live-session claim; a redial is accepted only after the previous socket
+  has closed);
 - `/term` and `/agent` relay round-trips with the documented message
   shapes, including a broker-authored `via` on `started` that the worker
   cannot spoof;
@@ -769,14 +790,15 @@ Implementation covers at least:
   `--acknowledge-reverse-worker-command-relay`, writes a worker token
   distinct from the pairing token, writes `worker-enroll.txt` rather than
   a same-host worker launcher, accepts `--worker-url`, writes a
-  `BROKER_HOST` placeholder for loopback binds, and on upgrade disables
-  leftover same-host launchers while rotating the worker token;
+  `BROKER_HOST` placeholder for loopback binds, and on upgrade of a real
+  old same-host layout requires `--repair` before disabling leftover
+  launchers and rotating the worker token;
 - `stop` then `start` of a different advertised CLI selects a matching
   worker instead of reusing the previous session;
 - a second authenticated `hello` on one `/worker` socket is rejected
   without registering another name;
-- a rapid second connection for an already-live worker name without a
-  live-session claim is rejected;
+- a second connection for an already-live worker name is rejected while
+  that socket is open, including when the new hello claims a live session;
 - controller `/term` disconnect forwards `detach` so shim grace starts;
   an expired grace does not reattach;
 - audit lines ignore worker-supplied `cmd`/`text` and log stop as

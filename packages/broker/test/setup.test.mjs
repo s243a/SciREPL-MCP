@@ -118,6 +118,7 @@ if (process.platform !== 'win32') {
         /^[0-9a-f]{32}$/.test(reverseWorkerToken) &&
         reverseEnroll.includes('reverse-worker.mjs') && reverseEnroll.includes('another account') &&
         reverseEnroll.includes('BROKER_HOST') && reverseEnroll.includes('node scripts/reverse-worker.mjs') &&
+        reverseEnroll.includes('--agents <cli-this-host-has>') && !/--agents agy\b/.test(reverseEnroll) &&
         !reverseEnroll.includes(process.execPath) &&
         !reverseEnroll.includes(reverseWorkerToken) &&
         !fs.existsSync(path.join(reverse, 'start-reverse-worker.sh')) &&
@@ -125,16 +126,87 @@ if (process.platform !== 'win32') {
         !fs.existsSync(path.join(reverse, 'workspace')),
         'acknowledged reverse-worker setup writes portable enrollment material, not a same-host worker launcher');
 
-    fs.writeFileSync(path.join(reverse, 'start-reverse-worker.sh'),
-        '#!/bin/sh\nexec node reverse-worker.mjs --url ws://127.0.0.1:8087/worker\n', { mode: 0o700 });
-    const oldWorkerToken = reverseWorkerToken;
-    const migrated = run('--output', reverse, '--no-install', '--enable-reverse-worker', '--acknowledge-reverse-worker-command-relay');
-    const retired = fs.existsSync(path.join(reverse, 'start-reverse-worker.sh'))
-        ? fs.readFileSync(path.join(reverse, 'start-reverse-worker.sh'), 'utf8') : '';
-    const rotatedToken = fs.readFileSync(path.join(reverse, 'worker-token'), 'utf8').trim();
-    ok(migrated.status === 0 && retired.includes('retired-same-host-reverse-worker') &&
-        rotatedToken && rotatedToken !== oldWorkerToken && /rotated/.test(migrated.stdout) && /restart/.test(migrated.stdout),
-        'upgrading an old same-host worker launcher disables it and rotates the worker token');
+    const oldLayout = path.join(testRoot, 'b3f8f99-layout');
+    fs.mkdirSync(path.join(oldLayout, 'workspace'), { recursive: true });
+    const oldPairing = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+    const oldWorker = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
+    fs.writeFileSync(path.join(oldLayout, 'broker-token'), oldPairing + '\n', { mode: 0o600 });
+    fs.writeFileSync(path.join(oldLayout, 'worker-token'), oldWorker + '\n', { mode: 0o600 });
+    const shQuote = (value) => "'" + String(value).replace(/'/g, "'\\''") + "'";
+    const psQuote = (value) => "'" + String(value).replace(/'/g, "''") + "'";
+    const brokerEntry = path.join(packageDir, 'src', 'broker.mjs');
+    const shim = path.join(packageDir, 'scripts', 'reverse-worker.mjs');
+    const workerUrl = 'ws://127.0.0.1:8087/worker';
+    const workerTokenPath = path.join(oldLayout, 'worker-token');
+    const workspacePath = path.join(oldLayout, 'workspace');
+    fs.writeFileSync(path.join(oldLayout, 'start-broker.sh'), [
+        '#!/usr/bin/env bash',
+        'set -euo pipefail',
+        `export BROKER_HOST='127.0.0.1'`,
+        `export BROKER_PORT='8087'`,
+        `export BROKER_TOKEN_FILE=${shQuote(path.join(oldLayout, 'broker-token'))}`,
+        `export BROKER_WORKSPACE=${shQuote(workspacePath)}`,
+        `export BROKER_AGENT_CWD=${shQuote(workspacePath)}`,
+        `export BROKER_REVERSE_WORKER='1'`,
+        `export BROKER_WORKER_TOKEN_FILE=${shQuote(workerTokenPath)}`,
+        `exec ${shQuote(process.execPath)} ${shQuote(brokerEntry)}`,
+        '',
+    ].join('\n'), { mode: 0o700 });
+    fs.writeFileSync(path.join(oldLayout, 'Start-Broker.ps1'), [
+        "$ErrorActionPreference = 'Stop'",
+        `$env:BROKER_HOST = '127.0.0.1'`,
+        `$env:BROKER_PORT = '8087'`,
+        `$env:BROKER_REVERSE_WORKER = '1'`,
+        `& ${psQuote(process.execPath)} ${psQuote(brokerEntry)}`,
+        'exit $LASTEXITCODE',
+        '',
+    ].join('\r\n'));
+    fs.writeFileSync(path.join(oldLayout, 'start-reverse-worker.sh'), [
+        '#!/usr/bin/env bash',
+        'set -euo pipefail',
+        `exec ${shQuote(process.execPath)} ${shQuote(shim)} --url ${shQuote(workerUrl)} --token-file ${shQuote(workerTokenPath)} --name worker --surfaces term,agent --cmds shell,claude,codex,gemini,agy --agents claude,codex,gemini,agy --cwd ${shQuote(workspacePath)}`,
+        '',
+    ].join('\n'), { mode: 0o700 });
+    fs.writeFileSync(path.join(oldLayout, 'Start-Reverse-Worker.ps1'), [
+        "$ErrorActionPreference = 'Stop'",
+        `& ${psQuote(process.execPath)} ${psQuote(shim)} --url ${psQuote(workerUrl)} --token-file ${psQuote(workerTokenPath)} --name worker --surfaces term,agent --cmds shell,claude,codex,gemini,agy --agents claude,codex,gemini,agy --cwd ${psQuote(workspacePath)}`,
+        'exit $LASTEXITCODE',
+        '',
+    ].join('\r\n'));
+    fs.writeFileSync(path.join(oldLayout, '.scirepl-mcp-setup.json'), JSON.stringify({
+        schemaVersion: 1,
+        generatedBy: 'SciREPL-MCP explicit broker setup',
+        sourceRepository: repoDir,
+        output: oldLayout,
+        host: '127.0.0.1',
+        port: 8087,
+        agentEnabled: false,
+        terminalEnabled: false,
+        reverseWorkerEnabled: true,
+        generatedFiles: ['start-broker.sh', 'Start-Broker.ps1', 'start-reverse-worker.sh', 'Start-Reverse-Worker.ps1'],
+    }, null, 2) + '\n');
+    const oldArgs = ['--output', oldLayout, '--no-install', '--enable-reverse-worker', '--acknowledge-reverse-worker-command-relay'];
+    const blockedUpgrade = run(...oldArgs);
+    ok(blockedUpgrade.status !== 0 && /--repair/.test(blockedUpgrade.stderr) &&
+        /start-reverse-worker\.sh/.test(blockedUpgrade.stderr) && /rotat/.test(blockedUpgrade.stderr) &&
+        fs.readFileSync(path.join(oldLayout, 'worker-token'), 'utf8').trim() === oldWorker &&
+        fs.readFileSync(path.join(oldLayout, 'start-reverse-worker.sh'), 'utf8').includes('reverse-worker.mjs') &&
+        !fs.existsSync(path.join(oldLayout, 'worker-enroll.txt')),
+        'a real b3f8f99 same-host layout requires --repair before launcher retirement and token rotation');
+    const repairedUpgrade = run(...oldArgs, '--repair');
+    const retiredSh = fs.readFileSync(path.join(oldLayout, 'start-reverse-worker.sh'), 'utf8');
+    const retiredPs = fs.readFileSync(path.join(oldLayout, 'Start-Reverse-Worker.ps1'), 'utf8');
+    const rotatedOld = fs.readFileSync(path.join(oldLayout, 'worker-token'), 'utf8').trim();
+    const upgradedEnroll = fs.readFileSync(path.join(oldLayout, 'worker-enroll.txt'), 'utf8');
+    const upgradedMarker = JSON.parse(fs.readFileSync(path.join(oldLayout, '.scirepl-mcp-setup.json'), 'utf8'));
+    ok(repairedUpgrade.status === 0 && retiredSh.includes('retired-same-host-reverse-worker') &&
+        retiredPs.includes('retired-same-host-reverse-worker') &&
+        rotatedOld && rotatedOld !== oldWorker && /^[0-9a-f]{32}$/.test(rotatedOld) &&
+        /rotated/.test(repairedUpgrade.stdout) && /restart/.test(repairedUpgrade.stdout) &&
+        upgradedEnroll.includes('--agents <cli-this-host-has>') &&
+        upgradedMarker.generatedFiles.includes('worker-enroll.txt') &&
+        !upgradedMarker.generatedFiles.includes('start-reverse-worker.sh'),
+        'repairing a real b3f8f99 layout retires the same-host launchers, rotates the worker token, and writes enrollment');
 
     const ipv6 = path.join(testRoot, 'ipv6');
     const ipv6Run = run('--output', ipv6, '--no-install', '--host', '::1',

@@ -3,7 +3,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { prepareNodePty } from '../src/node-pty-support.mjs';
+import { prepareNodePty, nodePtyUsable } from '../src/node-pty-support.mjs';
 
 let passed = 0;
 let failed = 0;
@@ -42,6 +42,19 @@ if (process.platform === 'win32') {
 
 const absent = prepareNodePty({ platform: 'darwin', arch: 'x64', nodePtyDirectory: root });
 ok(absent.status === 'no-prebuilt-helper', 'source builds and absent prebuilds require no repair');
+
+let resolvedPty = false;
+try {
+    const { createRequire } = await import('node:module');
+    createRequire(import.meta.url).resolve('node-pty');
+    resolvedPty = true;
+} catch (_) {}
+const usable = nodePtyUsable();
+ok(typeof usable === 'boolean' && (!resolvedPty || usable || process.platform === 'win32'),
+    'node-pty advertisement loads and smoke-checks the native module, not only its package path');
+if (!resolvedPty) {
+    ok(usable === false, 'missing node-pty is not advertised as usable');
+}
 
 console.log(`\n${passed} passed, ${failed} failed`);
 fs.rmSync(root, { recursive: true, force: true });

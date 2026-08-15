@@ -11,6 +11,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { spawn } from 'node:child_process';
 import { WebSocketServer } from 'ws';
 import { writePrivateFile } from './workspace.mjs';
 
@@ -27,12 +28,53 @@ export const CHILD_ENV_ALLOWLIST = Object.freeze([
 export const PROVIDER_API_KEYS = Object.freeze([
     'ANTHROPIC_API_KEY', 'OPENAI_API_KEY', 'GEMINI_API_KEY', 'GOOGLE_API_KEY',
 ]);
+export const DEFAULT_WINDOWS_PATHEXT = '.COM;.EXE;.BAT;.CMD;.VBS;.JS;.MSC';
+
+function envLookupKey(source, name) {
+    if (!source || typeof source !== 'object') return undefined;
+    if (Object.prototype.hasOwnProperty.call(source, name)) return name;
+    const needle = name.toLowerCase();
+    return Object.keys(source).find(key => key.toLowerCase() === needle);
+}
+
+function envLookup(source, name) {
+    const key = envLookupKey(source, name);
+    if (key === undefined) return undefined;
+    const value = source[key];
+    return value == null ? undefined : value;
+}
+
+function assignWindowsSearchVar(env, source, canonical, { mirror, fallback } = {}) {
+    const value = envLookup(source, canonical);
+    const resolved = value !== undefined ? value : fallback;
+    if (resolved === undefined) return;
+    env[canonical] = resolved;
+    if (mirror) env[mirror] = resolved;
+}
 
 export function childProcessEnv({ inheritEnv = false, useApiKey = false, source = process.env, extra = {} } = {}) {
     const env = {};
     const allowed = new Set(CHILD_ENV_ALLOWLIST);
     for (const [key, value] of Object.entries(source)) {
         if (inheritEnv || allowed.has(key) || key.startsWith('LC_')) env[key] = value;
+    }
+    const pathValue = envLookup(source, 'PATH');
+    if (pathValue !== undefined) {
+        env.PATH = pathValue;
+        const pathKey = envLookupKey(source, 'PATH');
+        if (process.platform === 'win32' || (pathKey && pathKey !== 'PATH')) env.Path = pathValue;
+    }
+    assignWindowsSearchVar(env, source, 'PATHEXT', {
+        fallback: process.platform === 'win32' ? DEFAULT_WINDOWS_PATHEXT : undefined,
+    });
+    if (process.platform === 'win32' || envLookup(source, 'SYSTEMROOT') !== undefined) {
+        assignWindowsSearchVar(env, source, 'SYSTEMROOT', { mirror: 'SystemRoot' });
+    }
+    if (process.platform === 'win32' || envLookup(source, 'WINDIR') !== undefined) {
+        assignWindowsSearchVar(env, source, 'WINDIR', { mirror: 'windir' });
+    }
+    if (process.platform === 'win32' || envLookup(source, 'COMSPEC') !== undefined) {
+        assignWindowsSearchVar(env, source, 'COMSPEC', { mirror: 'ComSpec' });
     }
     if (useApiKey) {
         for (const key of PROVIDER_API_KEYS) {
@@ -43,11 +85,35 @@ export function childProcessEnv({ inheritEnv = false, useApiKey = false, source 
     return env;
 }
 
+export function terminateChild(child, graceMs = 1000) {
+    if (!child) return;
+    const pid = child.pid;
+    try {
+        if (process.platform === 'win32') {
+            if (pid) spawn('taskkill', ['/pid', String(pid), '/t', '/f'], { stdio: 'ignore', windowsHide: true });
+            else child.kill();
+        } else if (pid) {
+            try { process.kill(-pid, 'SIGTERM'); } catch (_) { try { child.kill('SIGTERM'); } catch (_) {} }
+        } else {
+            child.kill('SIGTERM');
+        }
+    } catch (_) {}
+    setTimeout(() => {
+        try {
+            if (process.platform === 'win32') {
+                try { child.kill(); } catch (_) {}
+            } else if (pid) {
+                try { process.kill(-pid, 'SIGKILL'); } catch (_) { try { child.kill('SIGKILL'); } catch (_) {} }
+            } else {
+                try { child.kill('SIGKILL'); } catch (_) {}
+            }
+        } catch (_) {}
+    }, graceMs);
+}
+
 const TERM_KIND_SET = new Set(TERM_EVENT_KINDS);
 const AGENT_KIND_SET = new Set(AGENT_EVENT_KINDS);
 const SURFACE_SET = new Set(['term', 'agent']);
-
-export const WORKER_REPLACE_MIN_AGE_MS = 5000;
 
 export function secretMatches(candidate, expected) {
     if (typeof candidate !== 'string' || typeof expected !== 'string') return false;
@@ -301,9 +367,7 @@ export function createReverseWorkerHub({
         };
         const previous = workers.get(parsed.name);
         if (previous && previous.ws !== ws) {
-            const claimsLive = parsed.sessions.term.live || parsed.sessions.agent.live;
-            const tooSoon = socketOpen(previous.ws) && (Date.now() - previous.connectedAt) < WORKER_REPLACE_MIN_AGE_MS;
-            if (tooSoon && !claimsLive) {
+            if (socketOpen(previous.ws)) {
                 sendJson(ws, { type: 'error', error: 'worker name is already connected' }, maxPayloadBytes);
                 try { ws.close(1008, 'worker name is already connected'); } catch (_) {}
                 return null;

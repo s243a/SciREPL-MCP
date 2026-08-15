@@ -16,7 +16,9 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { createRequire } from 'node:module';
-import { childProcessEnv, boundedInteger, KNOWN_AGENTS } from '../src/reverse-worker.mjs';
+import { childProcessEnv, boundedInteger, KNOWN_AGENTS, terminateChild } from '../src/reverse-worker.mjs';
+import { nodePtyUsable } from '../src/node-pty-support.mjs';
+import { configureUtf8Pipes, truncateCodePoints } from '../src/utf8-pipes.mjs';
 
 const require = createRequire(import.meta.url);
 const WebSocket = require('ws');
@@ -38,7 +40,7 @@ const TOKEN = (tokenArg || fs.readFileSync(tokenFile, 'utf8')).trim();
 const NAME = arg('name', 'worker');
 
 function nodePtyAvailable() {
-    try { require.resolve('node-pty'); return true; } catch { return false; }
+    return nodePtyUsable();
 }
 
 function commandExists(name) {
@@ -62,7 +64,7 @@ function commandExists(name) {
 
 const SURFACES = has('surfaces') ? csv('surfaces') : ['agent'];
 if (SURFACES.includes('term') && !nodePtyAvailable()) {
-    console.error('reverse-worker.mjs: --surfaces includes term but node-pty is not installed on this host');
+    console.error('reverse-worker.mjs: --surfaces includes term but node-pty is not usable on this host');
     process.exit(2);
 }
 const CMDS = has('cmds') ? csv('cmds') : (SURFACES.includes('term') ? ['shell'] : []);
@@ -193,40 +195,19 @@ function spawnEnv() {
 }
 
 function spawnChild(command, args, stdio) {
-    return spawn(command, args, {
+    const child = spawn(command, args, {
         env: spawnEnv(),
         cwd: CWD,
         stdio,
         detached: process.platform !== 'win32',
         windowsHide: true,
     });
+    configureUtf8Pipes(child);
+    return child;
 }
 
-function terminateChild(child, graceMs = 1000) {
-    if (!child) return;
-    const pid = child.pid;
-    try {
-        if (process.platform === 'win32') {
-            if (pid) spawn('taskkill', ['/pid', String(pid), '/t', '/f'], { stdio: 'ignore', windowsHide: true });
-            else child.kill();
-        } else if (pid) {
-            try { process.kill(-pid, 'SIGTERM'); } catch (_) { try { child.kill('SIGTERM'); } catch (_) {} }
-        } else {
-            child.kill('SIGTERM');
-        }
-    } catch (_) {}
-    const timer = setTimeout(() => {
-        try {
-            if (process.platform === 'win32') {
-                try { child.kill(); } catch (_) {}
-            } else if (pid) {
-                try { process.kill(-pid, 'SIGKILL'); } catch (_) { try { child.kill('SIGKILL'); } catch (_) {} }
-            } else {
-                try { child.kill('SIGKILL'); } catch (_) {}
-            }
-        } catch (_) {}
-    }, graceMs);
-    child.once('exit', () => clearTimeout(timer));
+function emitAgentStderr(text) {
+    send({ type: 'agent', kind: 'stderr', text: truncateCodePoints(text, 500) });
 }
 
 async function startTerm(msg) {
@@ -344,7 +325,7 @@ function startAgent(name) {
     });
     child.stdout.on('data', (d) => {
         if (agent.child !== child) return;
-        const chunk = d.toString();
+        const chunk = typeof d === 'string' ? d : d.toString();
         if (Buffer.byteLength(agent.buf) + Buffer.byteLength(chunk) > MAX_AGENT_BUFFER_BYTES) {
             agent.child = null;
             terminateChild(child);
@@ -363,7 +344,7 @@ function startAgent(name) {
             if (n) send({ type: 'agent', ...n });
         }
     });
-    child.stderr.on('data', (d) => send({ type: 'agent', kind: 'stderr', text: d.toString().slice(0, 500) }));
+    child.stderr.on('data', (d) => emitAgentStderr(d));
     child.on('exit', (code) => { if (agent.child === child) { agent.child = null; send({ type: 'agent', kind: 'exit', code }); } });
 }
 
@@ -386,7 +367,7 @@ function oneshotTurn(text) {
     if (prof.format === 'text') {
         child.stdout.on('data', (d) => {
             if (agent.child !== child) return;
-            const chunk = d.toString();
+            const chunk = typeof d === 'string' ? d : d.toString();
             if (Buffer.byteLength(agent.buf) + Buffer.byteLength(chunk) > MAX_AGENT_BUFFER_BYTES) {
                 agent.child = null;
                 terminateChild(child);
@@ -396,7 +377,7 @@ function oneshotTurn(text) {
             }
             agent.buf += chunk;
         });
-        child.stderr.on('data', (d) => send({ type: 'agent', kind: 'stderr', text: d.toString().slice(0, 500) }));
+        child.stderr.on('data', (d) => emitAgentStderr(d));
         child.on('exit', (code) => {
             if (agent.child !== child) return;
             agent.child = null;
@@ -409,7 +390,7 @@ function oneshotTurn(text) {
     }
     child.stdout.on('data', (d) => {
         if (agent.child !== child) return;
-        const chunk = d.toString();
+        const chunk = typeof d === 'string' ? d : d.toString();
         if (Buffer.byteLength(agent.buf) + Buffer.byteLength(chunk) > MAX_AGENT_BUFFER_BYTES) {
             agent.child = null;
             terminateChild(child);
@@ -427,7 +408,7 @@ function oneshotTurn(text) {
             const n = prof.normalize(o); if (n) { if (n.kind === 'result') sawResult = true; send({ type: 'agent', ...n }); }
         }
     });
-    child.stderr.on('data', (d) => send({ type: 'agent', kind: 'stderr', text: d.toString().slice(0, 500) }));
+    child.stderr.on('data', (d) => emitAgentStderr(d));
     child.on('exit', (code) => {
         if (agent.child === child) {
             agent.child = null;

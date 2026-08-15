@@ -50,7 +50,10 @@ The setup command never prints the pairing token. It creates launchers which
 read the token from a private file. Active agent instructions are generated only
 when --enable-agent is supplied with its acknowledgement. Reverse-worker setup
 writes enrollment material (worker-token plus worker-enroll.txt); it does not
-install a same-host worker beside broker-token.`);
+install a same-host worker beside broker-token. Upgrading a b3f8f99-era
+directory that still has start-reverse-worker.sh / Start-Reverse-Worker.ps1
+requires --repair so those launchers can be retired and the worker token
+rotated.`);
 }
 
 function parseArgs(argv) {
@@ -277,13 +280,15 @@ function workerEnrollment(options, workerTokenFile) {
         '    --token-file /path/on/worker/worker-token \\',
         '    --name worker \\',
         '    --surfaces agent \\',
-        '    --agents agy \\',
+        '    --agents <cli-this-host-has> \\',
         '    --cwd /path/to/target-repo',
         '',
         ...reachability,
-        'Advertise only CLIs this worker host actually has. The shim defaults to',
-        'agent mode and PATH-detected CLIs; it does not advertise terminal support',
-        'unless you pass --surfaces term after installing and verifying node-pty.',
+        'Replace <cli-this-host-has> with a CLI this worker actually has, or omit',
+        '--agents so the shim PATH-detects known agents. Do not copy a hardcoded',
+        'example CLI from another machine. The shim defaults to agent mode; it does',
+        'not advertise terminal support unless you pass --surfaces term after',
+        'installing and verifying node-pty.',
         '',
         'Do not run the shim as the same OS user that runs this broker if you need',
         'the worker token to stay weaker than the pairing token: a commanded shell',
@@ -467,8 +472,18 @@ function writeGenerated(targets, options) {
     const unsafe = states.filter(({ state }) => state.startsWith('unsafe') || state === 'unreadable');
     if (unsafe.length) throw new Error(`refusing unsafe generated paths: ${unsafe.map(({ target }) => target.rel).join(', ')}`);
     const conflicts = states.filter(({ state }) => state === 'outdated');
-    if (conflicts.length && !options.repair) {
-        throw new Error(`generated files differ: ${conflicts.map(({ target }) => target.rel).join(', ')}; rerun with --repair to back them up and replace them`);
+    const obsolete = options.enableReverseWorker
+        ? OBSOLETE_WORKER_LAUNCHERS.filter(rel => isActiveObsoleteWorkerLauncher(path.join(options.output, rel)))
+        : [];
+    if ((conflicts.length || obsolete.length) && !options.repair) {
+        const parts = [];
+        if (conflicts.length) {
+            parts.push(`generated files differ: ${conflicts.map(({ target }) => target.rel).join(', ')}`);
+        }
+        if (obsolete.length) {
+            parts.push(`obsolete same-host worker launchers are present (${obsolete.join(', ')}) and retiring them rotates the worker token`);
+        }
+        throw new Error(`${parts.join('; ')}; rerun with --repair to back them up and replace them`);
     }
     if (options.dryRun) return { created: [], updated: [], backups: [] };
     const result = { created: [], updated: [], backups: [] };

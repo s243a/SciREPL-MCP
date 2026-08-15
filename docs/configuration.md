@@ -93,7 +93,7 @@ Important command-line options are:
 | `--output PATH` | Place the private token, generated launchers, and optional workspace under this dedicated directory. |
 | `--enable-agent --acknowledge-agent-host-access` | Enable structured, non-PTY `/agent` adapters and materialize their explicit session context. |
 | `--enable-terminal --acknowledge-terminal-host-access` | Enable `/term`, install/verify `node-pty`, and create its working directory. Combine it with agent mode for interactive agent/TUI choices. |
-| `--enable-reverse-worker --acknowledge-reverse-worker-command-relay` | Accept outbound workers and relay `/agent` and `/term` commands to them. Writes a distinct worker token and worker launchers. Does not imply local spawn. |
+| `--enable-reverse-worker --acknowledge-reverse-worker-command-relay` | Accept outbound workers and relay `/agent` and `/term` commands to them. Writes a distinct worker token and `worker-enroll.txt`. Does not imply local spawn. Upgrading a `b3f8f99` same-host layout requires `--repair`. |
 | `--repair` | Back up and replace edited or stale generated files. |
 | `--adopt` | Allow setup to use an existing non-empty directory that has no setup marker. |
 | `--host ADDRESS --allow-non-loopback` | Explicitly accept raw non-loopback binding. This does not prove Tailscale/SSH or provide TLS. |

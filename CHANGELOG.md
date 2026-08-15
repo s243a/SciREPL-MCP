@@ -6,8 +6,9 @@
   credential and the broker relays the existing `/agent` and `/term` controller
   messages to it. Default off; setup requires
   `--acknowledge-reverse-worker-command-relay` and writes enrollment material
-  rather than a same-host worker launcher. Upgrading leftover same-host
-  launchers disables them and rotates the worker token. Local spawn is
+  rather than a same-host worker launcher. Upgrading a `b3f8f99` same-host
+  layout requires `--repair` before leftover launchers are retired and the
+  worker token is rotated. Local spawn is
   unchanged when the flag is unset. Relayed `started` events carry a
   broker-authored `via` worker name; `BROKER_REVERSE_WORKER_STRICT=1` fails
   closed instead of falling through to local spawn. The worker shim can pass
@@ -15,7 +16,10 @@
   and still does not inject the controller pairing token. Stop clears the
   reverse session so the next start re-selects a capable worker; controller
   `/term` detach starts shim grace; worker-link loss kills `/agent` children
-  with SIGTERM then SIGKILL and clears adapter session ids.
+  with SIGTERM then SIGKILL (process-group SIGKILL stays scheduled after the
+  leader exits) and clears adapter session ids. Duplicate worker names are
+  rejected while the existing socket is open. Child PATH/PATHEXT are
+  preserved on Windows. Agent pipes decode UTF-8 incrementally.
 
 - Extract the SciREPL host-side MCP broker into an independently installable
   repository.

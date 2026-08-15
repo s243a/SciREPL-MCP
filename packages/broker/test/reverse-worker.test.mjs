@@ -11,7 +11,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { childProcessEnv, loadWorkerToken, validateWorkerHello, workerWebSocketUrl, boundedInteger, auditSafeIdentity } from '../src/reverse-worker.mjs';
+import { childProcessEnv, loadWorkerToken, validateWorkerHello, workerWebSocketUrl, boundedInteger, auditSafeIdentity, terminateChild } from '../src/reverse-worker.mjs';
 
 const packageDir = path.dirname(fileURLToPath(new URL('../package.json', import.meta.url)));
 const PORT = 8093;
@@ -127,6 +127,82 @@ const envInherit = childProcessEnv({
 });
 ok(envInherit.FOO === 'bar' && envInherit.ANTHROPIC_API_KEY === 'sk-secret',
     '--inherit-env passes the shim environment through');
+
+const envWindowsPath = childProcessEnv({
+    inheritEnv: false,
+    source: {
+        Path: 'C:\\WinBin',
+        PATHEXT: '.COM;.EXE;.BAT;.CMD',
+        SYSTEMROOT: 'C:\\Windows',
+        ANTHROPIC_API_KEY: 'sk-secret',
+        SCIREPL_MCP_BEARER: 'controller',
+        SECRET: 'nope',
+    },
+});
+ok(envWindowsPath.PATH === 'C:\\WinBin' && envWindowsPath.Path === 'C:\\WinBin' &&
+    envWindowsPath.PATHEXT === '.COM;.EXE;.BAT;.CMD' &&
+    envWindowsPath.SYSTEMROOT === 'C:\\Windows' && envWindowsPath.SystemRoot === 'C:\\Windows' &&
+    envWindowsPath.ANTHROPIC_API_KEY === undefined && envWindowsPath.SCIREPL_MCP_BEARER === undefined &&
+    envWindowsPath.SECRET === undefined,
+    'Windows Path/PATHEXT/SystemRoot are canonicalized without inheriting secrets');
+
+if (process.platform === 'win32') {
+    const cmdDir = path.join(testRoot, 'cmd-discovery');
+    fs.mkdirSync(cmdDir, { recursive: true });
+    fs.writeFileSync(path.join(cmdDir, 'probe-cli.cmd'), '@echo off\r\necho CMD_DISCOVERY_OK\r\n');
+    const cmdEnv = childProcessEnv({
+        inheritEnv: false,
+        source: {
+            Path: cmdDir,
+            PATHEXT: '.COM;.EXE;.BAT;.CMD;.VBS;.JS',
+            SYSTEMROOT: process.env.SYSTEMROOT || process.env.SystemRoot,
+            WINDIR: process.env.WINDIR || process.env.windir,
+            COMSPEC: process.env.COMSPEC || process.env.ComSpec,
+            HOME: process.env.USERPROFILE || process.env.HOME,
+            ANTHROPIC_API_KEY: 'sk-secret',
+            SECRET: 'nope',
+        },
+    });
+    const cmdResult = spawnSync('probe-cli', [], { env: cmdEnv, encoding: 'utf8', windowsHide: true, timeout: 10000 });
+    ok(cmdResult.status === 0 && /CMD_DISCOVERY_OK/.test(cmdResult.stdout || '') &&
+        cmdEnv.PATH === cmdDir && /\.CMD/i.test(cmdEnv.PATHEXT) && cmdEnv.SECRET === undefined,
+        'restricted child env can resolve and launch a real .cmd via Path+PATHEXT');
+} else {
+    console.log('  - native .cmd discovery skipped (not Windows)');
+}
+
+const pidAlive = (p) => { try { process.kill(p, 0); return true; } catch { return false; } };
+if (process.platform !== 'win32') {
+    const descPidFile = path.join(testRoot, 'stubborn-desc.pid');
+    const descScript = path.join(testRoot, 'stubborn-desc.mjs');
+    const leaderScript = path.join(testRoot, 'stubborn-leader.mjs');
+    fs.writeFileSync(descScript, `import fs from 'node:fs';
+process.on('SIGTERM', () => {});
+fs.writeFileSync(${JSON.stringify(descPidFile)}, String(process.pid));
+setInterval(() => {}, 1000);
+`);
+    fs.writeFileSync(leaderScript, `import { spawn } from 'node:child_process';
+spawn(process.execPath, [${JSON.stringify(descScript)}], { stdio: 'ignore' });
+process.on('SIGTERM', () => process.exit(0));
+setInterval(() => {}, 1000);
+`);
+    const leader = spawn(process.execPath, [leaderScript], { detached: true, stdio: 'ignore' });
+    const leaderExit = new Promise((resolve) => leader.once('exit', resolve));
+    const waitDesc = Date.now() + 4000;
+    while (!fs.existsSync(descPidFile) && Date.now() < waitDesc) await sleep(20);
+    const descPid = fs.existsSync(descPidFile) ? Number(fs.readFileSync(descPidFile, 'utf8').trim()) : 0;
+    const graceMs = 200;
+    ok(leader.pid > 0 && descPid > 0 && pidAlive(leader.pid) && pidAlive(descPid),
+        'stubborn-descendant fixture is running in the leader process group');
+    terminateChild(leader, graceMs);
+    await Promise.race([leaderExit, sleep(1000)]);
+    const deadline = Date.now() + graceMs + 2000;
+    while ((pidAlive(leader.pid) || pidAlive(descPid)) && Date.now() < deadline) await sleep(20);
+    ok(!pidAlive(leader.pid) && !pidAlive(descPid),
+        'process-group SIGKILL still fires after the leader exits on SIGTERM, reaping a stubborn descendant');
+} else {
+    console.log('  - stubborn-descendant process-group test skipped (Windows uses taskkill /t /f)');
+}
 
 ok(workerWebSocketUrl('127.0.0.1', 8087) === 'ws://127.0.0.1:8087/worker',
     'worker URL leaves IPv4 hosts unbracketed');
@@ -325,24 +401,31 @@ try {
     const healthRaced = await (await fetch(`http://127.0.0.1:${PORT}/health`)).json();
     ok(racedHello.error === 'worker name is already connected' &&
         (healthRaced.workers || []).length === 1 && healthRaced.workers[0].name === 'agy-box',
-        'a rapid second hello for a live name without a live-session claim is rejected');
+        'a second hello for a live name is rejected while the existing socket is open');
     try { raced.ws.close(); } catch (_) {}
 
-    const replacement = await connectWorker({
+    const liveClaim = await connectWorker({
         name: 'agy-box',
         sessions: { term: { live: true, cmd: 'shell' }, agent: { live: false } },
     });
-    const replacedClose = new Promise((resolve) => worker.once('close', (code) => resolve(code)));
-    const replacementWelcome = await replacement.welcome;
-    const replacedCode = await replacedClose;
-    ok(replacementWelcome.type === 'welcome' && replacedCode === 1000,
-        'a live-session claim can replace a still-connected worker of the same name');
-    const health2 = await (await fetch(`http://127.0.0.1:${PORT}/health`)).json();
-    ok((health2.workers || []).length === 1 && health2.workers[0].name === 'agy-box',
-        'health still shows one worker after replacement');
+    const liveClaimHello = await liveClaim.welcome;
+    const healthLiveClaim = await (await fetch(`http://127.0.0.1:${PORT}/health`)).json();
+    ok(liveClaimHello.error === 'worker name is already connected' &&
+        (healthLiveClaim.workers || []).length === 1 && healthLiveClaim.workers[0].name === 'agy-box',
+        'a live-session claim cannot replace a still-connected worker of the same name');
+    try { liveClaim.ws.close(); } catch (_) {}
 
-    const secondHello = onceMessage(replacement.ws);
-    replacement.ws.send(JSON.stringify({
+    const firstClosed = new Promise((resolve) => worker.once('close', resolve));
+    try { worker.close(); } catch (_) {}
+    await firstClosed;
+    await sleep(50);
+    const redial = await connectWorker({ name: 'agy-box' });
+    const redialWelcome = await redial.welcome;
+    ok(redialWelcome.type === 'welcome' && redialWelcome.name === 'agy-box',
+        'the same worker name can reconnect after the previous socket has closed');
+
+    const secondHello = onceMessage(redial.ws);
+    redial.ws.send(JSON.stringify({
         type: 'hello',
         token: WORKER,
         name: 'other-box',
@@ -355,7 +438,7 @@ try {
         healthAfterSecond.workers[0].name === 'agy-box',
         'a second hello on an authenticated worker socket is rejected without registering aliases');
 
-    try { replacement.ws.close(); } catch (_) {}
+    try { redial.ws.close(); } catch (_) {}
     await sleep(100);
 } catch (e) {
     console.log('  ✗ unexpected auth/registration error: ' + (e.stack || e));
@@ -814,7 +897,6 @@ setInterval(() => {}, 60000);
     const waitPid = Date.now() + 4000;
     while (!fs.existsSync(pidFile) && Date.now() < waitPid) await sleep(30);
     const pid = fs.existsSync(pidFile) ? Number(fs.readFileSync(pidFile, 'utf8').trim()) : 0;
-    const pidAlive = (p) => { try { process.kill(p, 0); return true; } catch { return false; } };
     ok(pid > 0 && pidAlive(pid), 'fake claude child is running after reverse start');
     const registered = reverseWorkerHub._workers.get('kill-box');
     try { registered.ws.close(); } catch (_) {}
@@ -825,6 +907,175 @@ setInterval(() => {}, 60000);
     try { killShim.kill('SIGTERM'); } catch (_) {}
 } catch (e) {
     console.log('  ✗ agent-kill-on-disconnect error: ' + (e.stack || e));
+    failed++;
+}
+
+function writeCliWrapper(dir, name, script) {
+    fs.mkdirSync(dir, { recursive: true });
+    if (process.platform === 'win32') {
+        fs.writeFileSync(path.join(dir, name + '.cmd'), `@echo off\r\n"${process.execPath}" "${script}" ${name} %*\r\n`);
+    } else {
+        fs.writeFileSync(path.join(dir, name),
+            `#!/bin/sh\nexec ${JSON.stringify(process.execPath)} ${JSON.stringify(script)} ${JSON.stringify(name)} "$@"\n`,
+            { mode: 0o755 });
+    }
+}
+
+function waitShimWelcome(child, label, timeoutMs = 5000) {
+    return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error(label + ' welcome timeout')), timeoutMs);
+        let buf = '';
+        child.stderr.on('data', (d) => {
+            buf += d.toString();
+            if (/welcome/.test(buf)) { clearTimeout(timer); resolve(buf); }
+        });
+        child.on('error', reject);
+    });
+}
+
+console.log('\nDuplicate real shims fail closed\n');
+try {
+    const binDir = path.join(testRoot, 'dup-bin');
+    const fakeScript = path.join(binDir, 'sleep-cli.mjs');
+    fs.mkdirSync(binDir, { recursive: true });
+    fs.writeFileSync(fakeScript, 'setInterval(() => {}, 60000);\n');
+    writeCliWrapper(binDir, 'claude', fakeScript);
+    const env = { ...process.env, PATH: `${binDir}${path.delimiter}${process.env.PATH || ''}` };
+    const shimArgs = [
+        path.join(packageDir, 'scripts', 'reverse-worker.mjs'),
+        '--url', `ws://127.0.0.1:${PORT}/worker`,
+        '--token-file', workerTokenFile,
+        '--name', 'dup-box',
+        '--surfaces', 'agent',
+        '--agents', 'claude',
+        '--cwd', process.env.BROKER_WORKSPACE,
+    ];
+    const first = spawn(process.execPath, shimArgs, { cwd: packageDir, env, stdio: ['ignore', 'pipe', 'pipe'] });
+    await waitShimWelcome(first, 'dup-first');
+    const second = spawn(process.execPath, shimArgs, { cwd: packageDir, env, stdio: ['ignore', 'pipe', 'pipe'] });
+    let secondErr = '';
+    second.stderr.on('data', (d) => { secondErr += d.toString(); });
+    const sawReject = Date.now() + 4000;
+    while (!/already connected/.test(secondErr) && Date.now() < sawReject) await sleep(30);
+    const healthDup = await (await fetch(`http://127.0.0.1:${PORT}/health`)).json();
+    const dupWorkers = (healthDup.workers || []).filter(w => w.name === 'dup-box');
+    ok(/already connected/.test(secondErr) && dupWorkers.length === 1,
+        'a second real shim with the same name is rejected while the first socket is open');
+    try { second.kill('SIGTERM'); } catch (_) {}
+    try { first.kill('SIGTERM'); } catch (_) {}
+    await sleep(100);
+} catch (e) {
+    console.log('  ✗ duplicate-shim error: ' + (e.stack || e));
+    failed++;
+}
+
+console.log('\nSplit UTF-8 through the reverse-worker shim\n');
+try {
+    const SENTINEL = 'côtés · 日本語 · বাংলা · 👩‍🔬';
+    const STDERR_SENTINEL = 'diagnóstico · العربية · 👩‍🔬\n';
+    const BOUNDARY = 'a'.repeat(499) + '😀' + 'tail';
+    const binDir = path.join(testRoot, 'utf8-bin');
+    const fixture = path.join(binDir, 'fake-agent.cjs');
+    fs.mkdirSync(binDir, { recursive: true });
+    fs.writeFileSync(fixture, `'use strict';
+const SENTINEL = ${JSON.stringify(SENTINEL)};
+const STDERR_SENTINEL = ${JSON.stringify(STDERR_SENTINEL)};
+const BOUNDARY = ${JSON.stringify(BOUNDARY)};
+const mode = process.argv[2];
+function splitWrite(stream, text, done) {
+  const bytes = Buffer.from(text, 'utf8');
+  const parts = [];
+  for (let i = 0; i < bytes.length; ) {
+    const b = bytes[i];
+    let len = 1;
+    if ((b & 0xe0) === 0xc0) len = 2;
+    else if ((b & 0xf0) === 0xe0) len = 3;
+    else if ((b & 0xf8) === 0xf0) len = 4;
+    if (len > 1) {
+      if ((bytes[i + 1] & 0xc0) !== 0x80) throw new Error('cut is not inside a UTF-8 sequence');
+      parts.push(bytes.subarray(i, i + 1));
+      parts.push(bytes.subarray(i + 1, i + len));
+    } else {
+      parts.push(bytes.subarray(i, i + 1));
+    }
+    i += len;
+  }
+  let n = 0;
+  const next = () => {
+    if (n >= parts.length) { if (done) done(); return; }
+    stream.write(parts[n++], () => setTimeout(next, 4));
+  };
+  next();
+}
+function emit(stdoutText, exitAfter) {
+  splitWrite(process.stderr, STDERR_SENTINEL, () => {
+    process.stderr.write(Buffer.from(BOUNDARY, 'utf8'), () => {
+      setTimeout(() => splitWrite(process.stdout, stdoutText, () => {
+        if (exitAfter) setTimeout(() => process.exit(0), 10);
+      }), 20);
+    });
+  });
+}
+const persistentPayload = () =>
+  JSON.stringify({ type: 'assistant', message: { content: [{ type: 'text', text: SENTINEL }] } }) + '\\n' +
+  JSON.stringify({ type: 'result', result: '' }) + '\\n';
+const oneShotPayload = () =>
+  JSON.stringify({ type: 'message', role: 'assistant', content: SENTINEL }) + '\\n' +
+  JSON.stringify({ type: 'result', stats: {} }) + '\\n';
+if (mode === 'claude') {
+  let input = '';
+  process.stdin.on('data', chunk => {
+    input += chunk;
+    if (input.includes('\\n')) emit(persistentPayload(), false);
+  });
+} else if (mode === 'gemini') emit(oneShotPayload(), true);
+else if (mode === 'agy') emit(SENTINEL + '\\n', true);
+else process.exit(2);
+`);
+    for (const name of ['claude', 'gemini', 'agy']) writeCliWrapper(binDir, name, fixture);
+    const utf8Shim = spawn(process.execPath, [
+        path.join(packageDir, 'scripts', 'reverse-worker.mjs'),
+        '--url', `ws://127.0.0.1:${PORT}/worker`,
+        '--token-file', workerTokenFile,
+        '--name', 'utf8-box',
+        '--surfaces', 'agent',
+        '--agents', 'claude,gemini,agy',
+        '--cwd', process.env.BROKER_WORKSPACE,
+    ], {
+        cwd: packageDir,
+        env: { ...process.env, PATH: `${binDir}${path.delimiter}${process.env.PATH || ''}` },
+        stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    await waitShimWelcome(utf8Shim, 'utf8 shim');
+    const agent = await connectController('/agent');
+    await agent.first;
+    const expectedStderr = STDERR_SENTINEL + 'a'.repeat(499) + '😀';
+    for (const name of ['claude', 'gemini', 'agy']) {
+        const startAt = Date.now();
+        const started = collectUntil(agent.ws, (m) => m.kind === 'started' && (m.text === name || m.cmd === name), 6000);
+        agent.ws.send(JSON.stringify({ type: 'start', agent: name }));
+        await started;
+        const finished = collectUntil(agent.ws, (m, got) => {
+            const assistant = got.filter(x => x.kind === 'assistant').map(x => x.text || '').join('');
+            const stderr = got.filter(x => x.kind === 'stderr').map(x => x.text || '').join('');
+            const done = got.some(x => x.kind === 'result') || got.some(x => x.kind === 'exit');
+            return assistant === SENTINEL && stderr === expectedStderr && done;
+        }, 8000);
+        agent.ws.send(JSON.stringify({ type: 'input', text: 'emit the UTF-8 sentinel' }));
+        const got = await finished;
+        const assistant = got.filter(x => x.kind === 'assistant').map(x => x.text || '').join('');
+        const stderr = got.filter(x => x.kind === 'stderr').map(x => x.text || '').join('');
+        ok(assistant === SENTINEL && stderr === expectedStderr &&
+            !assistant.includes('\uFFFD') && !stderr.includes('\uFFFD') && !stderr.includes('tail'),
+            `${name} preserves split 2-/3-/4-byte UTF-8 on stdout and stderr, including 500-code-point truncation`);
+        agent.ws.send(JSON.stringify({ type: 'stop' }));
+        await sleep(80);
+        void startAt;
+    }
+    try { agent.ws.close(); } catch (_) {}
+    try { utf8Shim.kill('SIGTERM'); } catch (_) {}
+} catch (e) {
+    console.log('  ✗ split-UTF-8 shim error: ' + (e.stack || e));
     failed++;
 }
 

@@ -6,7 +6,11 @@
   credential and the broker relays the existing `/agent` and `/term` controller
   messages to it. Default off; setup requires
   `--acknowledge-reverse-worker-command-relay`. Local spawn is unchanged when
-  the flag is unset.
+  the flag is unset. Relayed `started` events carry a broker-authored `via`
+  worker name; `BROKER_REVERSE_WORKER_STRICT=1` fails closed instead of
+  falling through to local spawn. The worker shim can pass provider API keys
+  or inherit its environment the same way local spawn does, and still does
+  not inject the controller pairing token.
 
 - Extract the SciREPL host-side MCP broker into an independently installable
   repository.

@@ -78,6 +78,7 @@ controller pairing token and authenticates `/worker` only. See
 | Variable | Default | Purpose |
 |---|---:|---|
 | `BROKER_REVERSE_WORKER` | `0` | Set to `1` to accept `/worker` connections and relay matching `/agent` and `/term` starts. |
+| `BROKER_REVERSE_WORKER_STRICT` | `0` | Fail a `start` that no connected worker advertised, instead of falling through to local spawn. Ignored unless reverse-worker mode is on. |
 | `BROKER_WORKER_TOKEN` | unset | Explicit worker credential. When set, it takes precedence over the worker token file. |
 | `BROKER_WORKER_TOKEN_FILE` | `~/scirepl-broker/worker-token` | Persistent worker-token location. Created with mode `0600` where supported, only when reverse-worker mode is on. |
 | `BROKER_MAX_WORKER_WS_PAYLOAD_BYTES` | `1048576` | Maximum inbound `/worker` message payload. Read only when reverse-worker mode is on. |

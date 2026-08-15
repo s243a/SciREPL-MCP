@@ -19,6 +19,29 @@ export const KNOWN_TERM_CMDS = Object.freeze(['shell', 'claude', 'codex', 'gemin
 export const KNOWN_AGENTS = Object.freeze(['claude', 'codex', 'gemini', 'agy']);
 export const TERM_EVENT_KINDS = Object.freeze(['started', 'data', 'exit', 'error']);
 export const AGENT_EVENT_KINDS = Object.freeze(['started', 'assistant', 'tool_use', 'result', 'stderr', 'error', 'exit']);
+export const CHILD_ENV_ALLOWLIST = Object.freeze([
+    'HOME', 'PATH', 'SHELL', 'USER', 'LOGNAME', 'TMPDIR', 'TMP', 'TEMP',
+    'LANG', 'LANGUAGE', 'COLORTERM', 'TERM', 'PREFIX',
+    'XDG_CONFIG_HOME', 'XDG_CACHE_HOME', 'XDG_DATA_HOME',
+]);
+export const PROVIDER_API_KEYS = Object.freeze([
+    'ANTHROPIC_API_KEY', 'OPENAI_API_KEY', 'GEMINI_API_KEY', 'GOOGLE_API_KEY',
+]);
+
+export function childProcessEnv({ inheritEnv = false, useApiKey = false, source = process.env, extra = {} } = {}) {
+    const env = {};
+    const allowed = new Set(CHILD_ENV_ALLOWLIST);
+    for (const [key, value] of Object.entries(source)) {
+        if (inheritEnv || allowed.has(key) || key.startsWith('LC_')) env[key] = value;
+    }
+    if (useApiKey) {
+        for (const key of PROVIDER_API_KEYS) {
+            if (source[key]) env[key] = source[key];
+        }
+    }
+    Object.assign(env, extra);
+    return env;
+}
 
 const TERM_KIND_SET = new Set(TERM_EVENT_KINDS);
 const AGENT_KIND_SET = new Set(AGENT_EVENT_KINDS);
@@ -142,6 +165,7 @@ function socketOpen(ws) {
 
 export function createReverseWorkerHub({
     enabled,
+    strict = false,
     workerToken,
     protocolVersion,
     maxPayloadBytes,
@@ -167,7 +191,7 @@ export function createReverseWorkerHub({
 
     function healthFields() {
         if (!enabled) return { reverseWorkerEnabled: false };
-        return { reverseWorkerEnabled: true, workers: listPublic() };
+        return { reverseWorkerEnabled: true, reverseWorkerStrict: !!strict, workers: listPublic() };
     }
 
     function advertisedTermCmds() {
@@ -282,8 +306,10 @@ export function createReverseWorkerHub({
         const surface = msg.type;
         const session = sessions[surface];
         if (!session || session.worker !== worker) return;
-        sendController(session, msg);
-        if (surface === 'term' && msg.kind === 'exit') sessions.term = null;
+        const { via: _ignored, ...rest } = msg;
+        const outbound = rest.kind === 'started' ? { ...rest, via: worker.name } : rest;
+        sendController(session, outbound);
+        if (surface === 'term' && rest.kind === 'exit') sessions.term = null;
     }
 
     function authDeadline(ws) {
@@ -344,7 +370,16 @@ export function createReverseWorkerHub({
             dropSession(surface, { notify: false });
         }
         const worker = findWorker(surface, requested);
-        if (!worker) return false;
+        if (!worker) {
+            if (strict) {
+                const payload = surface === 'term'
+                    ? { type: 'term', kind: 'error', text: `no reverse worker advertised '${requested}'` }
+                    : { type: 'agent', kind: 'error', text: `no reverse worker advertised '${requested}'` };
+                sendJson(controllerWs, payload, maxPayloadBytes);
+                return true;
+            }
+            return false;
+        }
         sessions[surface] = { worker, workerName: worker.name, controllerWs, requested };
         if (surface === 'term') audit(`term '${requested}' started via worker '${worker.name}'`);
         else audit(`agent '${requested}' ready via worker '${worker.name}'`);
@@ -393,6 +428,7 @@ export function createReverseWorkerHub({
 
     return {
         enabled: !!enabled,
+        strict: !!strict,
         wss,
         maxConnections: maxConnections || 4,
         healthFields,

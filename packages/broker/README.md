@@ -271,6 +271,10 @@ command-relay hub:
 That writes `worker-token` and `start-reverse-worker.sh` (or
 `Start-Reverse-Worker.ps1`). It does not enable local spawn; add the agent and
 terminal pairs if the broker host should still be able to run CLIs itself.
+Set `BROKER_REVERSE_WORKER_STRICT=1` when execution must not fall back to the
+broker host. Relayed `started` events include `"via":"<worker-name>"`. The
+shim's `--use-api-key` and `--inherit-env` match local spawn's environment
+flags and still do not inject the pairing token.
 `term-drive.mjs` and `agent-drive.mjs` are unchanged. See
 [Reverse-worker mode](https://github.com/s243a/SciREPL-MCP/blob/main/docs/reverse-worker.md).
 

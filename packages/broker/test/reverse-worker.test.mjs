@@ -11,7 +11,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { loadWorkerToken, validateWorkerHello } from '../src/reverse-worker.mjs';
+import { childProcessEnv, loadWorkerToken, validateWorkerHello } from '../src/reverse-worker.mjs';
 
 const packageDir = path.dirname(fileURLToPath(new URL('../package.json', import.meta.url)));
 const PORT = 8093;
@@ -109,6 +109,25 @@ ok(validateWorkerHello({
     capabilities: { surfaces: ['agent'], agents: ['shell'] },
 }).ok === false, 'shell is not a valid /agent advertisement');
 
+const envDefault = childProcessEnv({
+    source: { HOME: '/home/w', PATH: '/bin', ANTHROPIC_API_KEY: 'sk-secret', SCIREPL_MCP_BEARER: 'controller', FOO: 'bar' },
+});
+ok(envDefault.HOME === '/home/w' && envDefault.PATH === '/bin' &&
+    envDefault.ANTHROPIC_API_KEY === undefined && envDefault.SCIREPL_MCP_BEARER === undefined && envDefault.FOO === undefined,
+    'shim child env allowlist omits provider keys and the controller token by default');
+const envKeys = childProcessEnv({
+    useApiKey: true,
+    source: { HOME: '/home/w', ANTHROPIC_API_KEY: 'sk-secret', OPENAI_API_KEY: 'ok', FOO: 'bar' },
+});
+ok(envKeys.ANTHROPIC_API_KEY === 'sk-secret' && envKeys.OPENAI_API_KEY === 'ok' && envKeys.FOO === undefined,
+    '--use-api-key passes provider keys without inheriting the rest of the environment');
+const envInherit = childProcessEnv({
+    inheritEnv: true,
+    source: { HOME: '/home/w', FOO: 'bar', ANTHROPIC_API_KEY: 'sk-secret' },
+});
+ok(envInherit.FOO === 'bar' && envInherit.ANTHROPIC_API_KEY === 'sk-secret',
+    '--inherit-env passes the shim environment through');
+
 try {
     loadWorkerToken({ controllerToken: 'same-secret', env: { BROKER_WORKER_TOKEN: 'same-secret' } });
     ok(false, 'equal controller and worker secrets fail closed');
@@ -136,7 +155,7 @@ function runDriver(args, timeoutMs = 20000) {
 function spawnBroker(env, port) {
     return spawn(process.execPath, ['src/broker.mjs'], {
         cwd: packageDir,
-        env: { ...process.env, BROKER_REVERSE_WORKER: '', BROKER_WORKER_TOKEN: '', ...env, BROKER_PORT: String(port) },
+        env: { ...process.env, BROKER_REVERSE_WORKER: '', BROKER_WORKER_TOKEN: '', BROKER_REVERSE_WORKER_STRICT: '', ...env, BROKER_PORT: String(port) },
         stdio: ['ignore', 'pipe', 'pipe'],
     });
 }
@@ -198,6 +217,38 @@ try {
     offChild.kill('SIGTERM');
 }
 
+const strictPort = 8092;
+const strictChild = spawnBroker({
+    BROKER_TOKEN: 'strict-controller',
+    BROKER_WORKER_TOKEN: 'strict-worker-token',
+    BROKER_REVERSE_WORKER: '1',
+    BROKER_REVERSE_WORKER_STRICT: '1',
+    BROKER_TERM: '1',
+    BROKER_AGENT: '1',
+    BROKER_ALLOW_UNMANAGED_AGENT_WORKSPACE: '1',
+    BROKER_WORKSPACE: process.env.BROKER_WORKSPACE,
+}, strictPort);
+try {
+    const strictHealth = await waitHealth(strictPort);
+    ok(strictHealth.reverseWorkerEnabled === true && strictHealth.reverseWorkerStrict === true,
+        'strict reverse-worker health reports reverseWorkerStrict');
+    const strictTerm = new WebSocket(`ws://127.0.0.1:${strictPort}/term`);
+    await new Promise((res, rej) => { strictTerm.on('open', res); strictTerm.on('error', rej); });
+    const strictFirst = onceMessage(strictTerm);
+    strictTerm.send(JSON.stringify({ type: 'hello', token: 'strict-controller' }));
+    await strictFirst;
+    const strictReply = onceMessage(strictTerm);
+    strictTerm.send(JSON.stringify({ type: 'start', cmd: 'shell', cols: 80, rows: 24 }));
+    const strictMsg = await strictReply;
+    ok(strictMsg.type === 'term' && strictMsg.kind === 'error' && /no reverse worker advertised/.test(strictMsg.text || ''),
+        'strict mode fails a start that no worker advertised instead of spawning locally');
+    try { strictTerm.close(); } catch (_) {}
+} catch (e) {
+    ok(false, 'strict reverse-worker check: ' + (e.message || e));
+} finally {
+    strictChild.kill('SIGTERM');
+}
+
 const { httpServer, reverseWorkerHub } = await import('../src/broker.mjs');
 await sleep(250);
 
@@ -205,8 +256,9 @@ console.log('\nCredential classes and registration\n');
 
 try {
     const health0 = await (await fetch(`http://127.0.0.1:${PORT}/health`)).json();
-    ok(health0.reverseWorkerEnabled === true && Array.isArray(health0.workers) && health0.workers.length === 0,
-        'enabled health reports reverse-worker on and an empty worker list');
+    ok(health0.reverseWorkerEnabled === true && health0.reverseWorkerStrict === false &&
+        Array.isArray(health0.workers) && health0.workers.length === 0,
+        'enabled health reports reverse-worker on, strict off, and an empty worker list');
 
     const rejectedWorker = await connectWorker({ token: CONTROLLER, name: 'agy-box' });
     const rejectedHello = await rejectedWorker.welcome.catch(e => e);
@@ -273,11 +325,11 @@ try {
         if (msg.type === 'welcome') return;
         forwarded.push(msg);
         if (msg.surface === 'term' && msg.type === 'start') {
-            worker.send(JSON.stringify({ type: 'term', kind: 'started', cmd: msg.cmd }));
+            worker.send(JSON.stringify({ type: 'term', kind: 'started', cmd: msg.cmd, via: 'spoofed' }));
         } else if (msg.surface === 'term' && msg.type === 'input') {
-            worker.send(JSON.stringify({ type: 'term', kind: 'data', data: 'HELLO_42\n' }));
+            worker.send(JSON.stringify({ type: 'term', kind: 'data', data: 'HELLO_42\n', via: 'spoofed' }));
         } else if (msg.surface === 'agent' && msg.type === 'start') {
-            worker.send(JSON.stringify({ type: 'agent', kind: 'started', text: msg.agent, experimental: true }));
+            worker.send(JSON.stringify({ type: 'agent', kind: 'started', text: msg.agent, experimental: true, via: 'spoofed' }));
         } else if (msg.surface === 'agent' && msg.type === 'input') {
             worker.send(JSON.stringify({ type: 'agent', kind: 'assistant', text: 'pong:' + msg.text }));
             worker.send(JSON.stringify({ type: 'agent', kind: 'result', text: '' }));
@@ -293,10 +345,13 @@ try {
     await sleep(50);
     term.ws.send(JSON.stringify({ type: 'input', data: 'echo HELLO_42\n' }));
     const termGot = await termEvents;
-    ok(termGot.some(m => m.type === 'term' && m.kind === 'started' && m.cmd === 'shell'),
-        '/term start/started shapes are unchanged when relayed');
-    ok(termGot.some(m => m.type === 'term' && m.kind === 'data' && m.data.includes('HELLO_42')),
-        '/term input/data round-trips through the reverse worker');
+    ok(termGot.some(m => m.type === 'term' && m.kind === 'started' && m.cmd === 'shell' && m.via === 'relay-box'),
+        '/term started is unchanged except for a broker-authored via worker name');
+    ok(termGot.some(m => m.type === 'term' && m.kind === 'started' && m.via === 'relay-box') &&
+        !termGot.some(m => m.kind === 'started' && m.via === 'spoofed'),
+        'worker cannot spoof the via field on started');
+    ok(termGot.some(m => m.type === 'term' && m.kind === 'data' && m.data.includes('HELLO_42') && m.via === undefined),
+        '/term input/data round-trips through the reverse worker without a spoofable via');
     ok(forwarded.some(m => m.type === 'start' && m.surface === 'term' && m.cmd === 'shell'),
         'worker receives the controller start with a surface field');
 
@@ -309,8 +364,8 @@ try {
     await sleep(50);
     agent.ws.send(JSON.stringify({ type: 'input', text: 'ping' }));
     const agentGot = await agentEvents;
-    ok(agentGot.some(m => m.type === 'agent' && m.kind === 'started' && m.text === 'agy'),
-        '/agent start/started shapes are unchanged when relayed');
+    ok(agentGot.some(m => m.type === 'agent' && m.kind === 'started' && m.text === 'agy' && m.via === 'relay-box'),
+        '/agent started is unchanged except for a broker-authored via worker name');
     ok(agentGot.some(m => m.kind === 'assistant' && m.text === 'pong:ping') && agentGot.some(m => m.kind === 'result'),
         '/agent input/assistant/result round-trips through the reverse worker');
 

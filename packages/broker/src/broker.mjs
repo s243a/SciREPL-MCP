@@ -211,6 +211,7 @@ const TERM_GRACE_MS = integerSetting('BROKER_TERM_GRACE_MS', 600000, 0, 86400000
 // /agent and /term controller messages to it. Default off. Worker-specific
 // settings are read only when enabled so an unflagged broker ignores typos here.
 const REVERSE_WORKER_ENABLED = process.env.BROKER_REVERSE_WORKER === '1';
+const REVERSE_WORKER_STRICT = REVERSE_WORKER_ENABLED && process.env.BROKER_REVERSE_WORKER_STRICT === '1';
 const WORKER_TOKEN_INFO = REVERSE_WORKER_ENABLED ? loadWorkerToken({ controllerToken: TOKEN }) : null;
 const WORKER_TOKEN = WORKER_TOKEN_INFO ? WORKER_TOKEN_INFO.value : '';
 const MAX_WORKER_WS_PAYLOAD_BYTES = REVERSE_WORKER_ENABLED
@@ -218,6 +219,7 @@ const MAX_WORKER_WS_PAYLOAD_BYTES = REVERSE_WORKER_ENABLED
     : 1048576;
 const reverseWorkerHub = createReverseWorkerHub({
     enabled: REVERSE_WORKER_ENABLED,
+    strict: REVERSE_WORKER_STRICT,
     workerToken: WORKER_TOKEN,
     protocolVersion: PROTOCOL_VERSION,
     maxPayloadBytes: MAX_WORKER_WS_PAYLOAD_BYTES,
@@ -942,7 +944,7 @@ httpServer.listen(PORT, HOST, () => {
     console.log(`[broker]   agent WS:      ${AGENT_ENABLED ? 'ENABLED ws://' + displayHost + ':' + PORT + '/agent (agents: ' + Object.keys(AGENT_PROFILES).join(', ') + ')' : 'disabled (set BROKER_AGENT=1 after reviewing SECURITY.md)'}`);
     if (AGENT_ENABLED) console.log(`[broker]   agent access:  Claude ${AGENT_FULL_ACCESS ? 'full host tools' : 'allowlist ' + AGENT_ALLOWED_TOOLS}; other CLIs may retain normal host capabilities; environment ${AGENT_INHERIT_ENV ? 'inherited' : 'restricted'}`);
     console.log(`[broker]   terminal:      ${TERM_ENABLED ? 'ENABLED ws://' + displayHost + ':' + PORT + '/term (cmds: ' + TERM_CMDS.join(', ') + ')' + (TERM_NO_SHELL ? ' [no-shell: agents only, no shell escape]' : '') : 'disabled (set BROKER_TERM=1 to expose a PTY)'}`);
-    console.log(`[broker]   reverse worker:${REVERSE_WORKER_ENABLED ? ' ENABLED ws://' + displayHost + ':' + PORT + '/worker (worker token ' + (WORKER_TOKEN_INFO.source === 'BROKER_WORKER_TOKEN' ? 'provided by BROKER_WORKER_TOKEN (not printed)' : 'stored in ' + WORKER_TOKEN_INFO.source + ' (mode 0600)') + ')' : ' disabled (set BROKER_REVERSE_WORKER=1 after --acknowledge-reverse-worker-command-relay)'}`);
+    console.log(`[broker]   reverse worker:${REVERSE_WORKER_ENABLED ? ' ENABLED ws://' + displayHost + ':' + PORT + '/worker' + (REVERSE_WORKER_STRICT ? ' [strict: no local-spawn fallback]' : '') + ' (worker token ' + (WORKER_TOKEN_INFO.source === 'BROKER_WORKER_TOKEN' ? 'provided by BROKER_WORKER_TOKEN (not printed)' : 'stored in ' + WORKER_TOKEN_INFO.source + ' (mode 0600)') + ')' : ' disabled (set BROKER_REVERSE_WORKER=1 after --acknowledge-reverse-worker-command-relay)'}`);
     console.log(`[broker]   pairing token: ${TOKEN_INFO.source === 'BROKER_TOKEN' ? 'provided by BROKER_TOKEN (not printed)' : 'stored in ' + TOKEN_INFO.source + ' (mode 0600)'}`);
     console.log('[broker] For remote access, keep loopback binding and use Tailscale Serve or an SSH tunnel.');
 });

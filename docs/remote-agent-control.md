@@ -53,6 +53,10 @@ Enable it only with the setup acknowledgement
 git repository that remains the shared state. The worker token authorizes "be
 commanded" and must stay distinct from the pairing token; a stolen worker
 credential is impersonation of a commanded host, not a second controller.
+When the point of reverse mode is that execution must not happen on the
+broker host, set `BROKER_REVERSE_WORKER_STRICT=1` so a missing worker fails
+closed instead of falling through to local spawn. Relayed `started` events
+carry a broker-authored `via` field naming the worker.
 
 The supervision claim — every action prompted, logged, attributed — survives
 because relayed starts appear in the same `[broker]` audit trail, attributed

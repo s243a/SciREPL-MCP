@@ -107,6 +107,13 @@ registered worker and forward the worker's events back, without rewriting
 field names or inventing a parallel event vocabulary. A driver that already
 handles local-spawn events must not need a reverse-mode branch.
 
+Relayed `started` events carry one extra broker-authored field, `via`, set
+to the registered worker name. Local-spawn `started` events do not gain
+this field, so an unflagged broker's wire shape is unchanged. Existing
+drivers ignore unknown fields; a supervisor that cares where code ran can
+assert `via` matches the expected worker. The worker cannot set or spoof
+`via` — the broker strips any inbound copy and writes its own.
+
 ### When the broker relays versus spawns
 
 On each controller `start`:
@@ -115,17 +122,24 @@ On each controller `start`:
    worker registry is consulted.
 2. If reverse-worker mode is on and a connected worker advertised the
    requested surface and CLI, the broker relays. It does not also spawn
-   locally for that start.
+   locally for that start. The resulting `started` event includes
+   `"via":"<worker-name>"`.
 3. If reverse-worker mode is on and no connected worker can handle the
-   request, the existing local-spawn path runs when that surface is itself
-   enabled (`BROKER_AGENT=1` / `BROKER_TERM=1`). Otherwise the start fails
-   with the same class of `error` event a disabled or unknown command
-   already produces.
+   request:
+   - with `BROKER_REVERSE_WORKER_STRICT=1`, the start fails closed with
+     an `error` naming the missing advertisement. The broker does not
+     spawn locally. This is the right setting when the point of reverse
+     mode is that execution must not happen on the broker host.
+   - otherwise the existing local-spawn path runs when that surface is
+     itself enabled (`BROKER_AGENT=1` / `BROKER_TERM=1`). Otherwise the
+     start fails with the same class of `error` event a disabled or
+     unknown command already produces.
 
 A session that began on a worker stays on that worker. Mid-session input is
 never silently failed over to a local spawn; a dead worker produces an error
 (and `exit` on `/term`, `result` or `exit` on `/agent`) rather than a surprise
-local process.
+local process. Strict mode only affects the *start* decision when no worker
+is available; it does not change an in-flight reverse session.
 
 `/term` and `/agent` remain the controller-facing endpoints even when local
 spawn is off. When reverse mode is on, their `welcome` lists are the union of
@@ -411,6 +425,7 @@ BROKER_WORKER_TOKEN_FILE=/absolute/path/to/worker-token
 | Variable | Default | Purpose |
 |---|---:|---|
 | `BROKER_REVERSE_WORKER` | `0` | Set to `1` to accept `/worker` connections and relay matching `/agent` and `/term` starts. |
+| `BROKER_REVERSE_WORKER_STRICT` | `0` | When reverse-worker mode is on, set to `1` to fail a `start` that no connected worker advertised, instead of falling through to local spawn. Read only when reverse-worker mode is on. |
 | `BROKER_WORKER_TOKEN` | unset | Explicit worker credential. When set, it takes precedence over the worker token file. |
 | `BROKER_WORKER_TOKEN_FILE` | `~/scirepl-broker/worker-token` | Persistent worker-token location. Created with mode `0600` where supported, only when reverse-worker mode is on and `BROKER_WORKER_TOKEN` is unset. |
 | `BROKER_MAX_WORKER_WS_PAYLOAD_BYTES` | `1048576` | Maximum inbound `/worker` message payload. Read only when reverse-worker mode is on, so an unflagged broker ignores a typo here. |
@@ -471,8 +486,23 @@ PTY on `start`, relays streams, and on socket drop keeps a live PTY for
 the terminal grace period while it reconnects. Session preservation is
 the shim's job, matching how the broker itself holds a PTY across
 controller disconnects today. `/agent` one-shot and persistent adapters
-follow the same shapes the broker already uses; the shim does not inject
-the controller pairing token into child environments.
+follow the same shapes the broker already uses.
+
+Child processes get a restricted environment by default (the same class of
+allowlist as local spawn: `HOME`, `PATH`, locale, temp dirs, XDG). That
+is enough for interactive `/term` logins that authenticate from config
+files. One-shot `/agent` adapters that authenticate from the environment
+need an explicit opt-in, matching the broker's local flags:
+
+- `--use-api-key` (or `BROKER_AGENT_USE_API_KEY=1`) passes
+  `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`, and
+  `GOOGLE_API_KEY` when they are set in the shim's own environment.
+- `--inherit-env` (or `BROKER_AGENT_INHERIT_ENV=1`) passes the shim's
+  complete environment. This may disclose secrets on the worker host.
+
+The shim still does **not** inject the controller pairing token or the
+broker's `SCIREPL_MCP_BEARER`. See [Notebook MCP from a reverse
+worker](#notebook-mcp-from-a-reverse-worker).
 
 ### Notebook MCP from a reverse worker
 
@@ -528,9 +558,11 @@ the worker host; that is the adapter's feature, not the broker's.
 
 Controllers see the ordinary welcome for whatever local surfaces are
 enabled. A `start` for a CLI that is only advertised by an absent worker
-fails the same way an unknown or missing local CLI already fails, or
+fails closed under `BROKER_REVERSE_WORKER_STRICT=1`. Without strict mode
+it fails the same way an unknown or missing local CLI already fails, or
 falls through to local spawn when that path is enabled and the CLI is
-present on the broker host.
+present on the broker host. Fall-through is visible on the wire: a
+local-spawn `started` event has no `via` field.
 
 ### Malformed or oversized worker frames
 
@@ -597,11 +629,24 @@ process that can present the token.
 
 The distinctive hub-side harm is **impersonation of a commanded worker**:
 a supervisor believes it is driving `agy-box` and is instead driving the
-attacker. Audit lines will say `via worker 'agy-box'`. Revocation is
+attacker. Audit lines will say `via worker 'agy-box'`, and relayed
+`started` events will carry `"via":"agy-box"`.
+
+The highest-value form of that impersonation is **live-session rebind**.
+A replacement hello for an already-connected name that claims
+`sessions.term.live` (or `sessions.agent.live`) inherits the in-flight
+controller session: the broker rebinds the existing controller socket to
+the new worker and does **not** send the controller a disconnect. The
+controller keeps talking to what it thinks is the same PTY. Anyone
+holding the worker token can do this — it is how a legitimate shim
+reconnects after a network blip, and it is how a token thief slides into
+a live supervised turn. Forging a fresh `started` stream after the
+controller has to `start` again is noisier; this path is quiet. The
+bound is still the worker token, not host identity. Revocation is
 delete-the-worker-token-file and restart, the same "seconds, one person"
 shape as the pairing token. Until then, treat any worker that connected
 after a suspected leak as untrustworthy, including one that presents the
-expected name.
+expected name and a live-session claim.
 
 ### Attacker holds both
 
@@ -658,7 +703,10 @@ Implementation covers at least:
 - registration welcome, health listing without host fields, one-name
   replacement;
 - `/term` and `/agent` relay round-trips with the documented message
-  shapes;
+  shapes, including a broker-authored `via` on `started` that the worker
+  cannot spoof;
+- `BROKER_REVERSE_WORKER_STRICT=1` fails a start that no worker
+  advertised, instead of local spawn;
 - worker disconnect unblocks the controller; reconnect plus a new
   `start` can reattach when `sessions.term.live` is claimed;
 - an existing driver script (`term-drive.mjs`, and `/agent` equivalently)

@@ -134,7 +134,10 @@ The broker replies with `{"type":"term","kind":...}` events such as
 `welcome`, `started`, `data`, `exit`, and `error`. Terminal mode is a privileged
 feature and is disabled by default. When reverse-worker mode is enabled, `/term`
 and `/agent` keep these exact controller message shapes and the broker may
-relay them instead of spawning locally.
+relay them instead of spawning locally. Relayed `started` events include a
+broker-authored `via` field naming the worker; local-spawn `started` events do
+not. `BROKER_REVERSE_WORKER_STRICT=1` fails a start that no worker advertised
+instead of falling through to local spawn.
 
 ## Reverse worker (`/worker`)
 

@@ -6,7 +6,7 @@
  *
  *   node reverse-worker.mjs --url ws://HOST:8087/worker --token-file FILE \
  *        --name agy-box --surfaces term,agent --cmds agy --agents agy \
- *        [--cwd DIR] [--grace-ms 600000]
+ *        [--cwd DIR] [--grace-ms 600000] [--use-api-key] [--inherit-env]
  *
  * Reconnects with backoff. A live PTY survives socket drop for --grace-ms so a
  * later start can reattach, matching the broker's local /term behaviour.
@@ -16,6 +16,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { createRequire } from 'node:module';
+import { childProcessEnv } from '../src/reverse-worker.mjs';
 
 const require = createRequire(import.meta.url);
 const WebSocket = require('ws');
@@ -29,7 +30,7 @@ const url = arg('url');
 const tokenFile = arg('token-file');
 const tokenArg = arg('token', '');
 if (!url || (!tokenFile && !tokenArg)) {
-    console.error('usage: reverse-worker.mjs --url ws://HOST:PORT/worker --token-file FILE --name NAME [--surfaces term,agent] [--cmds LIST] [--agents LIST] [--cwd DIR]');
+    console.error('usage: reverse-worker.mjs --url ws://HOST:PORT/worker --token-file FILE --name NAME [--surfaces term,agent] [--cmds LIST] [--agents LIST] [--cwd DIR] [--use-api-key] [--inherit-env]');
     process.exit(2);
 }
 
@@ -43,6 +44,8 @@ const GRACE_MS = Number(arg('grace-ms', 600000));
 const MAX_AGENT_BUFFER_BYTES = Number(arg('max-agent-buffer-bytes', 1048576));
 const TERM_SHELL = process.env.SHELL || 'bash';
 const TERM_NO_SHELL = has('no-shell') || process.env.BROKER_TERM_NO_SHELL === '1';
+const USE_API_KEY = has('use-api-key') || process.env.BROKER_AGENT_USE_API_KEY === '1';
+const INHERIT_ENV = has('inherit-env') || process.env.BROKER_AGENT_INHERIT_ENV === '1';
 
 const shq = (s) => "'" + String(s).replace(/'/g, "'\\''") + "'";
 
@@ -135,16 +138,7 @@ function bindSender(ws) {
 }
 
 function spawnEnv() {
-    const env = {};
-    const allowed = new Set([
-        'HOME', 'PATH', 'SHELL', 'USER', 'LOGNAME', 'TMPDIR', 'TMP', 'TEMP',
-        'LANG', 'LANGUAGE', 'COLORTERM', 'TERM', 'PREFIX',
-        'XDG_CONFIG_HOME', 'XDG_CACHE_HOME', 'XDG_DATA_HOME',
-    ]);
-    for (const [key, value] of Object.entries(process.env)) {
-        if (allowed.has(key) || key.startsWith('LC_')) env[key] = value;
-    }
-    return env;
+    return childProcessEnv({ inheritEnv: INHERIT_ENV, useApiKey: USE_API_KEY });
 }
 
 async function startTerm(msg) {

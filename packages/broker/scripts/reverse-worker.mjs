@@ -16,7 +16,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { createRequire } from 'node:module';
-import { childProcessEnv } from '../src/reverse-worker.mjs';
+import { childProcessEnv, boundedInteger, KNOWN_AGENTS } from '../src/reverse-worker.mjs';
 
 const require = createRequire(import.meta.url);
 const WebSocket = require('ws');
@@ -36,13 +36,59 @@ if (!url || (!tokenFile && !tokenArg)) {
 
 const TOKEN = (tokenArg || fs.readFileSync(tokenFile, 'utf8')).trim();
 const NAME = arg('name', 'worker');
-const SURFACES = csv('surfaces', 'term,agent');
-const CMDS = csv('cmds', SURFACES.includes('term') ? 'shell,claude,codex,gemini,agy' : '');
-const AGENTS = csv('agents', SURFACES.includes('agent') ? 'claude,codex,gemini,agy' : '');
+
+function nodePtyAvailable() {
+    try { require.resolve('node-pty'); return true; } catch { return false; }
+}
+
+function commandExists(name) {
+    const envPath = process.env.PATH || process.env.Path || '';
+    const exts = process.platform === 'win32'
+        ? (process.env.PATHEXT || '.EXE;.CMD;.BAT;.COM').split(';').filter(Boolean)
+        : [''];
+    for (const dir of envPath.split(path.delimiter)) {
+        if (!dir) continue;
+        const names = process.platform === 'win32'
+            ? [name, ...exts.map(ext => name + ext)]
+            : [name];
+        for (const file of names) {
+            try {
+                if (fs.statSync(path.join(dir, file)).isFile()) return true;
+            } catch (_) {}
+        }
+    }
+    return false;
+}
+
+const SURFACES = has('surfaces') ? csv('surfaces') : ['agent'];
+if (SURFACES.includes('term') && !nodePtyAvailable()) {
+    console.error('reverse-worker.mjs: --surfaces includes term but node-pty is not installed on this host');
+    process.exit(2);
+}
+const CMDS = has('cmds') ? csv('cmds') : (SURFACES.includes('term') ? ['shell'] : []);
+const AGENTS = has('agents')
+    ? csv('agents')
+    : (SURFACES.includes('agent') ? KNOWN_AGENTS.filter(commandExists) : []);
+if (SURFACES.includes('agent') && !AGENTS.length) {
+    console.error('reverse-worker.mjs: pass --agents listing CLIs this host has; none were found on PATH');
+    process.exit(2);
+}
+if (SURFACES.includes('term') && !CMDS.length) {
+    console.error('reverse-worker.mjs: --surfaces includes term but --cmds is empty');
+    process.exit(2);
+}
 const CWD = path.resolve(arg('cwd', process.cwd()));
-const GRACE_MS = Number(arg('grace-ms', 600000));
-const MAX_AGENT_BUFFER_BYTES = Number(arg('max-agent-buffer-bytes', 1048576));
-const MAX_OUTBOUND_BUFFERED_BYTES = Number(arg('max-outbound-buffered-bytes', 1048576));
+let GRACE_MS;
+let MAX_AGENT_BUFFER_BYTES;
+let MAX_OUTBOUND_BUFFERED_BYTES;
+try {
+    GRACE_MS = boundedInteger(arg('grace-ms', ''), 600000, 0, 86400000, '--grace-ms');
+    MAX_AGENT_BUFFER_BYTES = boundedInteger(arg('max-agent-buffer-bytes', ''), 1048576, 4096, 67108864, '--max-agent-buffer-bytes');
+    MAX_OUTBOUND_BUFFERED_BYTES = boundedInteger(arg('max-outbound-buffered-bytes', ''), 1048576, 1024, 16777216, '--max-outbound-buffered-bytes');
+} catch (e) {
+    console.error('reverse-worker.mjs: ' + (e.message || e));
+    process.exit(2);
+}
 const TERM_SHELL = process.env.SHELL || 'bash';
 const TERM_NO_SHELL = has('no-shell') || process.env.BROKER_TERM_NO_SHELL === '1';
 const USE_API_KEY = has('use-api-key') || process.env.BROKER_AGENT_USE_API_KEY === '1';
@@ -146,6 +192,43 @@ function spawnEnv() {
     return childProcessEnv({ inheritEnv: INHERIT_ENV, useApiKey: USE_API_KEY });
 }
 
+function spawnChild(command, args, stdio) {
+    return spawn(command, args, {
+        env: spawnEnv(),
+        cwd: CWD,
+        stdio,
+        detached: process.platform !== 'win32',
+        windowsHide: true,
+    });
+}
+
+function terminateChild(child, graceMs = 1000) {
+    if (!child) return;
+    const pid = child.pid;
+    try {
+        if (process.platform === 'win32') {
+            if (pid) spawn('taskkill', ['/pid', String(pid), '/t', '/f'], { stdio: 'ignore', windowsHide: true });
+            else child.kill();
+        } else if (pid) {
+            try { process.kill(-pid, 'SIGTERM'); } catch (_) { try { child.kill('SIGTERM'); } catch (_) {} }
+        } else {
+            child.kill('SIGTERM');
+        }
+    } catch (_) {}
+    const timer = setTimeout(() => {
+        try {
+            if (process.platform === 'win32') {
+                try { child.kill(); } catch (_) {}
+            } else if (pid) {
+                try { process.kill(-pid, 'SIGKILL'); } catch (_) { try { child.kill('SIGKILL'); } catch (_) {} }
+            } else {
+                try { child.kill('SIGKILL'); } catch (_) {}
+            }
+        } catch (_) {}
+    }, graceMs);
+    child.once('exit', () => clearTimeout(timer));
+}
+
 async function startTerm(msg) {
     if (term.pty) {
         if (term.grace) { clearTimeout(term.grace); term.grace = null; }
@@ -243,7 +326,7 @@ function startAgent(name) {
     stopAgent();
     const resume = agent.sessionId || null;
     let child;
-    try { child = spawn(prof.cmd, prof.args({ resume }), { env: spawnEnv(), cwd: CWD, stdio: ['pipe', 'pipe', 'pipe'] }); }
+    try { child = spawnChild(prof.cmd, prof.args({ resume }), ['pipe', 'pipe', 'pipe']); }
     catch (e) { send({ type: 'agent', kind: 'error', text: `spawn failed: ${e.message}` }); return; }
     agent.child = child;
     agent.profile = prof;
@@ -255,12 +338,16 @@ function startAgent(name) {
         send({ type: 'agent', kind: 'error', text: `failed to start ${name}: ${e.message || e}` });
         send({ type: 'agent', kind: 'exit', code: null });
     });
+    child.once('spawn', () => {
+        if (agent.child !== child) return;
+        send({ type: 'agent', kind: 'started', text: name, experimental: !!prof.experimental, resumed: !!resume });
+    });
     child.stdout.on('data', (d) => {
         if (agent.child !== child) return;
         const chunk = d.toString();
         if (Buffer.byteLength(agent.buf) + Buffer.byteLength(chunk) > MAX_AGENT_BUFFER_BYTES) {
             agent.child = null;
-            try { child.kill('SIGTERM'); } catch (_) {}
+            terminateChild(child);
             send({ type: 'agent', kind: 'error', text: `agent output exceeded ${MAX_AGENT_BUFFER_BYTES} bytes without a complete event` });
             send({ type: 'agent', kind: 'exit', code: null });
             return;
@@ -278,7 +365,6 @@ function startAgent(name) {
     });
     child.stderr.on('data', (d) => send({ type: 'agent', kind: 'stderr', text: d.toString().slice(0, 500) }));
     child.on('exit', (code) => { if (agent.child === child) { agent.child = null; send({ type: 'agent', kind: 'exit', code }); } });
-    send({ type: 'agent', kind: 'started', text: name, experimental: !!prof.experimental, resumed: !!resume });
 }
 
 function oneshotTurn(text) {
@@ -286,7 +372,7 @@ function oneshotTurn(text) {
     const prof = agent.profile;
     if (!prof) { send({ type: 'agent', kind: 'error', text: 'no agent running' }); return false; }
     let child;
-    try { child = spawn(prof.cmd, prof.buildArgs(text, agent.sessionId), { env: spawnEnv(), cwd: CWD, stdio: ['ignore', 'pipe', 'pipe'] }); }
+    try { child = spawnChild(prof.cmd, prof.buildArgs(text, agent.sessionId), ['ignore', 'pipe', 'pipe']); }
     catch (e) { send({ type: 'agent', kind: 'error', text: 'spawn failed: ' + (e.message || e) }); send({ type: 'agent', kind: 'result', text: '' }); return false; }
     agent.child = child;
     agent.buf = '';
@@ -303,7 +389,7 @@ function oneshotTurn(text) {
             const chunk = d.toString();
             if (Buffer.byteLength(agent.buf) + Buffer.byteLength(chunk) > MAX_AGENT_BUFFER_BYTES) {
                 agent.child = null;
-                try { child.kill('SIGTERM'); } catch (_) {}
+                terminateChild(child);
                 send({ type: 'agent', kind: 'error', text: `agent output exceeded ${MAX_AGENT_BUFFER_BYTES} bytes` });
                 send({ type: 'agent', kind: 'result', text: '' });
                 return;
@@ -326,7 +412,7 @@ function oneshotTurn(text) {
         const chunk = d.toString();
         if (Buffer.byteLength(agent.buf) + Buffer.byteLength(chunk) > MAX_AGENT_BUFFER_BYTES) {
             agent.child = null;
-            try { child.kill('SIGTERM'); } catch (_) {}
+            terminateChild(child);
             send({ type: 'agent', kind: 'error', text: `agent output exceeded ${MAX_AGENT_BUFFER_BYTES} bytes without a complete event` });
             send({ type: 'agent', kind: 'result', text: '' });
             return;
@@ -358,7 +444,9 @@ function inputAgent(text) {
 }
 
 function stopAgent() {
-    if (agent.child) { try { agent.child.kill('SIGTERM'); } catch (_) {} agent.child = null; }
+    const child = agent.child;
+    agent.child = null;
+    terminateChild(child);
 }
 
 function resetAgent() {
@@ -367,6 +455,7 @@ function resetAgent() {
     agent.name = null;
     agent.mode = null;
     agent.buf = '';
+    agent.sessionId = null;
 }
 
 function sessionClaim() {
@@ -421,8 +510,13 @@ function connectOnce() {
         });
         ws.on('error', (e) => done(e));
         ws.on('close', (code, reason) => {
+            const why = Buffer.isBuffer(reason) ? reason.toString() : String(reason || '');
+            if (welcomed && /replaced by a new worker connection/.test(why)) {
+                done(new Error(`ws closed (${code}) ${why}`));
+                return;
+            }
             if (welcomed) done();
-            else done(new Error(`ws closed (${code}) ${reason || ''}`));
+            else done(new Error(`ws closed (${code}) ${why}`));
         });
         ws.on('message', (buf) => {
             let msg; try { msg = JSON.parse(buf.toString()); } catch { return; }

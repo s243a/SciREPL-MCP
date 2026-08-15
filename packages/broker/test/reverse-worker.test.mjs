@@ -11,7 +11,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { childProcessEnv, loadWorkerToken, validateWorkerHello, workerWebSocketUrl } from '../src/reverse-worker.mjs';
+import { childProcessEnv, loadWorkerToken, validateWorkerHello, workerWebSocketUrl, boundedInteger, auditSafeIdentity } from '../src/reverse-worker.mjs';
 
 const packageDir = path.dirname(fileURLToPath(new URL('../package.json', import.meta.url)));
 const PORT = 8093;
@@ -134,6 +134,21 @@ ok(workerWebSocketUrl('::1', 8087) === 'ws://[::1]:8087/worker',
     'worker URL brackets IPv6 loopback');
 ok(workerWebSocketUrl('::', 8087) === 'ws://127.0.0.1:8087/worker',
     'worker URL maps unspecified IPv6 bind to loopback IPv4');
+ok(auditSafeIdentity('agy') === 'agy' && auditSafeIdentity("shell'\n[broker] x") === '?',
+    'audit identities accept known CLIs and reject newline injection');
+ok(boundedInteger('', 1048576, 1024, 16777216, 'cap') === 1048576, 'bounded integer uses fallback when unset');
+try {
+    boundedInteger('NaN', 1048576, 1024, 16777216, '--max-outbound-buffered-bytes');
+    ok(false, 'NaN backpressure is rejected');
+} catch (e) {
+    ok(/must be an integer/.test(e.message), 'NaN backpressure is rejected');
+}
+try {
+    boundedInteger('Infinity', 1048576, 1024, 16777216, '--max-outbound-buffered-bytes');
+    ok(false, 'Infinity backpressure is rejected');
+} catch (e) {
+    ok(/must be an integer/.test(e.message), 'Infinity backpressure is rejected');
+}
 
 try {
     loadWorkerToken({ controllerToken: 'same-secret', env: { BROKER_WORKER_TOKEN: 'same-secret' } });
@@ -305,12 +320,23 @@ try {
         !Object.keys(listed[0]).some(k => /host|pid|path|address|ip/i.test(k)),
         'health lists the worker by name and capabilities without host details');
 
-    const replacement = await connectWorker({ name: 'agy-box' });
+    const raced = await connectWorker({ name: 'agy-box' });
+    const racedHello = await raced.welcome;
+    const healthRaced = await (await fetch(`http://127.0.0.1:${PORT}/health`)).json();
+    ok(racedHello.error === 'worker name is already connected' &&
+        (healthRaced.workers || []).length === 1 && healthRaced.workers[0].name === 'agy-box',
+        'a rapid second hello for a live name without a live-session claim is rejected');
+    try { raced.ws.close(); } catch (_) {}
+
+    const replacement = await connectWorker({
+        name: 'agy-box',
+        sessions: { term: { live: true, cmd: 'shell' }, agent: { live: false } },
+    });
     const replacedClose = new Promise((resolve) => worker.once('close', (code) => resolve(code)));
     const replacementWelcome = await replacement.welcome;
     const replacedCode = await replacedClose;
     ok(replacementWelcome.type === 'welcome' && replacedCode === 1000,
-        'a second hello for the same name replaces the previous worker socket');
+        'a live-session claim can replace a still-connected worker of the same name');
     const health2 = await (await fetch(`http://127.0.0.1:${PORT}/health`)).json();
     ok((health2.workers || []).length === 1 && health2.workers[0].name === 'agy-box',
         'health still shows one worker after replacement');
@@ -507,10 +533,10 @@ try {
         'stop clears the reverse session so a later start selects a worker that advertised that CLI');
     ok(audit.some(l => /agent 'agy' start requested via worker 'agy-only'/.test(l)) &&
         audit.some(l => /agent 'agy' ready via worker 'agy-only'/.test(l)) &&
-        audit.some(l => /agent 'agy' stopped via worker 'agy-only'/.test(l)) &&
+        audit.some(l => /agent 'agy' stop requested via worker 'agy-only'/.test(l)) &&
         audit.some(l => /agent 'claude' start requested via worker 'claude-only'/.test(l)) &&
         audit.some(l => /agent 'claude' ready via worker 'claude-only'/.test(l)),
-        'audit logs start requested before worker ack, started/ready on ack, and stop');
+        'audit logs start requested before worker ack, started/ready on ack, and stop requested');
 
     try { agent.ws.close(); } catch (_) {}
     try { agyWorker.close(); } catch (_) {}
@@ -553,6 +579,36 @@ try {
         'controller /term disconnect forwards detach and does not stop the worker PTY');
     try { termWorker.close(); } catch (_) {}
     await sleep(100);
+
+    const injLogs = [];
+    const injOrig = console.log;
+    console.log = (...args) => { injLogs.push(args.join(' ')); injOrig(...args); };
+    try {
+        const { ws: injWorker, welcome: injWelcome } = await connectWorker({
+            name: 'inj-box',
+            capabilities: { surfaces: ['term'], cmds: ['shell'] },
+        });
+        await injWelcome;
+        injWorker.on('message', (buf) => {
+            let msg; try { msg = JSON.parse(buf.toString()); } catch { return; }
+            if (msg.type === 'start') {
+                injWorker.send(JSON.stringify({ type: 'term', kind: 'started', cmd: "shell'\n[broker] injected-pwn" }));
+            }
+        });
+        const injTerm = await connectController('/term');
+        await injTerm.first;
+        const injStarted = collectUntil(injTerm.ws, (m) => m.kind === 'started');
+        injTerm.ws.send(JSON.stringify({ type: 'start', cmd: 'shell', cols: 80, rows: 24 }));
+        await injStarted;
+        try { injTerm.ws.close(); } catch (_) {}
+        try { injWorker.close(); } catch (_) {}
+        await sleep(50);
+    } finally {
+        console.log = injOrig;
+    }
+    ok(injLogs.some(l => /term 'shell' started via worker 'inj-box'/.test(l)) &&
+        !injLogs.some(l => /injected-pwn/.test(l)),
+        'audit uses the controller-requested CLI and ignores worker-supplied started text');
 } catch (e) {
     console.log('  ✗ unexpected lifecycle error: ' + (e.stack || e));
     failed++;
@@ -720,7 +776,16 @@ try {
     const binDir = path.join(testRoot, 'fake-bin');
     fs.mkdirSync(binDir, { recursive: true });
     const pidFile = path.join(testRoot, 'fake-claude.pid');
-    fs.writeFileSync(path.join(binDir, 'claude'), `#!/bin/sh\necho $$ > '${pidFile}'\nexec sleep 60\n`, { mode: 0o755 });
+    const fakeScript = path.join(binDir, 'claude.mjs');
+    fs.writeFileSync(fakeScript, `import fs from 'node:fs';
+fs.writeFileSync(${JSON.stringify(pidFile)}, String(process.pid));
+setInterval(() => {}, 60000);
+`);
+    if (process.platform === 'win32') {
+        fs.writeFileSync(path.join(binDir, 'claude.cmd'), `@echo off\r\n"${process.execPath}" "${fakeScript}" %*\r\n`);
+    } else {
+        fs.writeFileSync(path.join(binDir, 'claude'), `#!/bin/sh\nexec ${JSON.stringify(process.execPath)} ${JSON.stringify(fakeScript)} "$@"\n`, { mode: 0o755 });
+    }
     const killShim = spawn(process.execPath, [
         path.join(packageDir, 'scripts', 'reverse-worker.mjs'),
         '--url', `ws://127.0.0.1:${PORT}/worker`,

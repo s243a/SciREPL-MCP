@@ -117,18 +117,32 @@ if (process.platform !== 'win32') {
         reverseWorkerToken && reverseWorkerToken !== reverseToken &&
         /^[0-9a-f]{32}$/.test(reverseWorkerToken) &&
         reverseEnroll.includes('reverse-worker.mjs') && reverseEnroll.includes('another account') &&
+        reverseEnroll.includes('BROKER_HOST') && reverseEnroll.includes('node scripts/reverse-worker.mjs') &&
+        !reverseEnroll.includes(process.execPath) &&
         !reverseEnroll.includes(reverseWorkerToken) &&
         !fs.existsSync(path.join(reverse, 'start-reverse-worker.sh')) &&
         !fs.existsSync(path.join(reverse, 'Start-Reverse-Worker.ps1')) &&
         !fs.existsSync(path.join(reverse, 'workspace')),
-        'acknowledged reverse-worker setup writes enrollment material, not a same-host worker launcher');
+        'acknowledged reverse-worker setup writes portable enrollment material, not a same-host worker launcher');
+
+    fs.writeFileSync(path.join(reverse, 'start-reverse-worker.sh'),
+        '#!/bin/sh\nexec node reverse-worker.mjs --url ws://127.0.0.1:8087/worker\n', { mode: 0o700 });
+    const oldWorkerToken = reverseWorkerToken;
+    const migrated = run('--output', reverse, '--no-install', '--enable-reverse-worker', '--acknowledge-reverse-worker-command-relay');
+    const retired = fs.existsSync(path.join(reverse, 'start-reverse-worker.sh'))
+        ? fs.readFileSync(path.join(reverse, 'start-reverse-worker.sh'), 'utf8') : '';
+    const rotatedToken = fs.readFileSync(path.join(reverse, 'worker-token'), 'utf8').trim();
+    ok(migrated.status === 0 && retired.includes('retired-same-host-reverse-worker') &&
+        rotatedToken && rotatedToken !== oldWorkerToken && /rotated/.test(migrated.stdout) && /restart/.test(migrated.stdout),
+        'upgrading an old same-host worker launcher disables it and rotates the worker token');
 
     const ipv6 = path.join(testRoot, 'ipv6');
     const ipv6Run = run('--output', ipv6, '--no-install', '--host', '::1',
-        '--enable-reverse-worker', '--acknowledge-reverse-worker-command-relay');
+        '--enable-reverse-worker', '--acknowledge-reverse-worker-command-relay',
+        '--worker-url', 'ws://[::1]:8087/worker');
     const ipv6Enroll = ipv6Run.status === 0 ? fs.readFileSync(path.join(ipv6, 'worker-enroll.txt'), 'utf8') : '';
-    ok(ipv6Run.status === 0 && ipv6Enroll.includes('ws://[::1]:') && !ipv6Enroll.includes('ws://::1:'),
-        'enrollment brackets IPv6 loopback in the worker URL');
+    ok(ipv6Run.status === 0 && ipv6Enroll.includes('ws://[::1]:8087/worker') && !ipv6Enroll.includes('ws://::1:'),
+        'enrollment brackets IPv6 when --worker-url is supplied');
 }
 
 const dangerous = run('--output', path.join(repoDir, 'generated-setup'), '--no-install');

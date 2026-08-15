@@ -142,8 +142,9 @@ if credential attenuation matters.
 ```bash
 ./setup-broker.sh \
   --enable-reverse-worker \
-  --acknowledge-reverse-worker-command-relay
+  --acknowledge-reverse-worker-command-relay \
+  --worker-url ws://broker.example.ts.net:8087/worker
 ~/scirepl-broker/start-broker.sh
 # then, on another host/account, following worker-enroll.txt:
-# node reverse-worker.mjs --url ws://HOST:PORT/worker --token-file worker-token ...
+# node scripts/reverse-worker.mjs --url ws://broker.example.ts.net:8087/worker --token-file worker-token ...
 ```

@@ -47,11 +47,28 @@ const TERM_KIND_SET = new Set(TERM_EVENT_KINDS);
 const AGENT_KIND_SET = new Set(AGENT_EVENT_KINDS);
 const SURFACE_SET = new Set(['term', 'agent']);
 
+export const WORKER_REPLACE_MIN_AGE_MS = 5000;
+
 export function secretMatches(candidate, expected) {
     if (typeof candidate !== 'string' || typeof expected !== 'string') return false;
     const actual = Buffer.from(candidate);
     const wanted = Buffer.from(expected);
     return actual.length === wanted.length && crypto.timingSafeEqual(actual, wanted);
+}
+
+export function boundedInteger(raw, fallback, min, max, name) {
+    const value = raw === undefined || raw === '' || raw === null ? fallback : Number(raw);
+    if (!Number.isSafeInteger(value) || value < min || value > max) {
+        throw new Error(`${name} must be an integer from ${min} to ${max}; received ${JSON.stringify(raw)}`);
+    }
+    return value;
+}
+
+export function auditSafeIdentity(value) {
+    if (typeof value !== 'string') return '?';
+    if (WORKER_NAME_RE.test(value)) return value;
+    if (KNOWN_TERM_CMDS.includes(value) || KNOWN_AGENTS.includes(value)) return value;
+    return '?';
 }
 
 export function defaultWorkerTokenFile() {
@@ -284,6 +301,13 @@ export function createReverseWorkerHub({
         };
         const previous = workers.get(parsed.name);
         if (previous && previous.ws !== ws) {
+            const claimsLive = parsed.sessions.term.live || parsed.sessions.agent.live;
+            const tooSoon = socketOpen(previous.ws) && (Date.now() - previous.connectedAt) < WORKER_REPLACE_MIN_AGE_MS;
+            if (tooSoon && !claimsLive) {
+                sendJson(ws, { type: 'error', error: 'worker name is already connected' }, maxPayloadBytes);
+                try { ws.close(1008, 'worker name is already connected'); } catch (_) {}
+                return null;
+            }
             for (const surface of ['term', 'agent']) {
                 const session = sessions[surface];
                 if (!session || session.worker !== previous) continue;
@@ -295,9 +319,13 @@ export function createReverseWorkerHub({
                 }
             }
             try { previous.ws.close(1000, 'replaced by a new worker connection'); } catch (_) {}
-            audit(`worker '${parsed.name}' replaced`);
+            audit(`worker '${auditSafeIdentity(parsed.name)}' replaced`);
         } else {
-            audit(`worker '${parsed.name}' connected surfaces=${parsed.capabilities.surfaces.join(',')} cmds=${parsed.capabilities.cmds.join(',')} agents=${parsed.capabilities.agents.join(',')}`);
+            const name = auditSafeIdentity(parsed.name);
+            const surfaces = parsed.capabilities.surfaces.map(auditSafeIdentity).join(',');
+            const cmds = parsed.capabilities.cmds.map(auditSafeIdentity).join(',');
+            const agents = parsed.capabilities.agents.map(auditSafeIdentity).join(',');
+            audit(`worker '${name}' connected surfaces=${surfaces} cmds=${cmds} agents=${agents}`);
         }
         workers.set(parsed.name, next);
         return next;
@@ -308,7 +336,7 @@ export function createReverseWorkerHub({
         if (!worker) return;
         if (workers.get(worker.name) !== worker) return;
         workers.delete(worker.name);
-        audit(`worker '${worker.name}' disconnected`);
+        audit(`worker '${auditSafeIdentity(worker.name)}' disconnected`);
         for (const surface of ['term', 'agent']) {
             const session = sessions[surface];
             if (session && session.worker === worker) dropSession(surface, { notify: true });
@@ -325,10 +353,12 @@ export function createReverseWorkerHub({
         sendController(session, outbound);
         if (rest.kind === 'started') {
             const reattach = !!(rest.reattached || rest.reused);
+            const requested = auditSafeIdentity(session.requested);
+            const name = auditSafeIdentity(worker.name);
             if (surface === 'term') {
-                audit(`term '${rest.cmd || session.requested}' ${reattach ? 'reattached' : 'started'} via worker '${worker.name}'`);
+                audit(`term '${requested}' ${reattach ? 'reattached' : 'started'} via worker '${name}'`);
             } else {
-                audit(`agent '${rest.text || session.requested}' ${reattach ? 'reused' : 'ready'} via worker '${worker.name}'`);
+                audit(`agent '${requested}' ${reattach ? 'reused' : 'ready'} via worker '${name}'`);
             }
         }
         if (surface === 'term' && rest.kind === 'exit') sessions.term = null;
@@ -366,9 +396,10 @@ export function createReverseWorkerHub({
                         try { ws.close(1008, parsed.error); } catch (_) {}
                         return;
                     }
+                    const worker = register(ws, parsed);
+                    if (!worker) return;
                     authenticated();
                     authed = true;
-                    register(ws, parsed);
                     sendJson(ws, { type: 'welcome', protocolVersion, name: parsed.name }, maxPayloadBytes);
                     return;
                 }
@@ -381,13 +412,17 @@ export function createReverseWorkerHub({
     }
 
     function auditRequested(surface, requested, workerName) {
-        if (surface === 'term') audit(`term '${requested}' start requested via worker '${workerName}'`);
-        else audit(`agent '${requested}' start requested via worker '${workerName}'`);
+        const req = auditSafeIdentity(requested);
+        const name = auditSafeIdentity(workerName);
+        if (surface === 'term') audit(`term '${req}' start requested via worker '${name}'`);
+        else audit(`agent '${req}' start requested via worker '${name}'`);
     }
 
-    function auditStopped(surface, requested, workerName) {
-        if (surface === 'term') audit(`term '${requested}' stopped via worker '${workerName}'`);
-        else audit(`agent '${requested}' stopped via worker '${workerName}'`);
+    function auditStopRequested(surface, requested, workerName) {
+        const req = auditSafeIdentity(requested);
+        const name = auditSafeIdentity(workerName);
+        if (surface === 'term') audit(`term '${req}' stop requested via worker '${name}'`);
+        else audit(`agent '${req}' stop requested via worker '${name}'`);
     }
 
     function bindAndStart(surface, controllerWs, msg, worker, requested) {
@@ -415,7 +450,7 @@ export function createReverseWorkerHub({
             if (existing.worker && socketOpen(existing.worker.ws)) {
                 forwardToWorker(existing.worker, { type: 'stop', surface });
             }
-            auditStopped(surface, existing.requested, existing.workerName);
+            auditStopRequested(surface, existing.requested, existing.workerName);
             sessions[surface] = null;
         }
         const worker = findWorker(surface, requested);
@@ -454,7 +489,7 @@ export function createReverseWorkerHub({
         if (session.worker && socketOpen(session.worker.ws)) {
             forwardToWorker(session.worker, { type: 'stop', surface });
         }
-        auditStopped(surface, session.requested, session.workerName);
+        auditStopRequested(surface, session.requested, session.workerName);
         sessions[surface] = null;
         return true;
     }
@@ -467,7 +502,7 @@ export function createReverseWorkerHub({
             if (session.worker && socketOpen(session.worker.ws)) {
                 forwardToWorker(session.worker, { type: 'stop', surface: 'agent' });
             }
-            auditStopped(surface, session.requested, session.workerName);
+            auditStopRequested(surface, session.requested, session.workerName);
             sessions.agent = null;
             return true;
         }

@@ -315,7 +315,11 @@ not remote workers.
 ### One worker per name
 
 A second hello with an already-connected name **replaces** the first
-connection, following `/app`:
+connection only when the new hello claims a live session or the current
+registration is older than five seconds. Rapid competing hellos for the
+same name without a live claim are rejected with `worker name is already
+connected` so two reconnecting shims cannot replace each other in a tight
+loop. When replacement is allowed:
 
 - The previous socket is closed with code 1000 and reason
   `replaced by a new worker connection`.
@@ -368,11 +372,14 @@ session claim.
 
 The shim reconnects with exponential backoff (1s, 2s, 4s, … capped at
 15s) and resets the backoff after a session that reached `welcome` (close
-after welcome is a completed session, not a failed handshake). A second
-authenticated `hello` on the same `/worker` socket is rejected with
-`already authenticated`; it does not register another name. Outbound
-worker frames that exceed the 1 MiB `bufferedAmount` cap close the socket
-with code 1013, matching the hub.
+after welcome is a completed session, not a failed handshake). Being
+replaced by another worker is treated as a failed session so backoff
+grows instead of immediately redialing. A second authenticated `hello`
+on the same `/worker` socket is rejected with `already authenticated`;
+it does not register another name. Outbound worker frames that exceed
+the 1 MiB `bufferedAmount` cap close the socket with code 1013, matching
+the hub. Caps that are not safe integers (`NaN`, `Infinity`) are
+rejected at shim startup.
 
 `/app` replacement of a still-open previous socket is the model for a
 second worker hello with the same name while the first socket is still
@@ -405,11 +412,11 @@ Reverse:
 [broker] term 'agy' start requested via worker 'agy-box'
 [broker] term 'agy' started via worker 'agy-box'
 [broker] term 'agy' reattached via worker 'agy-box'
-[broker] term 'agy' stopped via worker 'agy-box'
+[broker] term 'agy' stop requested via worker 'agy-box'
 [broker] agent 'agy' start requested via worker 'agy-box'
 [broker] agent 'agy' ready via worker 'agy-box'
 [broker] agent 'agy' reused via worker 'agy-box'
-[broker] agent 'agy' stopped via worker 'agy-box'
+[broker] agent 'agy' stop requested via worker 'agy-box'
 [broker] worker 'agy-box' replaced
 [broker] worker 'agy-box' disconnected
 ```
@@ -417,9 +424,13 @@ Reverse:
 Rules:
 
 - Relayed start **request**, successful start/reattach/ready/reused (when the
-  worker acknowledges `started`), stop, worker connect, replace, and
+  worker acknowledges `started`), stop **request**, worker connect, replace, and
   disconnect are logged, attributed to the worker `name`. The broker does
-  not log `started` before the worker has launched or reattached anything.
+  not log `started` before the worker has launched or reattached anything,
+  and it does not log `stopped` without an acknowledgement it does not
+  have. Audit lines interpolate only validated worker names and known CLI
+  tokens from the controller request; worker-supplied `cmd`/`text` is never
+  copied into `[broker]` stdout.
 - Input bytes, PTY data, assistant text, and prompts are not logged by
   the broker. They never were on the local path. The supervisor's own
   decision log remains the place those appear, exactly as
@@ -472,10 +483,15 @@ Setup writes `BROKER_REVERSE_WORKER=1` and `BROKER_WORKER_TOKEN_FILE` into
 the generated broker launcher and creates a worker token distinct from
 the pairing token. It writes `worker-enroll.txt` describing how to copy
 that token to **another** account, container, or host and run the shim
-there with the capabilities that host actually has. It does **not**
-generate a same-host `start-reverse-worker.sh` beside `broker-token`: a
-commanded shell or agent running as the broker OS user could read the
-controller credential and nullify token attenuation. It does **not**
+there with the capabilities that host actually has. The example uses
+`node scripts/reverse-worker.mjs` (not this broker's Node path or
+checkout). `--worker-url` bakes in a reachable `ws://` or `wss://` URL
+ending in `/worker`; loopback binds otherwise write a `BROKER_HOST`
+placeholder. It does **not** generate a same-host
+`start-reverse-worker.sh` beside `broker-token`. Upgrading a directory
+that still has that launcher (or `Start-Reverse-Worker.ps1`) disables
+the file and rotates the worker token; stop any old shim and restart the
+broker so the previous token is no longer accepted. It does **not**
 create a workspace or advertise terminal support merely because reverse
 mode is on. Worker installation is separate; `node-pty` is a worker-host
 dependency when `--surfaces` includes `term`.
@@ -516,12 +532,15 @@ node packages/broker/scripts/reverse-worker.mjs \
 It connects out, sends the registration hello, supervises a local CLI or
 PTY on `start`, relays streams, and on socket drop keeps a live PTY for
 the terminal grace period while it reconnects. Welcome does **not** cancel
-that grace; a later `start` does (reattach). `/agent` children are killed
-when the worker link drops. Session preservation is the shim's job for
-`/term` only, matching how the broker itself holds a PTY across
-controller disconnects today. `/agent` one-shot and persistent adapters
-follow the same shapes the broker already uses. Hub-to-worker `detach` is
-the signal to start term grace; controllers never send it.
+that grace; a later `start` does (reattach). `/agent` children are sent
+`SIGTERM` then `SIGKILL` (process group on POSIX, `taskkill /t` on
+Windows) when the worker link drops, and adapter `sessionId` is cleared
+so a later CLI cannot resume unrelated context. Persistent `started` is
+emitted only after the OS `spawn` event. Session preservation is the
+shim's job for `/term` only. The shim defaults to `--surfaces agent` and
+PATH-detected agents; it does not advertise `term` or every CLI unless
+asked, and it refuses `term` when `node-pty` is missing. Hub-to-worker
+`detach` is the signal to start term grace; controllers never send it.
 
 Child processes get a restricted environment by default (the same class of
 allowlist as local spawn: `HOME`, `PATH`, locale, temp dirs, XDG). That
@@ -749,13 +768,19 @@ Implementation covers at least:
 - setup refuses `--enable-reverse-worker` without
   `--acknowledge-reverse-worker-command-relay`, writes a worker token
   distinct from the pairing token, writes `worker-enroll.txt` rather than
-  a same-host worker launcher, and brackets IPv6 hosts in the example URL;
+  a same-host worker launcher, accepts `--worker-url`, writes a
+  `BROKER_HOST` placeholder for loopback binds, and on upgrade disables
+  leftover same-host launchers while rotating the worker token;
 - `stop` then `start` of a different advertised CLI selects a matching
   worker instead of reusing the previous session;
 - a second authenticated `hello` on one `/worker` socket is rejected
   without registering another name;
+- a rapid second connection for an already-live worker name without a
+  live-session claim is rejected;
 - controller `/term` disconnect forwards `detach` so shim grace starts;
-  an expired grace does not reattach.
+  an expired grace does not reattach;
+- audit lines ignore worker-supplied `cmd`/`text` and log stop as
+  requested rather than completed.
 
 Use a protocol-level fake worker for auth, relay, reconnect, and driver
 compatibility so core CI without `node-pty` still proves the transport

@@ -270,9 +270,13 @@ command-relay hub:
 
 That writes `worker-token` and `worker-enroll.txt`. Copy the worker token
 to another account, container, or host and run the shim there with only
-the capabilities that host has. Setup does not generate a same-host worker
-launcher beside `broker-token`, because a commanded process under the
-broker OS account could read the controller credential. It does not enable
+the capabilities that host has. Pass `--worker-url` so the enrollment
+names a reachable dial address; loopback setup writes a `BROKER_HOST`
+placeholder instead of this machine's Node path or `127.0.0.1`. Setup
+does not generate a same-host worker launcher beside `broker-token`.
+Upgrading a directory that still has `start-reverse-worker.sh` disables
+it and rotates the worker token — restart the broker and stop any old
+shim. It does not enable
 local spawn; add the agent and
 terminal pairs if the broker host should still be able to run CLIs itself.
 Set `BROKER_REVERSE_WORKER_STRICT=1` when execution must not fall back to the

@@ -35,6 +35,11 @@ Options:
                                         /agent and /term commands to them
   --acknowledge-reverse-worker-command-relay
                                         Required with --enable-reverse-worker
+  --worker-url URL                      ws:// or wss:// URL workers should dial
+                                        (must end with /worker). Required for a
+                                        reachable example when the broker binds
+                                        loopback; otherwise a BROKER_HOST
+                                        placeholder is written.
   --no-install                          Do not install npm dependencies
   --adopt                               Allow an existing unmarked setup directory
   --repair                              Back up and replace changed generated files
@@ -60,6 +65,7 @@ function parseArgs(argv) {
         acknowledgeTerminal: false,
         enableReverseWorker: false,
         acknowledgeReverseWorker: false,
+        workerUrl: '',
         install: true,
         adopt: false,
         repair: false,
@@ -81,6 +87,7 @@ function parseArgs(argv) {
         else if (arg === '--acknowledge-terminal-host-access') options.acknowledgeTerminal = true;
         else if (arg === '--enable-reverse-worker') options.enableReverseWorker = true;
         else if (arg === '--acknowledge-reverse-worker-command-relay') options.acknowledgeReverseWorker = true;
+        else if (arg === '--worker-url') options.workerUrl = value();
         else if (arg === '--no-install') options.install = false;
         else if (arg === '--adopt') options.adopt = true;
         else if (arg === '--repair') options.repair = true;
@@ -100,6 +107,31 @@ function isLoopbackHost(host) {
     return host === '127.0.0.1' || host === '::1' || host === 'localhost';
 }
 
+function validateWorkerDialUrl(url) {
+    if (typeof url !== 'string' || !url.trim() || /[\r\n\s]/.test(url)) {
+        throw new Error('--worker-url must be a single-line ws:// or wss:// URL ending with /worker');
+    }
+    let parsed;
+    try { parsed = new URL(url); } catch {
+        throw new Error('--worker-url is not a valid URL');
+    }
+    if (parsed.protocol !== 'ws:' && parsed.protocol !== 'wss:') {
+        throw new Error('--worker-url must use ws:// or wss://');
+    }
+    if (!parsed.pathname.endsWith('/worker')) {
+        throw new Error('--worker-url path must end with /worker');
+    }
+    return url;
+}
+
+function enrollmentWorkerUrl(options) {
+    if (options.workerUrl) return { url: options.workerUrl, placeholder: false };
+    if (isLoopbackHost(options.host) || options.host === '0.0.0.0' || options.host === '::') {
+        return { url: `ws://BROKER_HOST:${options.port}/worker`, placeholder: true };
+    }
+    return { url: workerWebSocketUrl(options.host, options.port), placeholder: false };
+}
+
 function validate(options) {
     if (!Number.isSafeInteger(options.port) || options.port < 1 || options.port > 65535) {
         throw new Error('--port must be an integer from 1 to 65535');
@@ -116,6 +148,12 @@ function validate(options) {
     }
     if (options.enableReverseWorker && !options.acknowledgeReverseWorker) {
         throw new Error('--enable-reverse-worker requires --acknowledge-reverse-worker-command-relay because the broker will forward /agent and /term commands to whoever authenticates as that worker');
+    }
+    if (options.workerUrl) {
+        if (!options.enableReverseWorker) {
+            throw new Error('--worker-url is only valid with --enable-reverse-worker');
+        }
+        options.workerUrl = validateWorkerDialUrl(options.workerUrl);
     }
     if (process.platform === 'win32' && (options.enableAgent || options.enableTerminal || options.enableReverseWorker)) {
         throw new Error('agent, terminal, and reverse-worker modes currently require Linux, macOS, or WSL; use the PowerShell setup for the core broker only');
@@ -202,8 +240,21 @@ function setupManifest(options, files) {
 }
 
 function workerEnrollment(options, workerTokenFile) {
-    const url = workerWebSocketUrl(options.host, options.port);
-    const shim = path.join(PACKAGE_DIR, 'scripts', 'reverse-worker.mjs');
+    const { url, placeholder } = enrollmentWorkerUrl(options);
+    const reachability = placeholder
+        ? [
+            'The broker is bound to loopback (or an unspecified address). Replace',
+            'BROKER_HOST with a name this worker host can reach — Tailscale MagicDNS,',
+            'an SSH forwarded hostname, or another private name. Do not copy this',
+            'broker process\'s Node executable path or source checkout onto the worker.',
+            'Pass --worker-url at setup to bake in a deliberate reachable URL.',
+            '',
+        ]
+        : [
+            'This URL is the one supplied to setup (or derived from a non-loopback',
+            '--host). Confirm the worker host can reach it before starting the shim.',
+            '',
+        ];
     return [
         'SciREPL reverse-worker enrollment',
         '=================================',
@@ -213,20 +264,15 @@ function workerEnrollment(options, workerTokenFile) {
         '',
         `  ${workerTokenFile}`,
         '',
-        'Copy that file to another account, container, or host, then install and',
-        'run the worker shim there. Do not run the shim as the same OS user that',
-        'runs this broker if you need the worker token to stay weaker than the',
-        'pairing token: a commanded shell or agent on this host can read',
-        'broker-token from this directory and collapse that attenuation.',
+        'Copy that file to another account, container, or host. Install the shim',
+        'from this repository on that machine (Node 20+):',
         '',
-        'Worker installation is separate and capability-specific. Advertise only',
-        'CLIs this worker host actually has. Terminal support requires node-pty',
-        'on the worker host; omit term from --surfaces until that dependency is',
-        'installed and verified there.',
+        '  git clone <this-repo>',
+        '  cd SciREPL-MCP/packages/broker && npm ci --omit=optional',
         '',
-        'Example (run elsewhere, after copying worker-token):',
+        'Or copy packages/broker onto the worker host. Then run:',
         '',
-        `  ${process.execPath} ${shim} \\`,
+        '  node scripts/reverse-worker.mjs \\',
         `    --url ${url} \\`,
         '    --token-file /path/on/worker/worker-token \\',
         '    --name worker \\',
@@ -234,9 +280,75 @@ function workerEnrollment(options, workerTokenFile) {
         '    --agents agy \\',
         '    --cwd /path/to/target-repo',
         '',
+        ...reachability,
+        'Advertise only CLIs this worker host actually has. The shim defaults to',
+        'agent mode and PATH-detected CLIs; it does not advertise terminal support',
+        'unless you pass --surfaces term after installing and verifying node-pty.',
+        '',
+        'Do not run the shim as the same OS user that runs this broker if you need',
+        'the worker token to stay weaker than the pairing token: a commanded shell',
+        'or agent on this host can read broker-token from this directory.',
+        '',
         'IPv6 URLs must bracket the host, for example ws://[::1]:8087/worker.',
         '',
     ].join('\n');
+}
+
+const OBSOLETE_WORKER_LAUNCHERS = ['start-reverse-worker.sh', 'Start-Reverse-Worker.ps1'];
+
+function isActiveObsoleteWorkerLauncher(file) {
+    if (!fs.existsSync(file) || !fs.statSync(file).isFile()) return false;
+    const text = fs.readFileSync(file, 'utf8');
+    if (text.includes('retired-same-host-reverse-worker')) return false;
+    return text.includes('reverse-worker.mjs');
+}
+
+function retiredWorkerLauncherStub(kind) {
+    if (kind === 'ps1') {
+        return [
+            "$ErrorActionPreference = 'Stop'",
+            '# retired-same-host-reverse-worker',
+            "Write-Error 'This same-host reverse-worker launcher was retired. Copy worker-token to another account or host and run the shim there using worker-enroll.txt. Stop any old reverse-worker process and restart the broker so the rotated worker token is required.'",
+            'exit 1',
+            '',
+        ].join('\r\n');
+    }
+    return [
+        '#!/usr/bin/env bash',
+        '# retired-same-host-reverse-worker',
+        'echo "This same-host reverse-worker launcher was retired." >&2',
+        'echo "Copy worker-token to another account or host and run the shim there using worker-enroll.txt." >&2',
+        'echo "Stop any old reverse-worker process and restart the broker so the rotated worker token is required." >&2',
+        'exit 1',
+        '',
+    ].join('\n');
+}
+
+function migrateObsoleteSameHostWorker(options, workerTokenFile, controllerToken) {
+    const result = { disabled: [], rotated: false, backups: [], planned: false };
+    if (!options.enableReverseWorker) return result;
+    const obsolete = OBSOLETE_WORKER_LAUNCHERS
+        .map(rel => ({ rel, abs: path.join(options.output, rel) }))
+        .filter(({ abs }) => isActiveObsoleteWorkerLauncher(abs));
+    if (!obsolete.length) return result;
+    result.planned = true;
+    result.disabled = obsolete.map(item => item.rel);
+    result.rotated = fs.existsSync(workerTokenFile);
+    if (options.dryRun) return result;
+    for (const file of obsolete) {
+        result.backups.push(backup(file.abs));
+        const stub = retiredWorkerLauncherStub(file.rel.endsWith('.ps1') ? 'ps1' : 'sh');
+        writePrivateFile(file.abs, stub);
+        try { if (file.rel.endsWith('.sh')) fs.chmodSync(file.abs, 0o700); } catch (_) {}
+    }
+    if (fs.existsSync(workerTokenFile)) {
+        result.backups.push(backup(workerTokenFile));
+        let next = randomToken();
+        while (next === controllerToken) next = randomToken();
+        writePrivateFile(workerTokenFile, next + '\n');
+        result.rotated = true;
+    }
+    return result;
 }
 
 function generatedTargets(options, env) {
@@ -396,11 +508,15 @@ function main() {
     verifyTerminalDependency(options);
 
     let workspaceResult = null;
+    const workerMigration = options.enableReverseWorker
+        ? migrateObsoleteSameHostWorker({ ...options, dryRun: true }, workerTokenFile, token)
+        : { disabled: [], rotated: false, backups: [], planned: false };
     if (!options.dryRun) {
         fs.mkdirSync(options.output, { recursive: true, mode: 0o700 });
         try { fs.chmodSync(options.output, 0o700); } catch (_) {}
         ensureToken(tokenFile, false, token);
         if (options.enableReverseWorker) {
+            Object.assign(workerMigration, migrateObsoleteSameHostWorker(options, workerTokenFile, token));
             let workerToken = randomToken();
             while (workerToken === token) workerToken = randomToken();
             ensureToken(workerTokenFile, false, workerToken);
@@ -424,12 +540,22 @@ function main() {
     console.log(`[setup] terminal: ${options.enableTerminal ? 'enabled' : 'disabled'}`);
     console.log(`[setup] reverse worker: ${options.enableReverseWorker ? 'enabled (command relay; worker token stored privately; install the shim on another account/host)' : 'disabled'}`);
     if (workspaceResult) console.log(`[setup] agent context: ${workspaceResult.created.length} created, ${workspaceResult.updated.length} repaired`);
+    if (options.dryRun && workerMigration.planned) {
+        console.log(`[setup] would retire same-host worker launchers: ${workerMigration.disabled.join(', ')}`);
+        if (workerMigration.rotated) console.log('[setup] would rotate the worker token; restart the broker after applying');
+    }
     if (!options.dryRun) {
         console.log(`[setup] start with ${process.platform === 'win32' ? path.join(options.output, 'Start-Broker.ps1') : path.join(options.output, 'start-broker.sh')}`);
         console.log(`[setup] pairing token stored privately at ${tokenFile} (not printed)`);
         if (options.enableReverseWorker) {
             console.log(`[setup] reverse-worker enrollment written to ${path.join(options.output, 'worker-enroll.txt')}`);
             console.log('[setup] copy worker-token to another host or account; do not run the shim beside broker-token');
+            if (workerMigration.disabled.length) {
+                console.log(`[setup] retired same-host worker launchers: ${workerMigration.disabled.join(', ')}`);
+            }
+            if (workerMigration.rotated) {
+                console.log('[setup] worker token rotated; stop any running reverse-worker shim and restart the broker so the old token is no longer accepted');
+            }
         }
         if (isLoopbackHost(options.host)) {
             console.log(`[setup] Android remote access: configure Tailscale separately with: tailscale serve --bg localhost:${options.port}`);

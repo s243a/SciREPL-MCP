@@ -5,12 +5,15 @@
 - Add optional reverse-worker mode: a worker dials `/worker` with a distinct
   credential and the broker relays the existing `/agent` and `/term` controller
   messages to it. Default off; setup requires
-  `--acknowledge-reverse-worker-command-relay`. Local spawn is unchanged when
+  `--acknowledge-reverse-worker-command-relay` and writes enrollment material
+  rather than a same-host worker launcher. Local spawn is unchanged when
   the flag is unset. Relayed `started` events carry a broker-authored `via`
   worker name; `BROKER_REVERSE_WORKER_STRICT=1` fails closed instead of
   falling through to local spawn. The worker shim can pass provider API keys
   or inherit its environment the same way local spawn does, and still does
-  not inject the controller pairing token.
+  not inject the controller pairing token. Stop clears the reverse session so
+  the next start re-selects a capable worker; controller `/term` detach starts
+  shim grace; worker-link loss kills `/agent` children.
 
 - Extract the SciREPL host-side MCP broker into an independently installable
   repository.

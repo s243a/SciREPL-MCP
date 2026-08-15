@@ -268,8 +268,12 @@ command-relay hub:
   --acknowledge-reverse-worker-command-relay
 ```
 
-That writes `worker-token` and `start-reverse-worker.sh` (or
-`Start-Reverse-Worker.ps1`). It does not enable local spawn; add the agent and
+That writes `worker-token` and `worker-enroll.txt`. Copy the worker token
+to another account, container, or host and run the shim there with only
+the capabilities that host has. Setup does not generate a same-host worker
+launcher beside `broker-token`, because a commanded process under the
+broker OS account could read the controller credential. It does not enable
+local spawn; add the agent and
 terminal pairs if the broker host should still be able to run CLIs itself.
 Set `BROKER_REVERSE_WORKER_STRICT=1` when execution must not fall back to the
 broker host. Relayed `started` events include `"via":"<worker-name>"`. The

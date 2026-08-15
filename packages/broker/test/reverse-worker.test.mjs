@@ -11,7 +11,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { childProcessEnv, loadWorkerToken, validateWorkerHello } from '../src/reverse-worker.mjs';
+import { childProcessEnv, loadWorkerToken, validateWorkerHello, workerWebSocketUrl } from '../src/reverse-worker.mjs';
 
 const packageDir = path.dirname(fileURLToPath(new URL('../package.json', import.meta.url)));
 const PORT = 8093;
@@ -127,6 +127,13 @@ const envInherit = childProcessEnv({
 });
 ok(envInherit.FOO === 'bar' && envInherit.ANTHROPIC_API_KEY === 'sk-secret',
     '--inherit-env passes the shim environment through');
+
+ok(workerWebSocketUrl('127.0.0.1', 8087) === 'ws://127.0.0.1:8087/worker',
+    'worker URL leaves IPv4 hosts unbracketed');
+ok(workerWebSocketUrl('::1', 8087) === 'ws://[::1]:8087/worker',
+    'worker URL brackets IPv6 loopback');
+ok(workerWebSocketUrl('::', 8087) === 'ws://127.0.0.1:8087/worker',
+    'worker URL maps unspecified IPv6 bind to loopback IPv4');
 
 try {
     loadWorkerToken({ controllerToken: 'same-secret', env: { BROKER_WORKER_TOKEN: 'same-secret' } });
@@ -249,7 +256,7 @@ try {
     strictChild.kill('SIGTERM');
 }
 
-const { httpServer, reverseWorkerHub } = await import('../src/broker.mjs');
+const { httpServer, reverseWorkerHub, termBridge } = await import('../src/broker.mjs');
 await sleep(250);
 
 console.log('\nCredential classes and registration\n');
@@ -307,6 +314,21 @@ try {
     const health2 = await (await fetch(`http://127.0.0.1:${PORT}/health`)).json();
     ok((health2.workers || []).length === 1 && health2.workers[0].name === 'agy-box',
         'health still shows one worker after replacement');
+
+    const secondHello = onceMessage(replacement.ws);
+    replacement.ws.send(JSON.stringify({
+        type: 'hello',
+        token: WORKER,
+        name: 'other-box',
+        capabilities: { surfaces: ['agent'], agents: ['claude'] },
+    }));
+    const secondHelloReply = await secondHello;
+    const healthAfterSecond = await (await fetch(`http://127.0.0.1:${PORT}/health`)).json();
+    ok(secondHelloReply.error === 'already authenticated' &&
+        (healthAfterSecond.workers || []).length === 1 &&
+        healthAfterSecond.workers[0].name === 'agy-box',
+        'a second hello on an authenticated worker socket is rejected without registering aliases');
+
     try { replacement.ws.close(); } catch (_) {}
     await sleep(100);
 } catch (e) {
@@ -426,6 +448,116 @@ try {
     failed++;
 }
 
+console.log('\nLifecycle routing, detach, and audit\n');
+
+try {
+    const audit = [];
+    const origLog = console.log;
+    let agyWorker, claudeWorker, agent, agyCmds, claudeCmds, agyWelcome, claudeWelcome;
+    console.log = (...args) => {
+        const line = args.join(' ');
+        if (line.includes('[broker]')) audit.push(line);
+        origLog(...args);
+    };
+    try {
+    ({ ws: agyWorker, welcome: agyWelcome } = await connectWorker({
+        name: 'agy-only',
+        capabilities: { surfaces: ['agent'], agents: ['agy'] },
+    }));
+    await agyWelcome;
+    ({ ws: claudeWorker, welcome: claudeWelcome } = await connectWorker({
+        name: 'claude-only',
+        capabilities: { surfaces: ['agent'], agents: ['claude'] },
+    }));
+    await claudeWelcome;
+    agyCmds = [];
+    claudeCmds = [];
+    agyWorker.on('message', (buf) => {
+        let msg; try { msg = JSON.parse(buf.toString()); } catch { return; }
+        if (msg.type === 'welcome') return;
+        agyCmds.push(msg);
+        if (msg.type === 'start') agyWorker.send(JSON.stringify({ type: 'agent', kind: 'started', text: msg.agent }));
+    });
+    claudeWorker.on('message', (buf) => {
+        let msg; try { msg = JSON.parse(buf.toString()); } catch { return; }
+        if (msg.type === 'welcome') return;
+        claudeCmds.push(msg);
+        if (msg.type === 'start') claudeWorker.send(JSON.stringify({ type: 'agent', kind: 'started', text: msg.agent }));
+    });
+
+    agent = await connectController('/agent');
+    await agent.first;
+    const agyStarted = collectUntil(agent.ws, (m) => m.kind === 'started');
+    agent.ws.send(JSON.stringify({ type: 'start', agent: 'agy' }));
+    await agyStarted;
+    agent.ws.send(JSON.stringify({ type: 'stop' }));
+    const stopDeadline = Date.now() + 1000;
+    while (!agyCmds.some(m => m.type === 'stop') && Date.now() < stopDeadline) await sleep(20);
+    const claudeStarted = collectUntil(agent.ws, (m) => m.kind === 'started' && m.text === 'claude');
+    agent.ws.send(JSON.stringify({ type: 'start', agent: 'claude' }));
+    await claudeStarted;
+    } finally {
+        console.log = origLog;
+    }
+
+    ok(agyCmds.some(m => m.type === 'start' && m.agent === 'agy') &&
+        !agyCmds.some(m => m.type === 'start' && m.agent === 'claude') &&
+        claudeCmds.some(m => m.type === 'start' && m.agent === 'claude') &&
+        agyCmds.some(m => m.type === 'stop'),
+        'stop clears the reverse session so a later start selects a worker that advertised that CLI');
+    ok(audit.some(l => /agent 'agy' start requested via worker 'agy-only'/.test(l)) &&
+        audit.some(l => /agent 'agy' ready via worker 'agy-only'/.test(l)) &&
+        audit.some(l => /agent 'agy' stopped via worker 'agy-only'/.test(l)) &&
+        audit.some(l => /agent 'claude' start requested via worker 'claude-only'/.test(l)) &&
+        audit.some(l => /agent 'claude' ready via worker 'claude-only'/.test(l)),
+        'audit logs start requested before worker ack, started/ready on ack, and stop');
+
+    try { agent.ws.close(); } catch (_) {}
+    try { agyWorker.close(); } catch (_) {}
+    try { claudeWorker.close(); } catch (_) {}
+    await sleep(100);
+
+    const { ws: termWorker, welcome: termWelcome } = await connectWorker({
+        name: 'term-box',
+        capabilities: { surfaces: ['term'], cmds: ['shell'] },
+    });
+    await termWelcome;
+    const termCmds = [];
+    termWorker.on('message', (buf) => {
+        let msg; try { msg = JSON.parse(buf.toString()); } catch { return; }
+        if (msg.type === 'welcome') return;
+        termCmds.push(msg);
+        if (msg.type === 'start') termWorker.send(JSON.stringify({ type: 'term', kind: 'started', cmd: msg.cmd }));
+    });
+    const term = await connectController('/term');
+    await term.first;
+    const termStarted = collectUntil(term.ws, (m) => m.kind === 'started');
+    term.ws.send(JSON.stringify({ type: 'start', cmd: 'shell', cols: 80, rows: 24 }));
+    await termStarted;
+    const detached = new Promise((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error('detach not forwarded')), 2000);
+        const onMsg = (buf) => {
+            let msg; try { msg = JSON.parse(buf.toString()); } catch { return; }
+            if (msg.type === 'detach' && msg.surface === 'term') {
+                clearTimeout(timer);
+                termWorker.off('message', onMsg);
+                resolve(msg);
+            }
+        };
+        termWorker.on('message', onMsg);
+    });
+    try { term.ws.close(); } catch (_) {}
+    await detached;
+    ok(termCmds.some(m => m.type === 'detach' && m.surface === 'term') &&
+        !termCmds.some(m => m.type === 'stop'),
+        'controller /term disconnect forwards detach and does not stop the worker PTY');
+    try { termWorker.close(); } catch (_) {}
+    await sleep(100);
+} catch (e) {
+    console.log('  ✗ unexpected lifecycle error: ' + (e.stack || e));
+    failed++;
+}
+
 console.log('\nUnmodified controller driver\n');
 
 try {
@@ -512,12 +644,123 @@ if (hasPty) {
         ok(driven.status === 0 && /HELLO_42/.test(driven.stdout || ''),
             'real reverse-worker shim + unmodified term-drive.mjs round-trip a shell echo');
         try { shim.kill('SIGTERM'); } catch (_) {}
+        await sleep(150);
+
+        const graceShim = spawn(process.execPath, [
+            path.join(packageDir, 'scripts', 'reverse-worker.mjs'),
+            '--url', `ws://127.0.0.1:${PORT}/worker`,
+            '--token-file', workerTokenFile,
+            '--name', 'grace-box',
+            '--surfaces', 'term',
+            '--cmds', 'shell',
+            '--cwd', process.env.BROKER_WORKSPACE,
+            '--grace-ms', '150',
+        ], { cwd: packageDir, stdio: ['ignore', 'pipe', 'pipe'] });
+        await new Promise((resolve, reject) => {
+            const timer = setTimeout(() => reject(new Error('grace shim welcome timeout')), 5000);
+            graceShim.stderr.on('data', (d) => {
+                if (/welcome/.test(d.toString())) { clearTimeout(timer); resolve(); }
+            });
+            graceShim.on('error', reject);
+        });
+        const graceTerm = await connectController('/term');
+        await graceTerm.first;
+        const graceStarted = collectUntil(graceTerm.ws, (m) => m.kind === 'started');
+        graceTerm.ws.send(JSON.stringify({ type: 'start', cmd: 'shell', cols: 80, rows: 24 }));
+        await graceStarted;
+        try { graceTerm.ws.close(); } catch (_) {}
+        await sleep(400);
+        const graceTerm2 = await connectController('/term');
+        await graceTerm2.first;
+        const graceStarted2 = collectUntil(graceTerm2.ws, (m) => m.kind === 'started');
+        graceTerm2.ws.send(JSON.stringify({ type: 'start', cmd: 'shell', cols: 80, rows: 24 }));
+        const afterGrace = await graceStarted2;
+        ok(afterGrace.some(m => m.kind === 'started' && m.via === 'grace-box' && m.reattached !== true),
+            'expired term grace does not reattach a controller that disconnected');
+        try { graceTerm2.ws.close(); } catch (_) {}
+        try { graceShim.kill('SIGTERM'); } catch (_) {}
+        await sleep(200);
+
+        const localTerm = await connectController('/term');
+        await localTerm.first;
+        const localStarted = collectUntil(localTerm.ws, (m) => m.kind === 'started');
+        localTerm.ws.send(JSON.stringify({ type: 'start', cmd: 'shell', cols: 80, rows: 24 }));
+        const localGot = await localStarted;
+        ok(localGot.some(m => m.kind === 'started' && m.via === undefined),
+            'with no worker, /term start stays on the local PTY');
+        const sneak = await connectWorker({
+            name: 'sneak-box',
+            capabilities: { surfaces: ['term'], cmds: ['shell'] },
+        });
+        await sneak.welcome;
+        let sneakStart = false;
+        sneak.ws.on('message', (buf) => {
+            let msg; try { msg = JSON.parse(buf.toString()); } catch { return; }
+            if (msg.type === 'start') sneakStart = true;
+        });
+        const localReattach = collectUntil(localTerm.ws, (m) => m.kind === 'started');
+        localTerm.ws.send(JSON.stringify({ type: 'start', cmd: 'shell', cols: 80, rows: 24 }));
+        const reattachGot = await localReattach;
+        ok(reattachGot.some(m => m.kind === 'started' && m.reattached === true && m.via === undefined) && !sneakStart,
+            'a later worker does not steal an already-running local PTY');
+        try { localTerm.ws.close(); } catch (_) {}
+        try { sneak.ws.close(); } catch (_) {}
+        await sleep(100);
+        if (termBridge.running()) termBridge.stop();
     } catch (e) {
         console.log('  ✗ real shim error: ' + (e.stack || e));
         failed++;
     }
 } else {
     console.log('\nReal shim + term-drive — skipped (node-pty not installed)\n');
+}
+
+console.log('\nWorker-link loss kills /agent children\n');
+try {
+    const binDir = path.join(testRoot, 'fake-bin');
+    fs.mkdirSync(binDir, { recursive: true });
+    const pidFile = path.join(testRoot, 'fake-claude.pid');
+    fs.writeFileSync(path.join(binDir, 'claude'), `#!/bin/sh\necho $$ > '${pidFile}'\nexec sleep 60\n`, { mode: 0o755 });
+    const killShim = spawn(process.execPath, [
+        path.join(packageDir, 'scripts', 'reverse-worker.mjs'),
+        '--url', `ws://127.0.0.1:${PORT}/worker`,
+        '--token-file', workerTokenFile,
+        '--name', 'kill-box',
+        '--surfaces', 'agent',
+        '--agents', 'claude',
+        '--cwd', process.env.BROKER_WORKSPACE,
+    ], {
+        cwd: packageDir,
+        env: { ...process.env, PATH: `${binDir}${path.delimiter}${process.env.PATH || ''}` },
+        stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    await new Promise((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error('kill shim welcome timeout')), 5000);
+        killShim.stderr.on('data', (d) => {
+            if (/welcome/.test(d.toString())) { clearTimeout(timer); resolve(); }
+        });
+        killShim.on('error', reject);
+    });
+    const killer = await connectController('/agent');
+    await killer.first;
+    const killStarted = collectUntil(killer.ws, (m) => m.kind === 'started');
+    killer.ws.send(JSON.stringify({ type: 'start', agent: 'claude' }));
+    await killStarted;
+    const waitPid = Date.now() + 4000;
+    while (!fs.existsSync(pidFile) && Date.now() < waitPid) await sleep(30);
+    const pid = fs.existsSync(pidFile) ? Number(fs.readFileSync(pidFile, 'utf8').trim()) : 0;
+    const pidAlive = (p) => { try { process.kill(p, 0); return true; } catch { return false; } };
+    ok(pid > 0 && pidAlive(pid), 'fake claude child is running after reverse start');
+    const registered = reverseWorkerHub._workers.get('kill-box');
+    try { registered.ws.close(); } catch (_) {}
+    const deadDeadline = Date.now() + 3000;
+    while (pid > 0 && pidAlive(pid) && Date.now() < deadDeadline) await sleep(30);
+    ok(pid > 0 && !pidAlive(pid), 'worker-link loss kills the /agent child');
+    try { killer.ws.close(); } catch (_) {}
+    try { killShim.kill('SIGTERM'); } catch (_) {}
+} catch (e) {
+    console.log('  ✗ agent-kill-on-disconnect error: ' + (e.stack || e));
+    failed++;
 }
 
 ok(reverseWorkerHub.enabled === true, 'imported broker exposed the reverse-worker hub');

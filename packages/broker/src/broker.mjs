@@ -879,13 +879,16 @@ agentWss.on('connection', (ws) => {
         }
         if (!authed) return;
         if (msg.type === 'start') {
-            if (!reverseWorkerHub.tryStart('agent', ws, msg)) agentBridge.start(ws, msg.agent || 'claude');
+            const localActive = agentBridge.running() || !!(agentBridge.name && agentBridge.ws === ws);
+            if (localActive || !reverseWorkerHub.tryStart('agent', ws, msg)) agentBridge.start(ws, msg.agent || 'claude');
         } else if (msg.type === 'input') {
-            if (!reverseWorkerHub.tryRelay('agent', ws, { type: 'input', text: String(msg.text || '') })) {
+            const localActive = agentBridge.running() || !!(agentBridge.name && agentBridge.ws === ws);
+            if (localActive || !reverseWorkerHub.tryRelay('agent', ws, { type: 'input', text: String(msg.text || '') })) {
                 if (!agentBridge.input(String(msg.text || ''))) sendWsJson(ws, { type: 'agent', kind: 'error', text: 'no agent running' }, MAX_AGENT_BUFFER_BYTES);
             }
         } else if (msg.type === 'stop') {
-            if (!reverseWorkerHub.tryStop('agent', ws)) agentBridge.stop();
+            const localActive = agentBridge.running() || !!(agentBridge.name && agentBridge.ws === ws);
+            if (localActive || !reverseWorkerHub.tryStop('agent', ws)) agentBridge.stop();
         }
     });
     ws.on('close', () => {
@@ -917,13 +920,13 @@ termWss.on('connection', (ws) => {
         }
         if (!authed) return;
         if (msg.type === 'start') {
-            if (!reverseWorkerHub.tryStart('term', ws, msg)) termBridge.start(ws, { cmd: msg.cmd, cols: msg.cols, rows: msg.rows });
+            if (termBridge.running() || !reverseWorkerHub.tryStart('term', ws, msg)) termBridge.start(ws, { cmd: msg.cmd, cols: msg.cols, rows: msg.rows });
         } else if (msg.type === 'input') {
-            if (!reverseWorkerHub.tryRelay('term', ws, { type: 'input', data: String(msg.data || '') })) termBridge.input(String(msg.data || ''));
+            if (termBridge.running() || !reverseWorkerHub.tryRelay('term', ws, { type: 'input', data: String(msg.data || '') })) termBridge.input(String(msg.data || ''));
         } else if (msg.type === 'resize') {
-            if (!reverseWorkerHub.tryRelay('term', ws, { type: 'resize', cols: msg.cols, rows: msg.rows })) termBridge.resize(msg.cols, msg.rows);
+            if (termBridge.running() || !reverseWorkerHub.tryRelay('term', ws, { type: 'resize', cols: msg.cols, rows: msg.rows })) termBridge.resize(msg.cols, msg.rows);
         } else if (msg.type === 'stop') {
-            if (!reverseWorkerHub.tryStop('term', ws)) termBridge.stop();
+            if (termBridge.running() || !reverseWorkerHub.tryStop('term', ws)) termBridge.stop();
         }
     });
     ws.on('close', () => {

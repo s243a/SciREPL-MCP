@@ -134,12 +134,16 @@ To restrict this to Claude and Codex without a shell fallback, add
 launcher. A later `--repair` may replace edited generated launchers after making
 a timestamped backup.
 
-Relay `/agent` and `/term` to a worker that dials out (no local spawn implied):
+Relay `/agent` and `/term` to a worker that dials out (no local spawn implied).
+Setup writes enrollment material; copy `worker-token` to another host or
+account and run the shim there. Do not launch a worker beside `broker-token`
+if credential attenuation matters.
 
 ```bash
 ./setup-broker.sh \
   --enable-reverse-worker \
   --acknowledge-reverse-worker-command-relay
 ~/scirepl-broker/start-broker.sh
-~/scirepl-broker/start-reverse-worker.sh
+# then, on another host/account, following worker-enroll.txt:
+# node reverse-worker.mjs --url ws://HOST:PORT/worker --token-file worker-token ...
 ```

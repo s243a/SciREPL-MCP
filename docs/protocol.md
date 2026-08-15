@@ -144,8 +144,10 @@ instead of falling through to local spawn.
 Disabled unless `BROKER_REVERSE_WORKER=1`. A worker authenticates with a
 **worker** credential distinct from the controller pairing token, registers a
 name and advertised CLIs, and then receives the same `start` / `input` /
-`resize` / `stop` commands controllers already send on `/term` and `/agent`.
-It replies with the same `{"type":"term"|"agent","kind":...}` events. The
+`resize` / `stop` commands controllers already send on `/term` and `/agent`,
+plus hub-only `detach` on `/term` so the worker can start reconnect grace.
+A second authenticated `hello` on the same socket is an error. The worker
+replies with the same `{"type":"term"|"agent","kind":...}` events. The
 authoritative topology, credential attenuation, reconnect, failure, and
 security design is [Reverse-worker mode](reverse-worker.md).
 

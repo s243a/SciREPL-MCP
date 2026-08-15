@@ -58,6 +58,12 @@ export function defaultWorkerTokenFile() {
     return process.env.BROKER_WORKER_TOKEN_FILE || path.join(os.homedir(), 'scirepl-broker', 'worker-token');
 }
 
+export function workerWebSocketUrl(host, port, pathname = '/worker') {
+    const dial = host === '0.0.0.0' || host === '::' ? '127.0.0.1' : String(host || '');
+    const hostname = dial.includes(':') ? `[${dial}]` : dial;
+    return `ws://${hostname}:${port}${pathname}`;
+}
+
 export function loadWorkerToken({ controllerToken, env = process.env } = {}) {
     if (typeof controllerToken !== 'string' || !controllerToken) {
         throw new Error('reverse-worker mode requires a controller pairing token so the worker credential can be distinct from it');
@@ -143,6 +149,7 @@ export function controllerCommand(surface, msg) {
         if (msg.type === 'input') return { type: 'input', surface, data: String(msg.data || '') };
         if (msg.type === 'resize') return { type: 'resize', surface, cols: msg.cols, rows: msg.rows };
         if (msg.type === 'stop') return { type: 'stop', surface };
+        if (msg.type === 'detach') return { type: 'detach', surface };
     }
     if (surface === 'agent') {
         if (msg.type === 'start') return { type: 'start', surface, agent: msg.agent };
@@ -261,6 +268,13 @@ export function createReverseWorkerHub({
         sessions[surface] = null;
     }
 
+    function workerHandles(worker, surface, requested) {
+        if (!worker || !socketOpen(worker.ws)) return false;
+        if (!worker.capabilities.surfaces.includes(surface)) return false;
+        const list = surface === 'term' ? worker.capabilities.cmds : worker.capabilities.agents;
+        return list.includes(requested);
+    }
+
     function register(ws, parsed) {
         const next = {
             ws,
@@ -309,6 +323,14 @@ export function createReverseWorkerHub({
         const { via: _ignored, ...rest } = msg;
         const outbound = rest.kind === 'started' ? { ...rest, via: worker.name } : rest;
         sendController(session, outbound);
+        if (rest.kind === 'started') {
+            const reattach = !!(rest.reattached || rest.reused);
+            if (surface === 'term') {
+                audit(`term '${rest.cmd || session.requested}' ${reattach ? 'reattached' : 'started'} via worker '${worker.name}'`);
+            } else {
+                audit(`agent '${rest.text || session.requested}' ${reattach ? 'reused' : 'ready'} via worker '${worker.name}'`);
+            }
+        }
         if (surface === 'term' && rest.kind === 'exit') sessions.term = null;
     }
 
@@ -329,6 +351,10 @@ export function createReverseWorkerHub({
                 let msg;
                 try { msg = JSON.parse(buf.toString()); } catch { return; }
                 if (msg.type === 'hello') {
+                    if (authed) {
+                        sendJson(ws, { type: 'error', error: 'already authenticated' }, maxPayloadBytes);
+                        return;
+                    }
                     if (!secretMatches(msg.token, workerToken)) {
                         sendJson(ws, { type: 'error', error: 'unauthorized' }, maxPayloadBytes);
                         try { ws.close(1008, 'unauthorized'); } catch (_) {}
@@ -354,20 +380,43 @@ export function createReverseWorkerHub({
         });
     }
 
+    function auditRequested(surface, requested, workerName) {
+        if (surface === 'term') audit(`term '${requested}' start requested via worker '${workerName}'`);
+        else audit(`agent '${requested}' start requested via worker '${workerName}'`);
+    }
+
+    function auditStopped(surface, requested, workerName) {
+        if (surface === 'term') audit(`term '${requested}' stopped via worker '${workerName}'`);
+        else audit(`agent '${requested}' stopped via worker '${workerName}'`);
+    }
+
+    function bindAndStart(surface, controllerWs, msg, worker, requested) {
+        sessions[surface] = { worker, workerName: worker.name, controllerWs, requested };
+        auditRequested(surface, requested, worker.name);
+        const command = controllerCommand(surface, { ...msg, type: 'start' });
+        if (command) forwardToWorker(worker, command);
+        return true;
+    }
+
     function tryStart(surface, controllerWs, msg) {
         if (!enabled) return false;
         const requested = surface === 'term'
             ? String(msg.cmd || 'shell').trim()
             : String(msg.agent || 'claude').trim();
         const existing = sessions[surface];
-        if (existing && existing.worker && socketOpen(existing.worker.ws)) {
-            existing.controllerWs = controllerWs;
-            const command = controllerCommand(surface, msg);
-            if (command) forwardToWorker(existing.worker, command);
-            return true;
-        }
-        if (existing && existing.worker && !socketOpen(existing.worker.ws)) {
-            dropSession(surface, { notify: false });
+        if (existing) {
+            if (existing.requested === requested && workerHandles(existing.worker, surface, requested)) {
+                existing.controllerWs = controllerWs;
+                auditRequested(surface, requested, existing.workerName || existing.worker.name);
+                const command = controllerCommand(surface, { ...msg, type: 'start' });
+                if (command) forwardToWorker(existing.worker, command);
+                return true;
+            }
+            if (existing.worker && socketOpen(existing.worker.ws)) {
+                forwardToWorker(existing.worker, { type: 'stop', surface });
+            }
+            auditStopped(surface, existing.requested, existing.workerName);
+            sessions[surface] = null;
         }
         const worker = findWorker(surface, requested);
         if (!worker) {
@@ -380,12 +429,7 @@ export function createReverseWorkerHub({
             }
             return false;
         }
-        sessions[surface] = { worker, workerName: worker.name, controllerWs, requested };
-        if (surface === 'term') audit(`term '${requested}' started via worker '${worker.name}'`);
-        else audit(`agent '${requested}' ready via worker '${worker.name}'`);
-        const command = controllerCommand(surface, { ...msg, type: 'start' });
-        if (command) forwardToWorker(worker, command);
-        return true;
+        return bindAndStart(surface, controllerWs, msg, worker, requested);
     }
 
     function tryRelay(surface, controllerWs, msg) {
@@ -403,7 +447,16 @@ export function createReverseWorkerHub({
     }
 
     function tryStop(surface, controllerWs) {
-        return tryRelay(surface, controllerWs, { type: 'stop' });
+        if (!enabled) return false;
+        const session = sessions[surface];
+        if (!session) return false;
+        session.controllerWs = controllerWs;
+        if (session.worker && socketOpen(session.worker.ws)) {
+            forwardToWorker(session.worker, { type: 'stop', surface });
+        }
+        auditStopped(surface, session.requested, session.workerName);
+        sessions[surface] = null;
+        return true;
     }
 
     function detach(surface, controllerWs) {
@@ -414,8 +467,12 @@ export function createReverseWorkerHub({
             if (session.worker && socketOpen(session.worker.ws)) {
                 forwardToWorker(session.worker, { type: 'stop', surface: 'agent' });
             }
+            auditStopped(surface, session.requested, session.workerName);
             sessions.agent = null;
             return true;
+        }
+        if (session.worker && socketOpen(session.worker.ws)) {
+            forwardToWorker(session.worker, { type: 'detach', surface: 'term' });
         }
         session.controllerWs = null;
         return true;

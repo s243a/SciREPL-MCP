@@ -6,6 +6,7 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { prepareNodePty } from '../src/node-pty-support.mjs';
+import { workerWebSocketUrl } from '../src/reverse-worker.mjs';
 import { preflightWorkspace, randomToken, setupWorkspace, targetState, writePrivateFile } from '../src/workspace.mjs';
 
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
@@ -42,7 +43,9 @@ Options:
 
 The setup command never prints the pairing token. It creates launchers which
 read the token from a private file. Active agent instructions are generated only
-when --enable-agent is supplied with its acknowledgement.`);
+when --enable-agent is supplied with its acknowledgement. Reverse-worker setup
+writes enrollment material (worker-token plus worker-enroll.txt); it does not
+install a same-host worker beside broker-token.`);
 }
 
 function parseArgs(argv) {
@@ -198,32 +201,42 @@ function setupManifest(options, files) {
     }, null, 2) + '\n';
 }
 
-function workerDialHost(host) {
-    return host === '0.0.0.0' || host === '::' ? '127.0.0.1' : host;
-}
-
-function bashWorkerLauncher(options, workerTokenFile) {
-    const host = workerDialHost(options.host);
-    const url = `ws://${host}:${options.port}/worker`;
+function workerEnrollment(options, workerTokenFile) {
+    const url = workerWebSocketUrl(options.host, options.port);
     const shim = path.join(PACKAGE_DIR, 'scripts', 'reverse-worker.mjs');
     return [
-        '#!/usr/bin/env bash',
-        'set -euo pipefail',
-        `exec ${shQuote(process.execPath)} ${shQuote(shim)} --url ${shQuote(url)} --token-file ${shQuote(workerTokenFile)} --name worker --surfaces term,agent --cmds shell,claude,codex,gemini,agy --agents claude,codex,gemini,agy --cwd ${shQuote(path.join(options.output, 'workspace'))}`,
+        'SciREPL reverse-worker enrollment',
+        '=================================',
+        '',
+        'This broker accepts outbound workers on /worker. Setup created a worker',
+        'token distinct from the controller pairing token at:',
+        '',
+        `  ${workerTokenFile}`,
+        '',
+        'Copy that file to another account, container, or host, then install and',
+        'run the worker shim there. Do not run the shim as the same OS user that',
+        'runs this broker if you need the worker token to stay weaker than the',
+        'pairing token: a commanded shell or agent on this host can read',
+        'broker-token from this directory and collapse that attenuation.',
+        '',
+        'Worker installation is separate and capability-specific. Advertise only',
+        'CLIs this worker host actually has. Terminal support requires node-pty',
+        'on the worker host; omit term from --surfaces until that dependency is',
+        'installed and verified there.',
+        '',
+        'Example (run elsewhere, after copying worker-token):',
+        '',
+        `  ${process.execPath} ${shim} \\`,
+        `    --url ${url} \\`,
+        '    --token-file /path/on/worker/worker-token \\',
+        '    --name worker \\',
+        '    --surfaces agent \\',
+        '    --agents agy \\',
+        '    --cwd /path/to/target-repo',
+        '',
+        'IPv6 URLs must bracket the host, for example ws://[::1]:8087/worker.',
         '',
     ].join('\n');
-}
-
-function powerShellWorkerLauncher(options, workerTokenFile) {
-    const host = workerDialHost(options.host);
-    const url = `ws://${host}:${options.port}/worker`;
-    const shim = path.join(PACKAGE_DIR, 'scripts', 'reverse-worker.mjs');
-    return [
-        "$ErrorActionPreference = 'Stop'",
-        `& ${psQuote(process.execPath)} ${psQuote(shim)} --url ${psQuote(url)} --token-file ${psQuote(workerTokenFile)} --name worker --surfaces term,agent --cmds shell,claude,codex,gemini,agy --agents claude,codex,gemini,agy --cwd ${psQuote(path.join(options.output, 'workspace'))}`,
-        'exit $LASTEXITCODE',
-        '',
-    ].join('\r\n');
 }
 
 function generatedTargets(options, env) {
@@ -232,8 +245,7 @@ function generatedTargets(options, env) {
         ['Start-Broker.ps1', powerShellLauncher(env)],
     ];
     if (options.enableReverseWorker) {
-        definitions.push(['start-reverse-worker.sh', bashWorkerLauncher(options, options.workerTokenFile)]);
-        definitions.push(['Start-Reverse-Worker.ps1', powerShellWorkerLauncher(options, options.workerTokenFile)]);
+        definitions.push(['worker-enroll.txt', workerEnrollment(options, options.workerTokenFile)]);
     }
     definitions.push([SETUP_MARKER, setupManifest(options, definitions.map(([rel]) => rel))]);
     return definitions.map(([rel, content]) => ({
@@ -396,7 +408,7 @@ function main() {
                 throw new Error('worker token must be distinct from the pairing token; replace worker-token and rerun');
             }
         }
-        if (options.enableTerminal || options.enableReverseWorker) {
+        if (options.enableTerminal) {
             fs.mkdirSync(workspace, { recursive: true, mode: 0o700 });
             try { fs.chmodSync(workspace, 0o700); } catch (_) {}
         }
@@ -410,11 +422,15 @@ function main() {
     console.log(`[setup] broker: ${options.host}:${options.port} (${isLoopbackHost(options.host) ? 'loopback' : 'non-loopback — no transport verification is enforced'})`);
     console.log(`[setup] agent: ${options.enableAgent ? 'enabled with an explicit session workspace' : 'disabled'}`);
     console.log(`[setup] terminal: ${options.enableTerminal ? 'enabled' : 'disabled'}`);
-    console.log(`[setup] reverse worker: ${options.enableReverseWorker ? 'enabled (command relay; worker token stored privately)' : 'disabled'}`);
+    console.log(`[setup] reverse worker: ${options.enableReverseWorker ? 'enabled (command relay; worker token stored privately; install the shim on another account/host)' : 'disabled'}`);
     if (workspaceResult) console.log(`[setup] agent context: ${workspaceResult.created.length} created, ${workspaceResult.updated.length} repaired`);
     if (!options.dryRun) {
         console.log(`[setup] start with ${process.platform === 'win32' ? path.join(options.output, 'Start-Broker.ps1') : path.join(options.output, 'start-broker.sh')}`);
         console.log(`[setup] pairing token stored privately at ${tokenFile} (not printed)`);
+        if (options.enableReverseWorker) {
+            console.log(`[setup] reverse-worker enrollment written to ${path.join(options.output, 'worker-enroll.txt')}`);
+            console.log('[setup] copy worker-token to another host or account; do not run the shim beside broker-token');
+        }
         if (isLoopbackHost(options.host)) {
             console.log(`[setup] Android remote access: configure Tailscale separately with: tailscale serve --bg localhost:${options.port}`);
             console.log('[setup] Desktop MCP alternative: use an SSH local-forward; the Android app does not create that tunnel.');

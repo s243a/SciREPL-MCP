@@ -42,6 +42,7 @@ const AGENTS = csv('agents', SURFACES.includes('agent') ? 'claude,codex,gemini,a
 const CWD = path.resolve(arg('cwd', process.cwd()));
 const GRACE_MS = Number(arg('grace-ms', 600000));
 const MAX_AGENT_BUFFER_BYTES = Number(arg('max-agent-buffer-bytes', 1048576));
+const MAX_OUTBOUND_BUFFERED_BYTES = Number(arg('max-outbound-buffered-bytes', 1048576));
 const TERM_SHELL = process.env.SHELL || 'bash';
 const TERM_NO_SHELL = has('no-shell') || process.env.BROKER_TERM_NO_SHELL === '1';
 const USE_API_KEY = has('use-api-key') || process.env.BROKER_AGENT_USE_API_KEY === '1';
@@ -130,6 +131,10 @@ let send = () => false;
 
 function sendJson(ws, payload) {
     if (!ws || ws.readyState !== 1) return false;
+    if (ws.bufferedAmount > MAX_OUTBOUND_BUFFERED_BYTES) {
+        try { ws.close(1013, 'outbound backpressure limit'); } catch (_) {}
+        return false;
+    }
     try { ws.send(JSON.stringify(payload)); return true; } catch { return false; }
 }
 
@@ -356,6 +361,14 @@ function stopAgent() {
     if (agent.child) { try { agent.child.kill('SIGTERM'); } catch (_) {} agent.child = null; }
 }
 
+function resetAgent() {
+    stopAgent();
+    agent.profile = null;
+    agent.name = null;
+    agent.mode = null;
+    agent.buf = '';
+}
+
 function sessionClaim() {
     return {
         term: { live: !!term.pty, cmd: term.label || undefined },
@@ -370,6 +383,7 @@ async function handleCommand(msg) {
         else if (msg.type === 'input') inputTerm(String(msg.data || ''));
         else if (msg.type === 'resize') resizeTerm(msg.cols, msg.rows);
         else if (msg.type === 'stop') stopTerm();
+        else if (msg.type === 'detach') parkTerm();
         return;
     }
     if (msg.surface === 'agent') {
@@ -393,10 +407,12 @@ function connectOnce() {
     return new Promise((resolve, reject) => {
         const ws = new WebSocket(url);
         let settled = false;
+        let welcomed = false;
         const done = (err) => {
             if (settled) return;
             settled = true;
             parkTerm();
+            resetAgent();
             if (err) reject(err); else resolve();
         };
         ws.on('open', () => {
@@ -404,11 +420,14 @@ function connectOnce() {
             sendJson(ws, helloPayload());
         });
         ws.on('error', (e) => done(e));
-        ws.on('close', (code, reason) => done(new Error(`ws closed (${code}) ${reason || ''}`)));
+        ws.on('close', (code, reason) => {
+            if (welcomed) done();
+            else done(new Error(`ws closed (${code}) ${reason || ''}`));
+        });
         ws.on('message', (buf) => {
             let msg; try { msg = JSON.parse(buf.toString()); } catch { return; }
             if (msg.type === 'welcome') {
-                if (term.grace) { clearTimeout(term.grace); term.grace = null; }
+                welcomed = true;
                 console.error(`[reverse-worker] welcome name=${msg.name || NAME}`);
                 return;
             }
@@ -442,7 +461,7 @@ async function main() {
 function shutdown() {
     stopping = true;
     stopTerm();
-    stopAgent();
+    resetAgent();
     process.exit(0);
 }
 

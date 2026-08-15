@@ -108,7 +108,7 @@ if (process.platform !== 'win32') {
     const reverse = path.join(testRoot, 'reverse');
     const reverseRun = run('--output', reverse, '--no-install', '--enable-reverse-worker', '--acknowledge-reverse-worker-command-relay');
     const reverseLauncher = reverseRun.status === 0 ? fs.readFileSync(path.join(reverse, 'start-broker.sh'), 'utf8') : '';
-    const reverseWorkerLauncher = reverseRun.status === 0 ? fs.readFileSync(path.join(reverse, 'start-reverse-worker.sh'), 'utf8') : '';
+    const reverseEnroll = reverseRun.status === 0 ? fs.readFileSync(path.join(reverse, 'worker-enroll.txt'), 'utf8') : '';
     const reverseToken = reverseRun.status === 0 ? fs.readFileSync(path.join(reverse, 'broker-token'), 'utf8').trim() : '';
     const reverseWorkerToken = reverseRun.status === 0 ? fs.readFileSync(path.join(reverse, 'worker-token'), 'utf8').trim() : '';
     ok(reverseRun.status === 0 && /BROKER_REVERSE_WORKER='1'/.test(reverseLauncher) &&
@@ -116,8 +116,19 @@ if (process.platform !== 'win32') {
         !reverseLauncher.includes('BROKER_AGENT=') &&
         reverseWorkerToken && reverseWorkerToken !== reverseToken &&
         /^[0-9a-f]{32}$/.test(reverseWorkerToken) &&
-        reverseWorkerLauncher.includes('reverse-worker.mjs') && !reverseWorkerLauncher.includes(reverseWorkerToken),
-        'acknowledged reverse-worker setup writes a distinct worker token and launchers that never embed it');
+        reverseEnroll.includes('reverse-worker.mjs') && reverseEnroll.includes('another account') &&
+        !reverseEnroll.includes(reverseWorkerToken) &&
+        !fs.existsSync(path.join(reverse, 'start-reverse-worker.sh')) &&
+        !fs.existsSync(path.join(reverse, 'Start-Reverse-Worker.ps1')) &&
+        !fs.existsSync(path.join(reverse, 'workspace')),
+        'acknowledged reverse-worker setup writes enrollment material, not a same-host worker launcher');
+
+    const ipv6 = path.join(testRoot, 'ipv6');
+    const ipv6Run = run('--output', ipv6, '--no-install', '--host', '::1',
+        '--enable-reverse-worker', '--acknowledge-reverse-worker-command-relay');
+    const ipv6Enroll = ipv6Run.status === 0 ? fs.readFileSync(path.join(ipv6, 'worker-enroll.txt'), 'utf8') : '';
+    ok(ipv6Run.status === 0 && ipv6Enroll.includes('ws://[::1]:') && !ipv6Enroll.includes('ws://::1:'),
+        'enrollment brackets IPv6 loopback in the worker URL');
 }
 
 const dangerous = run('--output', path.join(repoDir, 'generated-setup'), '--no-install');

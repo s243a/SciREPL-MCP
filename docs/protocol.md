@@ -30,6 +30,9 @@ not expose tool definitions, notebook data, tokens, or host paths.
 files and backs up/replaces stale ones only when the broker was started with
 `BROKER_MANAGE_WORKSPACE=1`, which the explicit agent setup launcher supplies.
 Ordinary broker startup never seeds agent instructions or provider settings.
+Managed settings include Antigravity's workspace-local
+`.agents/mcp_config.json`; GET reports it like any other managed file, while
+POST is required to create or repair it.
 
 ## App bridge (`/app`)
 

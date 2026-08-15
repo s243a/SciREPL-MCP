@@ -27,6 +27,7 @@ import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { ListToolsRequestSchema, CallToolRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import { inspectWorkspace, setupWorkspace, writePrivateFile } from './workspace.mjs';
+import { configureUtf8Pipes, truncateCodePoints } from './utf8-pipes.mjs';
 import { createWorkbookFileTransfer } from './workbook-files.mjs';
 
 const PACKAGE_METADATA = JSON.parse(fs.readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
@@ -418,6 +419,7 @@ const agentBridge = {
         } catch (e) {
             sendWsJson(ws, { type: 'agent', kind: 'error', text: `spawn failed: ${e.message}` }, MAX_AGENT_BUFFER_BYTES); return;
         }
+        configureUtf8Pipes(child);
         this.ws = ws; this.child = child; this.profile = prof; this.name = name; this.buf = '';
         const send = (m) => this.ws === ws && sendWsJson(ws, { type: 'agent', ...m }, MAX_AGENT_BUFFER_BYTES);
         // spawn() reports command-not-found and similar launch failures through
@@ -430,7 +432,7 @@ const agentBridge = {
         });
         child.stdout.on('data', (d) => {
             if (this.child !== child) return;
-            const chunk = d.toString();
+            const chunk = d;
             if (Buffer.byteLength(this.buf) + Buffer.byteLength(chunk) > MAX_AGENT_BUFFER_BYTES) {
                 this.child = null;
                 try { child.kill('SIGTERM'); } catch (_) {}
@@ -449,7 +451,7 @@ const agentBridge = {
                 if (n) send(n);
             }
         });
-        child.stderr.on('data', (d) => send({ kind: 'stderr', text: d.toString().slice(0, 500) }));
+        child.stderr.on('data', (d) => send({ kind: 'stderr', text: truncateCodePoints(d, 500) }));
         child.on('exit', (code) => { if (this.child === child) { this.child = null; send({ kind: 'exit', code }); } });
         send({ kind: 'started', text: name, experimental: !!prof.experimental, resumed: !!resume });
         console.log(`[broker] agent '${name}' launch requested${child.pid ? ' (pid ' + child.pid + ')' : ''}${resume ? ' [resumed ' + resume.slice(0, 8) + ']' : ''}`);
@@ -469,6 +471,7 @@ const agentBridge = {
         let child;
         try { child = spawn(prof.cmd, prof.buildArgs(text, this.sessionId), { env: spawnEnv(), cwd: AGENT_CWD, stdio: ['ignore', 'pipe', 'pipe'] }); }
         catch (e) { send({ kind: 'error', text: 'spawn failed: ' + (e.message || e) }); send({ kind: 'result', text: '' }); return false; }
+        configureUtf8Pipes(child);
         this.child = child; this.buf = ''; let sawResult = false;
         child.once('error', (e) => {
             if (this.child !== child) return;
@@ -481,7 +484,7 @@ const agentBridge = {
             // answer, emit it on exit, and remember to --continue next turn.
             child.stdout.on('data', (d) => {
                 if (this.child !== child) return;
-                const chunk = d.toString();
+                const chunk = d;
                 if (Buffer.byteLength(this.buf) + Buffer.byteLength(chunk) > MAX_AGENT_BUFFER_BYTES) {
                     this.child = null;
                     try { child.kill('SIGTERM'); } catch (_) {}
@@ -491,7 +494,7 @@ const agentBridge = {
                 }
                 this.buf += chunk;
             });
-            child.stderr.on('data', (d) => send({ kind: 'stderr', text: d.toString().slice(0, 500) }));
+            child.stderr.on('data', (d) => send({ kind: 'stderr', text: truncateCodePoints(d, 500) }));
             child.on('exit', (code) => {
                 if (this.child !== child) return;
                 this.child = null;
@@ -504,7 +507,7 @@ const agentBridge = {
         }
         child.stdout.on('data', (d) => {
             if (this.child !== child) return;
-            const chunk = d.toString();
+            const chunk = d;
             if (Buffer.byteLength(this.buf) + Buffer.byteLength(chunk) > MAX_AGENT_BUFFER_BYTES) {
                 this.child = null;
                 try { child.kill('SIGTERM'); } catch (_) {}
@@ -522,7 +525,7 @@ const agentBridge = {
                 const n = prof.normalize(o); if (n) { if (n.kind === 'result') sawResult = true; send(n); }
             }
         });
-        child.stderr.on('data', (d) => send({ kind: 'stderr', text: d.toString().slice(0, 500) }));
+        child.stderr.on('data', (d) => send({ kind: 'stderr', text: truncateCodePoints(d, 500) }));
         child.on('exit', (code) => { if (this.child === child) { this.child = null; if (!sawResult) send(code ? { kind: 'error', text: `${this.name} exited (${code})` } : { kind: 'result', text: '' }); } });
         return true;
     },

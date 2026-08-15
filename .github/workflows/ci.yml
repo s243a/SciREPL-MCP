@@ -34,6 +34,7 @@ jobs:
       - run: npm run test:broker
       - run: npm run test:workbook
       - run: npm run test:missing-agent
+      - run: npm run test:utf8-agent
 
   broker-terminal:
     strategy:

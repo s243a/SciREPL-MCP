@@ -107,6 +107,13 @@ dedicated workspace. Without a current generated workspace or the explicit
 unmanaged bypass, `/agent` refuses to launch a CLI. See
 [Agent context and session workspace](agent-context.md).
 
+For Antigravity/Agy, the managed workspace includes
+`.agents/mcp_config.json` with `mcpServers.scirepl.serverUrl` and a literal
+Authorization header. This provider does not use Gemini CLI's `url` field for
+that file. Missing, edited, or loosely permissioned copies make the generated
+workspace stale until an explicit setup repair or authenticated doctor repair
+is approved.
+
 `/agent` is a structured non-PTY transport. Prompts and MCP notebook tools can
 work without terminal support, but terminal-only behaviour such as `!ls`,
 interactive slash commands, key-driven prompts, and full-screen TUIs requires

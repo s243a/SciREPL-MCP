@@ -13,20 +13,74 @@ Configuration is read from environment variables when the broker starts.
 | `BROKER_CALL_TIMEOUT_MS` | `120000` | Timeout for an app-side notebook tool call. |
 | `BROKER_MAX_PENDING_CALLS` | `32` | Maximum concurrent calls awaiting the app. |
 | `BROKER_MAX_HTTP_BODY_BYTES` | `1048576` | Maximum `/mcp` JSON request body. |
-| `BROKER_MAX_APP_WS_PAYLOAD_BYTES` | `16777216` | Maximum `/app` message payload. This larger cap accommodates base64 plots and file results. |
+| `BROKER_MAX_APP_WS_PAYLOAD_BYTES` | `16777216` | Maximum `/app` message payload. Workbook file transfer requires at least `42008576` bytes because the app's fixed 8 MiB content cap can expand under nested JSON escaping. |
+| `BROKER_WORKBOOK_IO_CONFIG` | unset | Absolute path to the immutable workbook file-transfer allowlist. Unset disables both broker-owned workbook file tools. |
 | `BROKER_MAX_AGENT_WS_PAYLOAD_BYTES` | `1048576` | Maximum inbound `/agent` message payload. |
 | `BROKER_MAX_TERM_WS_PAYLOAD_BYTES` | `1048576` | Maximum inbound `/term` message payload. |
 | `BROKER_MAX_WS_CONNECTIONS` | `4` | Connection cap for each WebSocket endpoint. |
 | `BROKER_WS_AUTH_TIMEOUT_MS` | `5000` | Time allowed for a WebSocket client to send an authenticated hello. |
 
-### Planned workbook file configuration
+### Workbook file configuration
 
-`BROKER_WORKBOOK_IO_CONFIG` is reserved by the workbook file-transfer design for
-an absolute, immutable-at-runtime JSON allowlist. It is **not read by the current
-broker**, and setting it does not enable any tools yet. The proposed file format,
-8 MiB maximum, private placement, cross-platform path rules, and generated-
-launcher requirements are specified in [Workbook file transfer through the
-broker](workbook-file-transfer.md).
+Set `BROKER_WORKBOOK_IO_CONFIG` to an absolute path naming a private,
+pre-existing JSON file. The broker validates and freezes it at startup. An
+invalid file fails startup; an unset variable exposes no broker-owned workbook
+tools.
+
+```json
+{
+  "schemaVersion": 1,
+  "maxContentBytes": 8388608,
+  "roots": [
+    {
+      "name": "catalog",
+      "path": "/home/s243a/Projects/SciREPL-Catalog",
+      "read": true,
+      "write": true,
+      "allowOverwrite": false,
+      "denyGitIgnoredWrites": true
+    },
+    {
+      "name": "agent-brain",
+      "path": "/home/s243a/.gemini/antigravity-cli/brain",
+      "read": true,
+      "write": true,
+      "allowOverwrite": false,
+      "denyGitIgnoredWrites": false
+    }
+  ]
+}
+```
+
+The config file must be outside the agent workspace and every allowlisted root.
+Each root must be a pre-existing real directory. The broker never creates
+destination directories, never follows a configured path through a symbolic
+link or ordinary junction, and requires both the root and the individual call
+to allow replacement.
+
+The example intentionally enables `denyGitIgnoredWrites` only for the Catalog
+project. This export-only policy fails closed when Git reports the destination
+as ignored, blocks `.git` metadata paths, and requires the configured root to be
+the exact top level of an accessible worktree.
+It prevents workbook export from bypassing an agent sandbox that treats ignored
+project paths as outside its writable project; it is the same rule regardless
+of which agent or model made the call.
+
+The `agent-brain` entry deliberately allowlists the stable parent of changing
+`<session>/scratch/` directories and leaves the Git policy off. This avoids a
+per-conversation config update but trusts transfers anywhere below that parent,
+including other sessions. The `.gemini/antigravity-cli/brain` pathname describes
+this deployment's scratch layout, not a restriction to Gemini, Agy, or any
+particular client.
+
+See [Workbook file transfer through the
+broker](workbook-file-transfer.md) for the full portable path grammar, receipts,
+auditing, and filesystem limitations.
+
+The app's `export_workbook` call cannot negotiate a lower payload limit, so an
+enabled configuration requires `BROKER_MAX_APP_WS_PAYLOAD_BYTES` to be at least
+`42008576` even when `maxContentBytes` is smaller. The setup command supplies
+that value automatically when `--workbook-io-config` is used.
 
 ## Remote agents
 
@@ -86,6 +140,7 @@ Important command-line options are:
 | `--output PATH` | Place the private token, generated launchers, and optional workspace under this dedicated directory. |
 | `--enable-agent --acknowledge-agent-host-access` | Enable structured, non-PTY `/agent` adapters and materialize their explicit session context. |
 | `--enable-terminal --acknowledge-terminal-host-access` | Enable `/term`, install/verify `node-pty`, and create its working directory. Combine it with agent mode for interactive agent/TUI choices. |
+| `--workbook-io-config PATH` | Validate an absolute workbook allowlist and preserve its path and required `/app` wire budget in both generated launchers. |
 | `--repair` | Back up and replace edited or stale generated files. |
 | `--adopt` | Allow setup to use an existing non-empty directory that has no setup marker. |
 | `--host ADDRESS --allow-non-loopback` | Explicitly accept raw non-loopback binding. This does not prove Tailscale/SSH or provide TLS. |

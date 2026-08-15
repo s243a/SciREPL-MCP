@@ -6,6 +6,7 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { prepareNodePty } from '../src/node-pty-support.mjs';
+import { REQUIRED_APP_WS_PAYLOAD_BYTES, createWorkbookFileTransfer } from '../src/workbook-files.mjs';
 import { preflightWorkspace, randomToken, setupWorkspace, targetState, writePrivateFile } from '../src/workspace.mjs';
 
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
@@ -30,6 +31,7 @@ Options:
   --enable-terminal                     Enable the host-side PTY/shell bridge;
                                         combine with agent mode for TUIs/! commands
   --acknowledge-terminal-host-access    Required with --enable-terminal
+  --workbook-io-config PATH             Enable allowlisted workbook file transfer
   --no-install                          Do not install npm dependencies
   --adopt                               Allow an existing unmarked setup directory
   --repair                              Back up and replace changed generated files
@@ -51,6 +53,7 @@ function parseArgs(argv) {
         acknowledgeAgent: false,
         enableTerminal: false,
         acknowledgeTerminal: false,
+        workbookIoConfig: null,
         install: true,
         adopt: false,
         repair: false,
@@ -70,6 +73,7 @@ function parseArgs(argv) {
         else if (arg === '--acknowledge-agent-host-access') options.acknowledgeAgent = true;
         else if (arg === '--enable-terminal') options.enableTerminal = true;
         else if (arg === '--acknowledge-terminal-host-access') options.acknowledgeTerminal = true;
+        else if (arg === '--workbook-io-config') options.workbookIoConfig = value();
         else if (arg === '--no-install') options.install = false;
         else if (arg === '--adopt') options.adopt = true;
         else if (arg === '--repair') options.repair = true;
@@ -106,8 +110,12 @@ function validate(options) {
     if (process.platform === 'win32' && (options.enableAgent || options.enableTerminal)) {
         throw new Error('agent and terminal modes currently require Linux, macOS, or WSL; use the PowerShell setup for the core broker only');
     }
+    if (options.workbookIoConfig && !path.isAbsolute(options.workbookIoConfig)) {
+        throw new Error('--workbook-io-config must be an absolute path');
+    }
 
     options.output = path.resolve(options.output.replace(/^~(?=$|[\\/])/, os.homedir()));
+    if (options.workbookIoConfig) options.workbookIoConfig = path.resolve(options.workbookIoConfig);
     const dangerous = [path.parse(options.output).root, os.homedir(), REPO_DIR, PACKAGE_DIR];
     if (dangerous.some(candidate => path.resolve(candidate) === options.output) ||
         isWithin(REPO_DIR, options.output) || isWithin(options.output, REPO_DIR)) {
@@ -151,6 +159,10 @@ function environment(options, tokenFile, workspace) {
         env.BROKER_TERM = '1';
         if (!options.enableAgent) env.BROKER_TERM_CMDS = 'shell';
     }
+    if (options.workbookIoConfig) {
+        env.BROKER_WORKBOOK_IO_CONFIG = options.workbookIoConfig;
+        env.BROKER_MAX_APP_WS_PAYLOAD_BYTES = String(REQUIRED_APP_WS_PAYLOAD_BYTES);
+    }
     return env;
 }
 
@@ -178,6 +190,7 @@ function setupManifest(options, files) {
         port: options.port,
         agentEnabled: options.enableAgent,
         terminalEnabled: options.enableTerminal,
+        workbookIoConfig: options.workbookIoConfig,
         generatedFiles: files,
     }, null, 2) + '\n';
 }
@@ -322,6 +335,14 @@ function main() {
 
     const tokenFile = path.join(options.output, 'broker-token');
     const workspace = path.join(options.output, 'workspace');
+    if (options.workbookIoConfig) {
+        createWorkbookFileTransfer({
+            configPath: options.workbookIoConfig,
+            agentWorkspace: workspace,
+            maxAppWsPayloadBytes: REQUIRED_APP_WS_PAYLOAD_BYTES,
+            log() {},
+        });
+    }
     const token = ensureToken(tokenFile, true);
     const env = environment(options, tokenFile, workspace);
     const targets = generatedTargets(options, env);
@@ -352,6 +373,7 @@ function main() {
     console.log(`[setup] broker: ${options.host}:${options.port} (${isLoopbackHost(options.host) ? 'loopback' : 'non-loopback — no transport verification is enforced'})`);
     console.log(`[setup] agent: ${options.enableAgent ? 'enabled with an explicit session workspace' : 'disabled'}`);
     console.log(`[setup] terminal: ${options.enableTerminal ? 'enabled' : 'disabled'}`);
+    console.log(`[setup] workbook I/O: ${options.workbookIoConfig ? 'enabled with ' + options.workbookIoConfig : 'disabled'}`);
     if (workspaceResult) console.log(`[setup] agent context: ${workspaceResult.created.length} created, ${workspaceResult.updated.length} repaired`);
     if (!options.dryRun) {
         console.log(`[setup] start with ${process.platform === 'win32' ? path.join(options.output, 'Start-Broker.ps1') : path.join(options.output, 'start-broker.sh')}`);

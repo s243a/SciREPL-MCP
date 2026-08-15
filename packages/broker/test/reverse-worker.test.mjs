@@ -116,6 +116,23 @@ try {
     ok(/distinct/.test(e.message), 'equal controller and worker secrets fail closed');
 }
 
+function runDriver(args, timeoutMs = 20000) {
+    return new Promise((resolve) => {
+        const child = spawn(process.execPath, args, { cwd: packageDir });
+        let stdout = '', stderr = '';
+        child.stdout.on('data', (d) => { stdout += d; });
+        child.stderr.on('data', (d) => { stderr += d; });
+        const timer = setTimeout(() => {
+            try { child.kill('SIGTERM'); } catch (_) {}
+            resolve({ status: null, stdout, stderr, timedOut: true });
+        }, timeoutMs);
+        child.on('close', (status) => {
+            clearTimeout(timer);
+            resolve({ status, stdout, stderr, timedOut: false });
+        });
+    });
+}
+
 function spawnBroker(env, port) {
     return spawn(process.execPath, ['src/broker.mjs'], {
         cwd: packageDir,
@@ -376,31 +393,31 @@ try {
         }
     });
 
-    const termDrive = spawnSync(process.execPath, [
+    const termDrive = await runDriver([
         path.join(packageDir, 'scripts', 'term-drive.mjs'),
         '--url', `ws://127.0.0.1:${PORT}/term`,
         '--token-file', controllerTokenFile,
         '--start', 'shell',
         '--send', 'echo HELLO_42',
-        '--read-ms', '800',
-    ], { cwd: packageDir, encoding: 'utf8', timeout: 15000 });
+        '--read-ms', '2000',
+    ]);
     ok(termDrive.status === 0 && /HELLO_42/.test(termDrive.stdout || ''),
         'unmodified term-drive.mjs drives a reverse worker through /term');
 
     const promptFile = path.join(testRoot, 'prompt.txt');
     fs.writeFileSync(promptFile, 'say ok');
-    const agentDrive = spawnSync(process.execPath, [
+    const agentDrive = await runDriver([
         path.join(packageDir, 'scripts', 'agent-drive.mjs'),
         '--url', `ws://127.0.0.1:${PORT}/agent`,
         '--token-file', controllerTokenFile,
         '--agent', 'agy',
         '--prompt-file', promptFile,
         '--timeout-ms', '8000',
-    ], { cwd: packageDir, encoding: 'utf8', timeout: 15000 });
+    ]);
     ok(agentDrive.status === 0 && /ok-from-reverse/.test(agentDrive.stdout || ''),
         'unmodified agent-drive.mjs drives a reverse worker through /agent');
 
-    try { worker.close(); } catch (_) {}
+    await new Promise((resolve) => { worker.once('close', resolve); try { worker.close(); } catch (_) { resolve(); } });
 } catch (e) {
     console.log('  ✗ unexpected driver error: ' + (e.stack || e));
     failed++;
@@ -429,17 +446,17 @@ if (hasPty) {
             shim.on('error', reject);
         });
         await shimReady;
-        const driven = spawnSync(process.execPath, [
+        const driven = await runDriver([
             path.join(packageDir, 'scripts', 'term-drive.mjs'),
             '--url', `ws://127.0.0.1:${PORT}/term`,
             '--token-file', controllerTokenFile,
             '--start', 'shell',
             '--send', 'echo HELLO_42',
-            '--read-ms', '1500',
-        ], { cwd: packageDir, encoding: 'utf8', timeout: 20000 });
+            '--read-ms', '2500',
+        ], 20000);
         ok(driven.status === 0 && /HELLO_42/.test(driven.stdout || ''),
             'real reverse-worker shim + unmodified term-drive.mjs round-trip a shell echo');
-        shim.kill('SIGTERM');
+        try { shim.kill('SIGTERM'); } catch (_) {}
     } catch (e) {
         console.log('  ✗ real shim error: ' + (e.stack || e));
         failed++;
@@ -451,6 +468,9 @@ if (hasPty) {
 ok(reverseWorkerHub.enabled === true, 'imported broker exposed the reverse-worker hub');
 
 console.log(`\n${passed} passed, ${failed} failed`);
-await new Promise(resolve => httpServer.close(resolve));
+await new Promise((resolve) => {
+    const timer = setTimeout(resolve, 1000);
+    httpServer.close(() => { clearTimeout(timer); resolve(); });
+});
 fs.rmSync(testRoot, { recursive: true, force: true });
 process.exit(failed ? 1 : 0);

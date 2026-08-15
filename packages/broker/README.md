@@ -225,7 +225,9 @@ for the proposed tools, receipts, limits, and filesystem security rules.
 The `/agent` endpoint lets the SciREPL Pro panel converse with a coding-agent CLI
 through a structured, non-PTY adapter. Use the acknowledged `--enable-agent`
 setup shown above, then start its generated launcher. Setup materializes notebook
-guidance only in its dedicated session workspace. A direct `BROKER_AGENT=1`
+guidance and provider-local MCP settings only in its dedicated session workspace.
+That includes Antigravity's `.agents/mcp_config.json` using the required
+`serverUrl` field. A direct `BROKER_AGENT=1`
 launch fails closed when that workspace is not prepared unless the operator
 explicitly uses `BROKER_ALLOW_UNMANAGED_AGENT_WORKSPACE=1` for self-managed
 context. Provider support varies; Claude is the verified persistent adapter,

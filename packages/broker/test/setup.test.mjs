@@ -80,8 +80,21 @@ if (process.platform === 'win32') {
         'acknowledged agent setup creates provider context only in the dedicated workspace');
     ok(fs.existsSync(path.join(workspace, '.scirepl-mcp', 'manifest.json')) &&
         fs.existsSync(path.join(workspace, '.claude', 'skills', 'scirepl-notebook', 'SKILL.md')) &&
-        fs.existsSync(path.join(workspace, '.codex', 'config.toml')),
+        fs.existsSync(path.join(workspace, '.codex', 'config.toml')) &&
+        fs.existsSync(path.join(workspace, '.agents', 'mcp_config.json')),
         'agent setup installs its marker, notebook guide, and client configuration');
+    const antigravityFile = path.join(workspace, '.agents', 'mcp_config.json');
+    const antigravity = JSON.parse(fs.readFileSync(antigravityFile, 'utf8'));
+    const antigravityServer = antigravity.mcpServers?.scirepl;
+    const agentToken = fs.readFileSync(path.join(agent, 'broker-token'), 'utf8').trim();
+    const managedFiles = JSON.parse(fs.readFileSync(path.join(workspace, '.scirepl-mcp', 'manifest.json'), 'utf8')).managedFiles;
+    const expectedAntigravity = { mcpServers: { scirepl: {
+        serverUrl: 'http://127.0.0.1:8087/mcp',
+        headers: { Authorization: `Bearer ${agentToken}` },
+    } } };
+    ok(JSON.stringify(antigravity) === JSON.stringify(expectedAntigravity) &&
+        managedFiles.includes('.agents/mcp_config.json'),
+    'Antigravity receives its exact serverUrl schema and the doctor manifest owns the file');
     ok(!['AGENTS.md', 'CLAUDE.md', 'GEMINI.md'].some(name => fs.existsSync(path.join(repoDir, name))),
         'setup never places active agent instructions in the repository root');
 
@@ -117,6 +130,16 @@ if (process.platform !== 'win32') {
     ok(linkedRun.status !== 0 && /unsafe managed paths/.test(linkedRun.stderr) &&
         !fs.existsSync(path.join(linked, 'broker-token')) && !fs.existsSync(path.join(linked, 'workspace', 'AGENTS.md')),
         'agent setup rejects a symlinked managed path before creating any files');
+
+    const linkedConfig = path.join(testRoot, 'linked-antigravity-config');
+    const outsideConfig = path.join(testRoot, 'outside-mcp-config.json');
+    fs.mkdirSync(path.join(linkedConfig, 'workspace', '.agents'), { recursive: true });
+    fs.writeFileSync(outsideConfig, '{}\n');
+    fs.symlinkSync(outsideConfig, path.join(linkedConfig, 'workspace', '.agents', 'mcp_config.json'));
+    const linkedConfigRun = run('--output', linkedConfig, '--no-install', '--adopt', '--enable-agent', '--acknowledge-agent-host-access');
+    ok(linkedConfigRun.status !== 0 && /unsafe managed paths/.test(linkedConfigRun.stderr) &&
+        !fs.existsSync(path.join(linkedConfig, 'broker-token')) && fs.readFileSync(outsideConfig, 'utf8') === '{}\n',
+    'agent setup rejects a symlinked Antigravity MCP file without touching its target');
 }
 
 console.log(`\n${passed} passed, ${failed} failed`);

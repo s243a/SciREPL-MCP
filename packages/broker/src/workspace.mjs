@@ -37,6 +37,17 @@ function geminiConfig(port, token) {
     }, null, 2) + '\n';
 }
 
+function antigravityConfig(port, token) {
+    return JSON.stringify({
+        mcpServers: {
+            scirepl: {
+                serverUrl: `http://127.0.0.1:${port}/mcp`,
+                headers: { Authorization: `Bearer ${token}` },
+            },
+        },
+    }, null, 2) + '\n';
+}
+
 function manifestContent(files) {
     return JSON.stringify({
         schemaVersion: 1,
@@ -59,6 +70,7 @@ export function workspaceTargets({ workspace, port, token, callTimeoutMs }) {
         ['.agents/skills/scirepl-notebook/SKILL.md', skill],
         ['.codex/config.toml', codexConfig(port, callTimeoutMs)],
         ['.gemini/settings.json', geminiConfig(port, token)],
+        ['.agents/mcp_config.json', antigravityConfig(port, token)],
     ];
     definitions.push([WORKSPACE_MARKER, manifestContent(definitions.map(([rel]) => rel))]);
     return definitions.map(([rel, content]) => ({
@@ -73,6 +85,7 @@ export function targetState(target) {
         const stat = fs.lstatSync(target.abs);
         if (stat.isSymbolicLink()) return 'unsafe-symlink';
         if (!stat.isFile()) return 'unsafe-type';
+        if (process.platform !== 'win32' && (stat.mode & 0o077) !== 0) return 'outdated';
         return fs.readFileSync(target.abs).equals(target.content) ? 'current' : 'outdated';
     } catch (error) {
         return error.code === 'ENOENT' ? 'missing' : 'unreadable';

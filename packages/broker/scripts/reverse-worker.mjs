@@ -14,11 +14,11 @@
  */
 import fs from 'node:fs';
 import path from 'node:path';
-import { spawn } from 'node:child_process';
 import { createRequire } from 'node:module';
 import { childProcessEnv, boundedInteger, KNOWN_AGENTS, terminateChild } from '../src/reverse-worker.mjs';
 import { nodePtyUsable } from '../src/node-pty-support.mjs';
-import { configureUtf8Pipes, truncateCodePoints } from '../src/utf8-pipes.mjs';
+import { truncateCodePoints } from '../src/utf8-pipes.mjs';
+import { finalizeAfterStdioClose, spawnUtf8Child } from '../src/spawn-child.mjs';
 
 const require = createRequire(import.meta.url);
 const WebSocket = require('ws');
@@ -175,6 +175,7 @@ const term = { pty: null, label: null, cols: 80, rows: 24, grace: null };
 const agent = { child: null, profile: null, name: null, buf: '', sessionId: null, mode: null };
 
 let stopping = false;
+let activeWs = null;
 let send = () => false;
 
 function sendJson(ws, payload) {
@@ -195,15 +196,13 @@ function spawnEnv() {
 }
 
 function spawnChild(command, args, stdio) {
-    const child = spawn(command, args, {
+    return spawnUtf8Child(command, args, {
         env: spawnEnv(),
         cwd: CWD,
         stdio,
         detached: process.platform !== 'win32',
         windowsHide: true,
     });
-    configureUtf8Pipes(child);
-    return child;
 }
 
 function emitAgentStderr(text) {
@@ -280,9 +279,12 @@ function stopTerm() {
 }
 
 function parkTerm() {
-    if (term.pty && !term.grace && GRACE_MS > 0) {
-        term.grace = setTimeout(() => { term.grace = null; stopTerm(); }, GRACE_MS);
+    if (!term.pty || term.grace) return;
+    if (GRACE_MS <= 0) {
+        stopTerm();
+        return;
     }
+    term.grace = setTimeout(() => { term.grace = null; stopTerm(); }, GRACE_MS);
 }
 
 function startAgent(name) {
@@ -313,12 +315,6 @@ function startAgent(name) {
     agent.profile = prof;
     agent.name = name;
     agent.buf = '';
-    child.once('error', (e) => {
-        if (agent.child !== child) return;
-        agent.child = null;
-        send({ type: 'agent', kind: 'error', text: `failed to start ${name}: ${e.message || e}` });
-        send({ type: 'agent', kind: 'exit', code: null });
-    });
     child.once('spawn', () => {
         if (agent.child !== child) return;
         send({ type: 'agent', kind: 'started', text: name, experimental: !!prof.experimental, resumed: !!resume });
@@ -344,8 +340,23 @@ function startAgent(name) {
             if (n) send({ type: 'agent', ...n });
         }
     });
-    child.stderr.on('data', (d) => emitAgentStderr(d));
-    child.on('exit', (code) => { if (agent.child === child) { agent.child = null; send({ type: 'agent', kind: 'exit', code }); } });
+    child.stderr.on('data', (d) => {
+        if (agent.child !== child) return;
+        emitAgentStderr(d);
+    });
+    finalizeAfterStdioClose(child, {
+        onSpawnError(e) {
+            if (agent.child !== child) return;
+            agent.child = null;
+            send({ type: 'agent', kind: 'error', text: `failed to start ${name}: ${e.message || e}` });
+            send({ type: 'agent', kind: 'exit', code: null });
+        },
+        onClose(code) {
+            if (agent.child !== child) return;
+            agent.child = null;
+            send({ type: 'agent', kind: 'exit', code });
+        },
+    });
 }
 
 function oneshotTurn(text) {
@@ -358,12 +369,6 @@ function oneshotTurn(text) {
     agent.child = child;
     agent.buf = '';
     let sawResult = false;
-    child.once('error', (e) => {
-        if (agent.child !== child) return;
-        agent.child = null;
-        send({ type: 'agent', kind: 'error', text: `failed to start ${agent.name}: ${e.message || e}` });
-        send({ type: 'agent', kind: 'result', text: '' });
-    });
     if (prof.format === 'text') {
         child.stdout.on('data', (d) => {
             if (agent.child !== child) return;
@@ -377,14 +382,25 @@ function oneshotTurn(text) {
             }
             agent.buf += chunk;
         });
-        child.stderr.on('data', (d) => emitAgentStderr(d));
-        child.on('exit', (code) => {
+        child.stderr.on('data', (d) => {
             if (agent.child !== child) return;
-            agent.child = null;
-            if (!agent.sessionId) agent.sessionId = '_continue_';
-            const out = agent.buf.trim();
-            if (out) send({ type: 'agent', kind: 'assistant', text: out });
-            send(code ? { type: 'agent', kind: 'error', text: `${agent.name} exited (${code})` } : { type: 'agent', kind: 'result', text: '' });
+            emitAgentStderr(d);
+        });
+        finalizeAfterStdioClose(child, {
+            onSpawnError(e) {
+                if (agent.child !== child) return;
+                agent.child = null;
+                send({ type: 'agent', kind: 'error', text: `failed to start ${agent.name}: ${e.message || e}` });
+                send({ type: 'agent', kind: 'result', text: '' });
+            },
+            onClose(code) {
+                if (agent.child !== child) return;
+                agent.child = null;
+                if (!agent.sessionId) agent.sessionId = '_continue_';
+                const out = agent.buf.trim();
+                if (out) send({ type: 'agent', kind: 'assistant', text: out });
+                send(code ? { type: 'agent', kind: 'error', text: `${agent.name} exited (${code})` } : { type: 'agent', kind: 'result', text: '' });
+            },
         });
         return true;
     }
@@ -408,12 +424,22 @@ function oneshotTurn(text) {
             const n = prof.normalize(o); if (n) { if (n.kind === 'result') sawResult = true; send({ type: 'agent', ...n }); }
         }
     });
-    child.stderr.on('data', (d) => emitAgentStderr(d));
-    child.on('exit', (code) => {
-        if (agent.child === child) {
+    child.stderr.on('data', (d) => {
+        if (agent.child !== child) return;
+        emitAgentStderr(d);
+    });
+    finalizeAfterStdioClose(child, {
+        onSpawnError(e) {
+            if (agent.child !== child) return;
+            agent.child = null;
+            send({ type: 'agent', kind: 'error', text: `failed to start ${agent.name}: ${e.message || e}` });
+            send({ type: 'agent', kind: 'result', text: '' });
+        },
+        onClose(code) {
+            if (agent.child !== child) return;
             agent.child = null;
             if (!sawResult) send(code ? { type: 'agent', kind: 'error', text: `${agent.name} exited (${code})` } : { type: 'agent', kind: 'result', text: '' });
-        }
+        },
     });
     return true;
 }
@@ -476,13 +502,17 @@ function helloPayload() {
 function connectOnce() {
     return new Promise((resolve, reject) => {
         const ws = new WebSocket(url);
+        activeWs = ws;
         let settled = false;
         let welcomed = false;
         const done = (err) => {
             if (settled) return;
             settled = true;
-            parkTerm();
-            resetAgent();
+            if (activeWs === ws) activeWs = null;
+            if (!stopping) {
+                parkTerm();
+                resetAgent();
+            }
             if (err) reject(err); else resolve();
         };
         ws.on('open', () => {
@@ -533,15 +563,24 @@ async function main() {
     }
 }
 
-function shutdown() {
+async function shutdown() {
+    if (stopping) return;
     stopping = true;
+    const child = agent.child;
+    agent.child = null;
+    agent.profile = null;
+    agent.name = null;
+    agent.mode = null;
+    agent.buf = '';
+    agent.sessionId = null;
+    try { if (activeWs) activeWs.close(); } catch (_) {}
     stopTerm();
-    resetAgent();
+    await terminateChild(child);
     process.exit(0);
 }
 
-process.on('SIGINT', shutdown);
-process.on('SIGTERM', shutdown);
+process.on('SIGINT', () => { shutdown().catch(() => process.exit(1)); });
+process.on('SIGTERM', () => { shutdown().catch(() => process.exit(1)); });
 
 if (!SURFACES.length) {
     console.error('reverse-worker.mjs: --surfaces must include term and/or agent');

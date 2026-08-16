@@ -19,7 +19,12 @@
   with SIGTERM then SIGKILL (process-group SIGKILL stays scheduled after the
   leader exits) and clears adapter session ids. Duplicate worker names are
   rejected while the existing socket is open. Child PATH/PATHEXT are
-  preserved on Windows. Agent pipes decode UTF-8 incrementally.
+  preserved on Windows and CLIs are launched with cross-spawn so npm
+  `.cmd` shims run. Agent pipes decode UTF-8 incrementally and finalize
+  after stdio close. `/agent` has one surface-wide owner. `--grace-ms 0`
+  stops a parked PTY immediately. Shim SIGTERM waits for process-tree
+  SIGKILL. The hub pings workers and drops half-open sockets after a
+  bounded pong deadline.
 
 - Extract the SciREPL host-side MCP broker into an independently installable
   repository.

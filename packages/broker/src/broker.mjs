@@ -21,14 +21,15 @@ import crypto from 'node:crypto';
 import os from 'node:os';
 import fs from 'node:fs';
 import path from 'node:path';
-import { spawn, spawnSync } from 'node:child_process';
+import { spawnSync } from 'node:child_process';
 import { WebSocketServer } from 'ws';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { ListToolsRequestSchema, CallToolRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import { inspectWorkspace, setupWorkspace, writePrivateFile } from './workspace.mjs';
-import { createReverseWorkerHub, loadWorkerToken } from './reverse-worker.mjs';
-import { configureUtf8Pipes, truncateCodePoints } from './utf8-pipes.mjs';
+import { childProcessEnv, createReverseWorkerHub, loadWorkerToken } from './reverse-worker.mjs';
+import { truncateCodePoints } from './utf8-pipes.mjs';
+import { finalizeAfterStdioClose, spawnUtf8Child } from './spawn-child.mjs';
 import { createWorkbookFileTransfer } from './workbook-files.mjs';
 
 const PACKAGE_METADATA = JSON.parse(fs.readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
@@ -187,22 +188,16 @@ function doctorReport() {
 // BROKER_AGENT_INHERIT_ENV=1 only when the process intentionally needs every
 // host variable; this may expose credentials to the spawned CLI.
 function spawnEnv() {
-    const env = {};
-    const allowed = new Set([
-        'HOME', 'PATH', 'SHELL', 'USER', 'LOGNAME', 'TMPDIR', 'TMP', 'TEMP',
-        'LANG', 'LANGUAGE', 'COLORTERM', 'TERM', 'PREFIX', 'ANDROID_ROOT',
-        'ANDROID_DATA', 'XDG_CONFIG_HOME', 'XDG_CACHE_HOME', 'XDG_DATA_HOME',
-    ]);
-    for (const [key, value] of Object.entries(process.env)) {
-        if (AGENT_INHERIT_ENV || allowed.has(key) || key.startsWith('LC_')) env[key] = value;
-    }
-    if (AGENT_USE_API_KEY) {
-        for (const key of ['ANTHROPIC_API_KEY', 'OPENAI_API_KEY', 'GEMINI_API_KEY', 'GOOGLE_API_KEY']) {
-            if (process.env[key]) env[key] = process.env[key];
-        }
-    }
-    Object.assign(env, { SCIREPL_SESSION: '1', SCIREPL_BROKER_PORT: String(PORT), SCIREPL_MCP: 'scirepl', SCIREPL_MCP_BEARER: TOKEN });
-    return env;
+    return childProcessEnv({
+        inheritEnv: AGENT_INHERIT_ENV,
+        useApiKey: AGENT_USE_API_KEY,
+        extra: {
+            SCIREPL_SESSION: '1',
+            SCIREPL_BROKER_PORT: String(PORT),
+            SCIREPL_MCP: 'scirepl',
+            SCIREPL_MCP_BEARER: TOKEN,
+        },
+    });
 }
 // ── Terminal config (§14C). /term exposes a REAL PTY (full shell) on this
 //    machine, so it is OFF unless explicitly enabled. ──────────────────────────
@@ -405,8 +400,10 @@ const AGENT_PROFILES = {
 //    redundant start from the app never wipes context. A genuine respawn (crash,
 //    or agent switch back) resumes via the captured session_id. ────────────────
 const agentBridge = {
-    ws: null, child: null, profile: null, name: null, buf: '', sessionId: null,
+    ws: null, child: null, profile: null, name: null, buf: '', sessionId: null, mode: null,
     running() { return !!this.child; },
+    occupied() { return !!this.child || !!(this.name && this.mode); },
+    ownerOpen() { return !!(this.ws && this.ws.readyState === 1); },
     start(ws, name) {
         if (!AGENT_ENABLED) { sendWsJson(ws, { type: 'agent', kind: 'error', text: 'remote agents disabled — restart with BROKER_AGENT=1 after reviewing the host-access warning' }, MAX_AGENT_BUFFER_BYTES); return; }
         const workspaceProblem = agentWorkspaceProblem();
@@ -438,21 +435,12 @@ const agentBridge = {
         const resume = this.sessionId || null; // respawn of the same agent → resume context
         let child;
         try {
-            child = spawn(prof.cmd, prof.args({ resume }), { env, cwd: AGENT_CWD, stdio: ['pipe', 'pipe', 'pipe'] });
+            child = spawnUtf8Child(prof.cmd, prof.args({ resume }), { env, cwd: AGENT_CWD, stdio: ['pipe', 'pipe', 'pipe'] });
         } catch (e) {
             sendWsJson(ws, { type: 'agent', kind: 'error', text: `spawn failed: ${e.message}` }, MAX_AGENT_BUFFER_BYTES); return;
         }
-        configureUtf8Pipes(child);
         this.ws = ws; this.child = child; this.profile = prof; this.name = name; this.buf = '';
         const send = (m) => this.ws === ws && sendWsJson(ws, { type: 'agent', ...m }, MAX_AGENT_BUFFER_BYTES);
-        // spawn() reports command-not-found and similar launch failures through
-        // an asynchronous 'error' event, not the surrounding try/catch.
-        child.once('error', (e) => {
-            if (this.child !== child) return;
-            this.child = null;
-            send({ kind: 'error', text: `failed to start ${name}: ${e.message || e}` });
-            send({ kind: 'exit', code: null });
-        });
         child.stdout.on('data', (d) => {
             if (this.child !== child) return;
             const chunk = d;
@@ -474,8 +462,23 @@ const agentBridge = {
                 if (n) send(n);
             }
         });
-        child.stderr.on('data', (d) => send({ kind: 'stderr', text: truncateCodePoints(d, 500) }));
-        child.on('exit', (code) => { if (this.child === child) { this.child = null; send({ kind: 'exit', code }); } });
+        child.stderr.on('data', (d) => {
+            if (this.child !== child) return;
+            send({ kind: 'stderr', text: truncateCodePoints(d, 500) });
+        });
+        finalizeAfterStdioClose(child, {
+            onSpawnError(e) {
+                if (agentBridge.child !== child) return;
+                agentBridge.child = null;
+                send({ kind: 'error', text: `failed to start ${name}: ${e.message || e}` });
+                send({ kind: 'exit', code: null });
+            },
+            onClose(code) {
+                if (agentBridge.child !== child) return;
+                agentBridge.child = null;
+                send({ kind: 'exit', code });
+            },
+        });
         send({ kind: 'started', text: name, experimental: !!prof.experimental, resumed: !!resume });
         console.log(`[broker] agent '${name}' launch requested${child.pid ? ' (pid ' + child.pid + ')' : ''}${resume ? ' [resumed ' + resume.slice(0, 8) + ']' : ''}`);
     },
@@ -492,19 +495,12 @@ const agentBridge = {
         const prof = this.profile, ws = this.ws;
         const send = (m) => this.ws === ws && sendWsJson(ws, { type: 'agent', ...m }, MAX_AGENT_BUFFER_BYTES);
         let child;
-        try { child = spawn(prof.cmd, prof.buildArgs(text, this.sessionId), { env: spawnEnv(), cwd: AGENT_CWD, stdio: ['ignore', 'pipe', 'pipe'] }); }
+        try { child = spawnUtf8Child(prof.cmd, prof.buildArgs(text, this.sessionId), { env: spawnEnv(), cwd: AGENT_CWD, stdio: ['ignore', 'pipe', 'pipe'] }); }
         catch (e) { send({ kind: 'error', text: 'spawn failed: ' + (e.message || e) }); send({ kind: 'result', text: '' }); return false; }
-        configureUtf8Pipes(child);
         this.child = child; this.buf = ''; let sawResult = false;
-        child.once('error', (e) => {
-            if (this.child !== child) return;
-            this.child = null;
-            send({ kind: 'error', text: `failed to start ${this.name}: ${e.message || e}` });
-            send({ kind: 'result', text: '' });
-        });
         if (prof.format === 'text') {
             // Plain-text agents (agy): no JSON to parse — accumulate stdout as the
-            // answer, emit it on exit, and remember to --continue next turn.
+            // answer, emit it after stdio close, and remember to --continue next turn.
             child.stdout.on('data', (d) => {
                 if (this.child !== child) return;
                 const chunk = d;
@@ -517,14 +513,25 @@ const agentBridge = {
                 }
                 this.buf += chunk;
             });
-            child.stderr.on('data', (d) => send({ kind: 'stderr', text: truncateCodePoints(d, 500) }));
-            child.on('exit', (code) => {
+            child.stderr.on('data', (d) => {
                 if (this.child !== child) return;
-                this.child = null;
-                if (!this.sessionId) this.sessionId = '_continue_'; // enable -c/--continue next turn
-                const out = this.buf.trim();
-                if (out) send({ kind: 'assistant', text: out });
-                send(code ? { kind: 'error', text: `${this.name} exited (${code})` } : { kind: 'result', text: '' });
+                send({ kind: 'stderr', text: truncateCodePoints(d, 500) });
+            });
+            finalizeAfterStdioClose(child, {
+                onSpawnError(e) {
+                    if (agentBridge.child !== child) return;
+                    agentBridge.child = null;
+                    send({ kind: 'error', text: `failed to start ${agentBridge.name}: ${e.message || e}` });
+                    send({ kind: 'result', text: '' });
+                },
+                onClose(code) {
+                    if (agentBridge.child !== child) return;
+                    agentBridge.child = null;
+                    if (!agentBridge.sessionId) agentBridge.sessionId = '_continue_';
+                    const out = agentBridge.buf.trim();
+                    if (out) send({ kind: 'assistant', text: out });
+                    send(code ? { kind: 'error', text: `${agentBridge.name} exited (${code})` } : { kind: 'result', text: '' });
+                },
             });
             return true;
         }
@@ -548,14 +555,29 @@ const agentBridge = {
                 const n = prof.normalize(o); if (n) { if (n.kind === 'result') sawResult = true; send(n); }
             }
         });
-        child.stderr.on('data', (d) => send({ kind: 'stderr', text: truncateCodePoints(d, 500) }));
-        child.on('exit', (code) => { if (this.child === child) { this.child = null; if (!sawResult) send(code ? { kind: 'error', text: `${this.name} exited (${code})` } : { kind: 'result', text: '' }); } });
+        child.stderr.on('data', (d) => {
+            if (this.child !== child) return;
+            send({ kind: 'stderr', text: truncateCodePoints(d, 500) });
+        });
+        finalizeAfterStdioClose(child, {
+            onSpawnError(e) {
+                if (agentBridge.child !== child) return;
+                agentBridge.child = null;
+                send({ kind: 'error', text: `failed to start ${agentBridge.name}: ${e.message || e}` });
+                send({ kind: 'result', text: '' });
+            },
+            onClose(code) {
+                if (agentBridge.child !== child) return;
+                agentBridge.child = null;
+                if (!sawResult) send(code ? { kind: 'error', text: `${agentBridge.name} exited (${code})` } : { kind: 'result', text: '' });
+            },
+        });
         return true;
     },
     stop() {
         if (this.child) { try { this.child.kill('SIGTERM'); } catch (_) {} this.child = null; console.log('[broker] agent stopped'); }
     },
-    reset() { this.stop(); this.sessionId = null; this.name = null; },
+    reset() { this.stop(); this.sessionId = null; this.name = null; this.mode = null; },
 };
 
 // ── Terminal bridge (§14C): a real PTY relayed to xterm.js in the app. ─────────
@@ -939,21 +961,48 @@ agentWss.on('connection', (ws) => {
         }
         if (!authed) return;
         if (msg.type === 'start') {
-            const localActive = agentBridge.running() || !!(agentBridge.name && agentBridge.ws === ws);
-            if (localActive || !reverseWorkerHub.tryStart('agent', ws, msg)) agentBridge.start(ws, msg.agent || 'claude');
-        } else if (msg.type === 'input') {
-            const localActive = agentBridge.running() || !!(agentBridge.name && agentBridge.ws === ws);
-            if (localActive || !reverseWorkerHub.tryRelay('agent', ws, { type: 'input', text: String(msg.text || '') })) {
-                if (!agentBridge.input(String(msg.text || ''))) sendWsJson(ws, { type: 'agent', kind: 'error', text: 'no agent running' }, MAX_AGENT_BUFFER_BYTES);
+            if (agentBridge.occupied() && agentBridge.ownerOpen() && agentBridge.ws !== ws) {
+                sendWsJson(ws, { type: 'agent', kind: 'error', text: 'agent session is already owned by another controller' }, MAX_AGENT_BUFFER_BYTES);
+                return;
             }
+            if (agentBridge.occupied()) {
+                agentBridge.start(ws, msg.agent || 'claude');
+                return;
+            }
+            if (reverseWorkerHub.hasSession('agent')) {
+                reverseWorkerHub.tryStart('agent', ws, msg);
+                return;
+            }
+            if (!reverseWorkerHub.tryStart('agent', ws, msg)) agentBridge.start(ws, msg.agent || 'claude');
+        } else if (msg.type === 'input') {
+            if (reverseWorkerHub.hasSession('agent')) {
+                reverseWorkerHub.tryRelay('agent', ws, { type: 'input', text: String(msg.text || '') });
+                return;
+            }
+            if (agentBridge.occupied()) {
+                if (agentBridge.ownerOpen() && agentBridge.ws !== ws) {
+                    sendWsJson(ws, { type: 'agent', kind: 'error', text: 'agent session is already owned by another controller' }, MAX_AGENT_BUFFER_BYTES);
+                    return;
+                }
+                if (!agentBridge.input(String(msg.text || ''))) sendWsJson(ws, { type: 'agent', kind: 'error', text: 'no agent running' }, MAX_AGENT_BUFFER_BYTES);
+                return;
+            }
+            sendWsJson(ws, { type: 'agent', kind: 'error', text: 'no agent running' }, MAX_AGENT_BUFFER_BYTES);
         } else if (msg.type === 'stop') {
-            const localActive = agentBridge.running() || !!(agentBridge.name && agentBridge.ws === ws);
-            if (localActive || !reverseWorkerHub.tryStop('agent', ws)) agentBridge.stop();
+            if (reverseWorkerHub.hasSession('agent')) {
+                reverseWorkerHub.tryStop('agent', ws);
+                return;
+            }
+            if (agentBridge.occupied() && agentBridge.ownerOpen() && agentBridge.ws !== ws) {
+                sendWsJson(ws, { type: 'agent', kind: 'error', text: 'agent session is already owned by another controller' }, MAX_AGENT_BUFFER_BYTES);
+                return;
+            }
+            agentBridge.stop();
         }
     });
     ws.on('close', () => {
         if (reverseWorkerHub.detach('agent', ws)) return;
-        if (agentBridge.ws === ws) agentBridge.stop();
+        if (agentBridge.ws === ws) agentBridge.reset();
     });
 });
 

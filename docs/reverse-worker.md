@@ -349,10 +349,13 @@ unchanged and that worker still advertises it. `stop` forwards `stop` and
 currently connected workers. Switching CLIs without an explicit `stop`
 also stops the previous reverse session before selecting.
 
-If a local `/term` PTY is already running, or a local `/agent` session is
-active on this controller (`running()` or oneshot-ready bound to this
-socket), start/input/stop stay local even if a worker later appears.
-Reverse mode must not create a second live session beside a local one.
+`/agent` has one surface-wide placement and one owner controller. A
+locally ready one-shot session (no child yet) occupies the surface the
+same way a running child does: another controller cannot start a
+simultaneous reverse session, and inputs never fall through from a bound
+reverse worker to a newly started local child. `/term` stays local while
+a PTY is already running. Reverse mode must not create a second live
+session beside a local one.
 
 Operators who need a specific machine should give that worker a
 unique advertised CLI, or run one worker name per broker. Explicit
@@ -368,7 +371,7 @@ session claim.
 
 | Who dropped | What is preserved | What the other side sees |
 |---|---|---|
-| Controller `/term` disconnect, worker still connected | The worker keeps its PTY for the shim's `--grace-ms` (default 600000). The broker forwards `{type:"detach",surface:"term"}` so the shim **starts** that grace timer. It does **not** forward `stop`. | Next controller `start` is relayed; if grace has not expired the worker answers `started` with `reattached: true` and nudges a redraw, matching local `/term`. After expiry the next `start` is a new spawn. |
+| Controller `/term` disconnect, worker still connected | The worker keeps its PTY for the shim's `--grace-ms` (default 600000). `--grace-ms 0` stops the PTY immediately. The broker forwards `{type:"detach",surface:"term"}` so the shim **starts** that grace timer (or cleanup). It does **not** forward `stop`. | Next controller `start` is relayed; if grace has not expired the worker answers `started` with `reattached: true` and nudges a redraw, matching local `/term`. After expiry (or with zero grace) the next `start` is a new spawn. |
 | Controller `/agent` disconnect, worker still connected | Nothing. Local `/agent` already kills the child on controller close; reverse mode forwards `stop` so the semantics match. | Worker stops the CLI. A later `start` is a new session (CLI resume flags still apply on the worker host if the adapter supports them). |
 | Worker disconnect, controller still connected | The worker shim keeps a live PTY across its own reconnect for the same grace period. It **kills** `/agent` children on socket close so they cannot outlive the controller's error/result. The broker does not keep a PTY. | The broker sends `error` then `exit` (term) or `error` then `result` (agent) to the bound controller. The controller must `start` again. If the reconnected worker claims `sessions.term.live`, that later `start` may reattach. |
 | Broker process restart | Nothing in the broker. The worker shim reconnects with backoff and re-registers. A still-live PTY is advertised in `sessions`. | Controllers reconnect as they do today. A `start` after both sides are back is a reattach if the shim preserved the process. |
@@ -383,7 +386,10 @@ on the same `/worker` socket is rejected with `already authenticated`;
 it does not register another name. Outbound worker frames that exceed
 the 1 MiB `bufferedAmount` cap close the socket with code 1013, matching
 the hub. Caps that are not safe integers (`NaN`, `Infinity`) are
-rejected at shim startup.
+rejected at shim startup. After welcome the hub sends WebSocket pings
+every 15s and terminates a worker that does not pong within 30s, so a
+half-open TCP session cannot occupy a name forever. That is a bounded
+liveness check, not an application-level heartbeat protocol.
 
 `/app` replacement of a still-open previous socket is **not** the model
 for `/worker`. A second worker hello with the same name while the first
@@ -524,9 +530,10 @@ token, invalid payload cap) fails broker startup. It never degrades to
 ## Worker shim
 
 `packages/broker/scripts/reverse-worker.mjs` is the worker-side counterpart
-of `term-drive.mjs`: a small `ws` client, no new dependencies beyond `ws`
-(and optional `node-pty` for `/term`, the same optional dependency the
-broker already uses).
+of `term-drive.mjs`: a small `ws` client. CLI children are launched with
+the broker's `cross-spawn` helper so Windows npm `.cmd` shims run without
+`shell:true`. Optional `node-pty` is still required for `/term`, the same
+optional dependency the broker already uses.
 
 ```bash
 node packages/broker/scripts/reverse-worker.mjs \
@@ -677,15 +684,16 @@ controller-token holder can still drive that CLI and approve its prompts.
 
 ### Attacker holds the worker token
 
-They can dial `/worker`, register (or replace) a name, and sit in the
-command seat. That is enough to:
+They can dial `/worker` and register a **free** name. A second hello for
+a name whose socket is still open is rejected; the token is not
+permission to kick a live same-name worker. That is enough to:
 
 - **Receive** every `/term` and `/agent` command the broker would have
   relayed to that name, including task text and keystrokes that answer
   permission prompts.
 - **Forge** the event stream the controller sees: fake `assistant` /
-  `data` / `result` events, drop a real worker by replacing its name, or
-  run a different executable than the one advertised.
+  `data` / `result` events, or run a different executable than the one
+  advertised. They cannot drop a still-connected worker of the same name.
 - **Do nothing else on the hub.** They cannot call `/mcp`, read or repair
   `/doctor`, connect as the app on `/app`, or drive `/term` and `/agent`
   as a controller. Workbook-transfer tools, if they are ever implemented,
@@ -800,7 +808,16 @@ Implementation covers at least:
 - a second connection for an already-live worker name is rejected while
   that socket is open, including when the new hello claims a live session;
 - controller `/term` disconnect forwards `detach` so shim grace starts;
-  an expired grace does not reattach;
+  `--grace-ms 0` stops immediately; an expired grace does not reattach;
+- CLI children are launched through the production `cross-spawn` helper
+  (native `.cmd` on Windows; PATH commands everywhere) without `shell:true`;
+- persistent NDJSON, one-shot NDJSON, and plain-text children finalize
+  after stdout/stderr close, including when a grandchild writes after the
+  parent exits; late stderr cannot leak into the next session;
+- signaling the shim waits for process-tree termination before exit;
+- a locally ready one-shot `/agent` session occupies the surface so a
+  second controller cannot start a simultaneous reverse session, and
+  inputs stay on the bound reverse worker;
 - audit lines ignore worker-supplied `cmd`/`text` and log stop as
   requested rather than completed.
 

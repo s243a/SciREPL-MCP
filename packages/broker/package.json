@@ -19,7 +19,7 @@
     "postinstall": "node scripts/prepare-node-pty.mjs",
     "setup": "node scripts/setup.mjs",
     "start": "node src/broker.mjs",
-    "check": "node --check src/broker.mjs && node --check src/workbook-files.mjs && node --check src/workspace.mjs && node --check src/node-pty-support.mjs && node --check src/reverse-worker.mjs && node --check src/utf8-pipes.mjs && node --check scripts/setup.mjs && node --check scripts/prepare-node-pty.mjs && node --check scripts/reverse-worker.mjs && node --check scripts/term-drive.mjs && node --check scripts/agent-drive.mjs",
+    "check": "node --check src/broker.mjs && node --check src/workbook-files.mjs && node --check src/workspace.mjs && node --check src/node-pty-support.mjs && node --check src/reverse-worker.mjs && node --check src/utf8-pipes.mjs && node --check src/spawn-child.mjs && node --check scripts/setup.mjs && node --check scripts/prepare-node-pty.mjs && node --check scripts/reverse-worker.mjs && node --check scripts/term-drive.mjs && node --check scripts/agent-drive.mjs",
     "test": "node test/node-pty-support.test.mjs && node test/utf8-pipes.test.mjs && node test/setup.test.mjs && node test/security.test.mjs && node test/unmanaged-workspace.test.mjs && node test/broker.test.mjs && npm run test:workbook && node test/missing-agent.test.mjs && node test/utf8-agent.test.mjs && node test/reverse-worker.test.mjs && node test/term.test.mjs",
     "test:utf8-pipes": "node test/utf8-pipes.test.mjs",
     "test:node-pty-support": "node test/node-pty-support.test.mjs",
@@ -64,6 +64,7 @@
   "license": "MIT",
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.30.0",
+    "cross-spawn": "^7.0.6",
     "ws": "^8.21.3"
   },
   "optionalDependencies": {

@@ -22,13 +22,15 @@ export const TERM_EVENT_KINDS = Object.freeze(['started', 'data', 'exit', 'error
 export const AGENT_EVENT_KINDS = Object.freeze(['started', 'assistant', 'tool_use', 'result', 'stderr', 'error', 'exit']);
 export const CHILD_ENV_ALLOWLIST = Object.freeze([
     'HOME', 'PATH', 'SHELL', 'USER', 'LOGNAME', 'TMPDIR', 'TMP', 'TEMP',
-    'LANG', 'LANGUAGE', 'COLORTERM', 'TERM', 'PREFIX',
-    'XDG_CONFIG_HOME', 'XDG_CACHE_HOME', 'XDG_DATA_HOME',
+    'LANG', 'LANGUAGE', 'COLORTERM', 'TERM', 'PREFIX', 'ANDROID_ROOT',
+    'ANDROID_DATA', 'XDG_CONFIG_HOME', 'XDG_CACHE_HOME', 'XDG_DATA_HOME',
 ]);
 export const PROVIDER_API_KEYS = Object.freeze([
     'ANTHROPIC_API_KEY', 'OPENAI_API_KEY', 'GEMINI_API_KEY', 'GOOGLE_API_KEY',
 ]);
 export const DEFAULT_WINDOWS_PATHEXT = '.COM;.EXE;.BAT;.CMD;.VBS;.JS;.MSC';
+export const WORKER_PING_INTERVAL_MS = 15000;
+export const WORKER_PONG_DEADLINE_MS = 30000;
 
 function envLookupKey(source, name) {
     if (!source || typeof source !== 'object') return undefined;
@@ -86,8 +88,9 @@ export function childProcessEnv({ inheritEnv = false, useApiKey = false, source 
 }
 
 export function terminateChild(child, graceMs = 1000) {
-    if (!child) return;
+    if (!child) return Promise.resolve();
     const pid = child.pid;
+    const waitMs = Number.isFinite(graceMs) ? Math.max(0, graceMs) : 1000;
     try {
         if (process.platform === 'win32') {
             if (pid) spawn('taskkill', ['/pid', String(pid), '/t', '/f'], { stdio: 'ignore', windowsHide: true });
@@ -98,17 +101,27 @@ export function terminateChild(child, graceMs = 1000) {
             child.kill('SIGTERM');
         }
     } catch (_) {}
-    setTimeout(() => {
-        try {
-            if (process.platform === 'win32') {
-                try { child.kill(); } catch (_) {}
-            } else if (pid) {
-                try { process.kill(-pid, 'SIGKILL'); } catch (_) { try { child.kill('SIGKILL'); } catch (_) {} }
-            } else {
-                try { child.kill('SIGKILL'); } catch (_) {}
-            }
-        } catch (_) {}
-    }, graceMs);
+    return new Promise((resolve) => {
+        let settled = false;
+        const finish = () => {
+            if (settled) return;
+            settled = true;
+            resolve();
+        };
+        setTimeout(() => {
+            try {
+                if (process.platform === 'win32') {
+                    try { child.kill(); } catch (_) {}
+                } else if (pid) {
+                    try { process.kill(-pid, 'SIGKILL'); } catch (_) { try { child.kill('SIGKILL'); } catch (_) {} }
+                } else {
+                    try { child.kill('SIGKILL'); } catch (_) {}
+                }
+            } catch (_) {}
+            setTimeout(finish, 150);
+        }, waitMs);
+        setTimeout(finish, waitMs + 2000);
+    });
 }
 
 const TERM_KIND_SET = new Set(TERM_EVENT_KINDS);
@@ -251,6 +264,23 @@ export function isForwardableWorkerEvent(msg) {
 
 function socketOpen(ws) {
     return !!(ws && ws.readyState === 1);
+}
+
+function watchWorkerLiveness(ws) {
+    let lastPong = Date.now();
+    const onPong = () => { lastPong = Date.now(); };
+    ws.on('pong', onPong);
+    const beat = setInterval(() => {
+        if (Date.now() - lastPong > WORKER_PONG_DEADLINE_MS) {
+            try { ws.terminate(); } catch (_) {}
+            return;
+        }
+        try { ws.ping(); } catch (_) {}
+    }, WORKER_PING_INTERVAL_MS);
+    ws.once('close', () => {
+        clearInterval(beat);
+        ws.off('pong', onPong);
+    });
 }
 
 export function createReverseWorkerHub({
@@ -464,6 +494,7 @@ export function createReverseWorkerHub({
                     if (!worker) return;
                     authenticated();
                     authed = true;
+                    watchWorkerLiveness(ws);
                     sendJson(ws, { type: 'welcome', protocolVersion, name: parsed.name }, maxPayloadBytes);
                     return;
                 }
@@ -497,8 +528,24 @@ export function createReverseWorkerHub({
         return true;
     }
 
+    function hasSession(surface) {
+        return !!sessions[surface];
+    }
+
+    function rejectForeignController(surface, controllerWs) {
+        const session = sessions[surface];
+        if (!session || !session.controllerWs || session.controllerWs === controllerWs) return false;
+        if (!socketOpen(session.controllerWs)) return false;
+        const payload = surface === 'term'
+            ? { type: 'term', kind: 'error', text: 'term session is already owned by another controller' }
+            : { type: 'agent', kind: 'error', text: 'agent session is already owned by another controller' };
+        sendJson(controllerWs, payload, maxPayloadBytes);
+        return true;
+    }
+
     function tryStart(surface, controllerWs, msg) {
         if (!enabled) return false;
+        if (rejectForeignController(surface, controllerWs)) return true;
         const requested = surface === 'term'
             ? String(msg.cmd || 'shell').trim()
             : String(msg.agent || 'claude').trim();
@@ -535,6 +582,7 @@ export function createReverseWorkerHub({
         if (!enabled) return false;
         const session = sessions[surface];
         if (!session) return false;
+        if (rejectForeignController(surface, controllerWs)) return true;
         session.controllerWs = controllerWs;
         if (!session.worker || !socketOpen(session.worker.ws)) {
             dropSession(surface, { notify: true });
@@ -549,6 +597,7 @@ export function createReverseWorkerHub({
         if (!enabled) return false;
         const session = sessions[surface];
         if (!session) return false;
+        if (rejectForeignController(surface, controllerWs)) return true;
         session.controllerWs = controllerWs;
         if (session.worker && socketOpen(session.worker.ws)) {
             forwardToWorker(session.worker, { type: 'stop', surface });
@@ -592,6 +641,7 @@ export function createReverseWorkerHub({
         advertisedTermCmds,
         advertisedAgents,
         canHandle,
+        hasSession,
         tryStart,
         tryRelay,
         tryStop,

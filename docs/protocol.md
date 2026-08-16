@@ -15,6 +15,7 @@ WebSocket connection. JSON examples below omit unrelated fields.
 | `/app` | WebSocket | SciREPL app advertises and executes notebook tools | enabled |
 | `/agent` | WebSocket | App chat to a host-side coding-agent CLI | disabled unless configured |
 | `/term` | WebSocket | App terminal to a host-side PTY | disabled unless configured |
+| `/worker` | WebSocket | Reverse worker registers and receives `/agent` and `/term` commands | disabled unless configured |
 
 `/mcp` and `/doctor` use `Authorization: Bearer <token>`. WebSocket endpoints
 authenticate in their first JSON `hello` message. An unauthenticated socket is
@@ -22,8 +23,9 @@ closed after the configured deadline.
 
 `/health` is intentionally unauthenticated so clients can diagnose reachability
 before pairing. It reveals broker/protocol versions, whether the app is connected,
-the advertised tool count, and whether agent and terminal features are enabled;
-it also reports whether the exact generated agent workspace is ready. It does
+the advertised tool count, whether agent, terminal, and reverse-worker features
+are enabled, connected reverse-worker names and advertised CLIs (never host
+details), and whether the exact generated agent workspace is ready. It does
 not expose tool definitions, notebook data, tokens, or host paths.
 
 `GET /doctor` is read-only. `POST /doctor` creates missing generated workspace
@@ -117,6 +119,14 @@ is empty and a start request fails closed. The app can then send:
 { "type": "stop" }
 ```
 
+`stop` ends the session: the adapter is deactivated and surface ownership
+is released, so a later `input` fails until `start`. Provider resume
+tokens are stored separately, keyed by agent name — a later `start` of
+the same CLI may resume, but switching agents cannot reuse the wrong
+session. Controller disconnect destroys that parked ticket, even if the
+same socket later bound a reverse session. A repeated or idle `stop`
+does not forget which controller parked it.
+
 Broker events use `{"type":"agent","kind":...}`. Kinds include `welcome`,
 `started`, `assistant`, `tool_use`, `result`, `stderr`, `error`, and `exit`.
 Adapter output is normalized, but raw CLI behaviour and privileges remain
@@ -140,7 +150,24 @@ After an authenticated hello, the app can send:
 
 The broker replies with `{"type":"term","kind":...}` events such as
 `welcome`, `started`, `data`, `exit`, and `error`. Terminal mode is a privileged
-feature and is disabled by default.
+feature and is disabled by default. When reverse-worker mode is enabled, `/term`
+and `/agent` keep these exact controller message shapes and the broker may
+relay them instead of spawning locally. Relayed `started` events include a
+broker-authored `via` field naming the worker; local-spawn `started` events do
+not. `BROKER_REVERSE_WORKER_STRICT=1` fails a start that no worker advertised
+instead of falling through to local spawn.
+
+## Reverse worker (`/worker`)
+
+Disabled unless `BROKER_REVERSE_WORKER=1`. A worker authenticates with a
+**worker** credential distinct from the controller pairing token, registers a
+name and advertised CLIs, and then receives the same `start` / `input` /
+`resize` / `stop` commands controllers already send on `/term` and `/agent`,
+plus hub-only `detach` on `/term` so the worker can start reconnect grace.
+A second authenticated `hello` on the same socket is an error. The worker
+replies with the same `{"type":"term"|"agent","kind":...}` events. The
+authoritative topology, credential attenuation, reconnect, failure, and
+security design is [Reverse-worker mode](reverse-worker.md).
 
 ## Compatibility
 

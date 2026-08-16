@@ -21,13 +21,15 @@ import crypto from 'node:crypto';
 import os from 'node:os';
 import fs from 'node:fs';
 import path from 'node:path';
-import { spawn, spawnSync } from 'node:child_process';
+import { spawnSync } from 'node:child_process';
 import { WebSocketServer } from 'ws';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { ListToolsRequestSchema, CallToolRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import { inspectWorkspace, setupWorkspace, writePrivateFile } from './workspace.mjs';
-import { configureUtf8Pipes, truncateCodePoints } from './utf8-pipes.mjs';
+import { childProcessEnv, createReverseWorkerHub, loadWorkerToken } from './reverse-worker.mjs';
+import { truncateCodePoints } from './utf8-pipes.mjs';
+import { finalizeAfterStdioClose, spawnUtf8Child } from './spawn-child.mjs';
 import { createWorkbookFileTransfer } from './workbook-files.mjs';
 
 const PACKAGE_METADATA = JSON.parse(fs.readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
@@ -186,22 +188,16 @@ function doctorReport() {
 // BROKER_AGENT_INHERIT_ENV=1 only when the process intentionally needs every
 // host variable; this may expose credentials to the spawned CLI.
 function spawnEnv() {
-    const env = {};
-    const allowed = new Set([
-        'HOME', 'PATH', 'SHELL', 'USER', 'LOGNAME', 'TMPDIR', 'TMP', 'TEMP',
-        'LANG', 'LANGUAGE', 'COLORTERM', 'TERM', 'PREFIX', 'ANDROID_ROOT',
-        'ANDROID_DATA', 'XDG_CONFIG_HOME', 'XDG_CACHE_HOME', 'XDG_DATA_HOME',
-    ]);
-    for (const [key, value] of Object.entries(process.env)) {
-        if (AGENT_INHERIT_ENV || allowed.has(key) || key.startsWith('LC_')) env[key] = value;
-    }
-    if (AGENT_USE_API_KEY) {
-        for (const key of ['ANTHROPIC_API_KEY', 'OPENAI_API_KEY', 'GEMINI_API_KEY', 'GOOGLE_API_KEY']) {
-            if (process.env[key]) env[key] = process.env[key];
-        }
-    }
-    Object.assign(env, { SCIREPL_SESSION: '1', SCIREPL_BROKER_PORT: String(PORT), SCIREPL_MCP: 'scirepl', SCIREPL_MCP_BEARER: TOKEN });
-    return env;
+    return childProcessEnv({
+        inheritEnv: AGENT_INHERIT_ENV,
+        useApiKey: AGENT_USE_API_KEY,
+        extra: {
+            SCIREPL_SESSION: '1',
+            SCIREPL_BROKER_PORT: String(PORT),
+            SCIREPL_MCP: 'scirepl',
+            SCIREPL_MCP_BEARER: TOKEN,
+        },
+    });
 }
 // ── Terminal config (§14C). /term exposes a REAL PTY (full shell) on this
 //    machine, so it is OFF unless explicitly enabled. ──────────────────────────
@@ -215,6 +211,28 @@ const TERM_CMDS = (process.env.BROKER_TERM_CMDS || 'shell,claude,codex,gemini,ag
     .filter(c => !(TERM_NO_SHELL && c === 'shell'));
 const TERM_SHELL = process.env.BROKER_TERM_SHELL || process.env.SHELL || 'bash';
 const TERM_GRACE_MS = integerSetting('BROKER_TERM_GRACE_MS', 600000, 0, 86400000); // keep PTY alive this long after a WS drop
+
+// Reverse-worker mode: a worker dials /worker and the broker relays the existing
+// /agent and /term controller messages to it. Default off. Worker-specific
+// settings are read only when enabled so an unflagged broker ignores typos here.
+const REVERSE_WORKER_ENABLED = process.env.BROKER_REVERSE_WORKER === '1';
+const REVERSE_WORKER_STRICT = REVERSE_WORKER_ENABLED && process.env.BROKER_REVERSE_WORKER_STRICT === '1';
+const WORKER_TOKEN_INFO = REVERSE_WORKER_ENABLED ? loadWorkerToken({ controllerToken: TOKEN }) : null;
+const WORKER_TOKEN = WORKER_TOKEN_INFO ? WORKER_TOKEN_INFO.value : '';
+const MAX_WORKER_WS_PAYLOAD_BYTES = REVERSE_WORKER_ENABLED
+    ? integerSetting('BROKER_MAX_WORKER_WS_PAYLOAD_BYTES', 1048576, 1024, 16777216)
+    : 1048576;
+const reverseWorkerHub = createReverseWorkerHub({
+    enabled: REVERSE_WORKER_ENABLED,
+    strict: REVERSE_WORKER_STRICT,
+    workerToken: WORKER_TOKEN,
+    protocolVersion: PROTOCOL_VERSION,
+    maxPayloadBytes: MAX_WORKER_WS_PAYLOAD_BYTES,
+    maxConnections: MAX_WS_CONNECTIONS,
+    authTimeoutMs: WS_AUTH_TIMEOUT_MS,
+    sendJson: sendWsJson,
+    audit: (msg) => console.log(`[broker] ${msg}`),
+});
 
 // ── App bridge: the single connected SciREPL app (WS) and its advertised tools ──
 const appBridge = {
@@ -382,54 +400,63 @@ const AGENT_PROFILES = {
 //    redundant start from the app never wipes context. A genuine respawn (crash,
 //    or agent switch back) resumes via the captured session_id. ────────────────
 const agentBridge = {
-    ws: null, child: null, profile: null, name: null, buf: '', sessionId: null,
+    ws: null, child: null, profile: null, name: null, buf: '', sessionId: null, sessionAgent: null, mode: null, stoppedBy: null,
     running() { return !!this.child; },
+    occupied() { return !!this.child || !!(this.name && this.mode); },
+    ownerOpen() { return !!(this.ws && this.ws.readyState === 1); },
+    forgetResumeUnless(name) {
+        const owner = this.sessionAgent || this.name;
+        if (owner && owner !== name) {
+            this.sessionId = null;
+            this.sessionAgent = null;
+        }
+    },
+    rememberResume(id) {
+        if (!id || !this.name) return;
+        this.sessionId = id;
+        this.sessionAgent = this.name;
+    },
+    killChild() {
+        if (!this.child) return;
+        try { this.child.kill('SIGTERM'); } catch (_) {}
+        this.child = null;
+    },
     start(ws, name) {
         if (!AGENT_ENABLED) { sendWsJson(ws, { type: 'agent', kind: 'error', text: 'remote agents disabled — restart with BROKER_AGENT=1 after reviewing the host-access warning' }, MAX_AGENT_BUFFER_BYTES); return; }
         const workspaceProblem = agentWorkspaceProblem();
         if (workspaceProblem) { sendWsJson(ws, { type: 'agent', kind: 'error', text: workspaceProblem }, MAX_AGENT_BUFFER_BYTES); return; }
         const prof = AGENT_PROFILES[name];
         if (!prof) { sendWsJson(ws, { type: 'agent', kind: 'error', text: `unknown agent: ${name}` }, MAX_AGENT_BUFFER_BYTES); return; }
+        this.forgetResumeUnless(name);
+        this.stoppedBy = null;
         // One-shot agents (codex/gemini): no long-lived process — each turn spawns a
         // fresh CLI and resumes by session id. Just (re)bind and signal ready.
         if (prof.mode === 'oneshot') {
-            if (this.name && this.name !== name) this.sessionId = null;
-            this.stop();
+            this.killChild();
             this.ws = ws; this.profile = prof; this.name = name; this.mode = 'oneshot';
             sendWsJson(ws, { type: 'agent', kind: 'started', text: name, experimental: !!prof.experimental }, MAX_AGENT_BUFFER_BYTES);
             console.log(`[broker] agent '${name}' ready (one-shot per turn)`);
             return;
         }
-        this.mode = 'persistent';
         // Reuse a healthy session for the same agent (the key context-preserving fix).
         if (this.child && this.name === name) {
+            this.mode = 'persistent';
             this.ws = ws; // re-bind to the (possibly reconnected) app WS
             sendWsJson(ws, { type: 'agent', kind: 'started', text: name, experimental: !!prof.experimental, reused: true }, MAX_AGENT_BUFFER_BYTES);
             console.log(`[broker] agent '${name}' start reused (pid ${this.child.pid})`);
             return;
         }
-        // Switching to a different agent → drop any old session context.
-        if (this.name && this.name !== name) this.sessionId = null;
-        this.stop();
+        this.killChild();
         const env = spawnEnv();
         const resume = this.sessionId || null; // respawn of the same agent → resume context
         let child;
         try {
-            child = spawn(prof.cmd, prof.args({ resume }), { env, cwd: AGENT_CWD, stdio: ['pipe', 'pipe', 'pipe'] });
+            child = spawnUtf8Child(prof.cmd, prof.args({ resume }), { env, cwd: AGENT_CWD, stdio: ['pipe', 'pipe', 'pipe'] });
         } catch (e) {
             sendWsJson(ws, { type: 'agent', kind: 'error', text: `spawn failed: ${e.message}` }, MAX_AGENT_BUFFER_BYTES); return;
         }
-        configureUtf8Pipes(child);
-        this.ws = ws; this.child = child; this.profile = prof; this.name = name; this.buf = '';
+        this.ws = ws; this.child = child; this.profile = prof; this.name = name; this.mode = 'persistent'; this.buf = '';
         const send = (m) => this.ws === ws && sendWsJson(ws, { type: 'agent', ...m }, MAX_AGENT_BUFFER_BYTES);
-        // spawn() reports command-not-found and similar launch failures through
-        // an asynchronous 'error' event, not the surrounding try/catch.
-        child.once('error', (e) => {
-            if (this.child !== child) return;
-            this.child = null;
-            send({ kind: 'error', text: `failed to start ${name}: ${e.message || e}` });
-            send({ kind: 'exit', code: null });
-        });
         child.stdout.on('data', (d) => {
             if (this.child !== child) return;
             const chunk = d;
@@ -446,17 +473,33 @@ const agentBridge = {
                 const line = this.buf.slice(0, i); this.buf = this.buf.slice(i + 1);
                 if (!line.trim()) continue;
                 let o; try { o = JSON.parse(line); } catch { continue; }
-                if (o.session_id) this.sessionId = o.session_id; // capture for --resume
+                if (o.session_id) this.rememberResume(o.session_id); // capture for --resume
                 const n = prof.normalize(o);
                 if (n) send(n);
             }
         });
-        child.stderr.on('data', (d) => send({ kind: 'stderr', text: truncateCodePoints(d, 500) }));
-        child.on('exit', (code) => { if (this.child === child) { this.child = null; send({ kind: 'exit', code }); } });
+        child.stderr.on('data', (d) => {
+            if (this.child !== child) return;
+            send({ kind: 'stderr', text: truncateCodePoints(d, 500) });
+        });
+        finalizeAfterStdioClose(child, {
+            onSpawnError(e) {
+                if (agentBridge.child !== child) return;
+                agentBridge.child = null;
+                send({ kind: 'error', text: `failed to start ${name}: ${e.message || e}` });
+                send({ kind: 'exit', code: null });
+            },
+            onClose(code) {
+                if (agentBridge.child !== child) return;
+                agentBridge.child = null;
+                send({ kind: 'exit', code });
+            },
+        });
         send({ kind: 'started', text: name, experimental: !!prof.experimental, resumed: !!resume });
         console.log(`[broker] agent '${name}' launch requested${child.pid ? ' (pid ' + child.pid + ')' : ''}${resume ? ' [resumed ' + resume.slice(0, 8) + ']' : ''}`);
     },
     input(text) {
+        if (!this.profile || !this.mode) return false;
         if (this.mode === 'oneshot') return this._oneshotTurn(text);
         if (!this.child) return false;
         try { this.child.stdin.write(this.profile.encodeTurn(text)); return true; } catch { return false; }
@@ -469,19 +512,12 @@ const agentBridge = {
         const prof = this.profile, ws = this.ws;
         const send = (m) => this.ws === ws && sendWsJson(ws, { type: 'agent', ...m }, MAX_AGENT_BUFFER_BYTES);
         let child;
-        try { child = spawn(prof.cmd, prof.buildArgs(text, this.sessionId), { env: spawnEnv(), cwd: AGENT_CWD, stdio: ['ignore', 'pipe', 'pipe'] }); }
+        try { child = spawnUtf8Child(prof.cmd, prof.buildArgs(text, this.sessionId), { env: spawnEnv(), cwd: AGENT_CWD, stdio: ['ignore', 'pipe', 'pipe'] }); }
         catch (e) { send({ kind: 'error', text: 'spawn failed: ' + (e.message || e) }); send({ kind: 'result', text: '' }); return false; }
-        configureUtf8Pipes(child);
         this.child = child; this.buf = ''; let sawResult = false;
-        child.once('error', (e) => {
-            if (this.child !== child) return;
-            this.child = null;
-            send({ kind: 'error', text: `failed to start ${this.name}: ${e.message || e}` });
-            send({ kind: 'result', text: '' });
-        });
         if (prof.format === 'text') {
             // Plain-text agents (agy): no JSON to parse — accumulate stdout as the
-            // answer, emit it on exit, and remember to --continue next turn.
+            // answer, emit it after stdio close, and remember to --continue next turn.
             child.stdout.on('data', (d) => {
                 if (this.child !== child) return;
                 const chunk = d;
@@ -494,14 +530,25 @@ const agentBridge = {
                 }
                 this.buf += chunk;
             });
-            child.stderr.on('data', (d) => send({ kind: 'stderr', text: truncateCodePoints(d, 500) }));
-            child.on('exit', (code) => {
+            child.stderr.on('data', (d) => {
                 if (this.child !== child) return;
-                this.child = null;
-                if (!this.sessionId) this.sessionId = '_continue_'; // enable -c/--continue next turn
-                const out = this.buf.trim();
-                if (out) send({ kind: 'assistant', text: out });
-                send(code ? { kind: 'error', text: `${this.name} exited (${code})` } : { kind: 'result', text: '' });
+                send({ kind: 'stderr', text: truncateCodePoints(d, 500) });
+            });
+            finalizeAfterStdioClose(child, {
+                onSpawnError(e) {
+                    if (agentBridge.child !== child) return;
+                    agentBridge.child = null;
+                    send({ kind: 'error', text: `failed to start ${agentBridge.name}: ${e.message || e}` });
+                    send({ kind: 'result', text: '' });
+                },
+                onClose(code) {
+                    if (agentBridge.child !== child) return;
+                    agentBridge.child = null;
+                    if (!agentBridge.sessionId) agentBridge.rememberResume('_continue_');
+                    const out = agentBridge.buf.trim();
+                    if (out) send({ kind: 'assistant', text: out });
+                    send(code ? { kind: 'error', text: `${agentBridge.name} exited (${code})` } : { kind: 'result', text: '' });
+                },
             });
             return true;
         }
@@ -521,18 +568,54 @@ const agentBridge = {
                 const line = this.buf.slice(0, i); this.buf = this.buf.slice(i + 1);
                 if (!line.trim()) continue;
                 let o; try { o = JSON.parse(line); } catch { continue; }
-                const sid = prof.sessionIdFrom && prof.sessionIdFrom(o); if (sid) this.sessionId = sid;
+                const sid = prof.sessionIdFrom && prof.sessionIdFrom(o); if (sid) this.rememberResume(sid);
                 const n = prof.normalize(o); if (n) { if (n.kind === 'result') sawResult = true; send(n); }
             }
         });
-        child.stderr.on('data', (d) => send({ kind: 'stderr', text: truncateCodePoints(d, 500) }));
-        child.on('exit', (code) => { if (this.child === child) { this.child = null; if (!sawResult) send(code ? { kind: 'error', text: `${this.name} exited (${code})` } : { kind: 'result', text: '' }); } });
+        child.stderr.on('data', (d) => {
+            if (this.child !== child) return;
+            send({ kind: 'stderr', text: truncateCodePoints(d, 500) });
+        });
+        finalizeAfterStdioClose(child, {
+            onSpawnError(e) {
+                if (agentBridge.child !== child) return;
+                agentBridge.child = null;
+                send({ kind: 'error', text: `failed to start ${agentBridge.name}: ${e.message || e}` });
+                send({ kind: 'result', text: '' });
+            },
+            onClose(code) {
+                if (agentBridge.child !== child) return;
+                agentBridge.child = null;
+                if (!sawResult) send(code ? { kind: 'error', text: `${agentBridge.name} exited (${code})` } : { kind: 'result', text: '' });
+            },
+        });
         return true;
     },
     stop() {
-        if (this.child) { try { this.child.kill('SIGTERM'); } catch (_) {} this.child = null; console.log('[broker] agent stopped'); }
+        const had = this.occupied();
+        if (had) this.stoppedBy = this.ws;
+        if (this.sessionId && this.name) this.sessionAgent = this.name;
+        this.killChild();
+        this.ws = null;
+        this.profile = null;
+        this.name = null;
+        this.mode = null;
+        this.buf = '';
+        if (had) console.log('[broker] agent stopped');
     },
-    reset() { this.stop(); this.sessionId = null; this.name = null; },
+    reset() {
+        const had = this.occupied();
+        this.killChild();
+        this.ws = null;
+        this.profile = null;
+        this.name = null;
+        this.mode = null;
+        this.buf = '';
+        this.sessionId = null;
+        this.sessionAgent = null;
+        this.stoppedBy = null;
+        if (had) console.log('[broker] agent stopped');
+    },
 };
 
 // ── Terminal bridge (§14C): a real PTY relayed to xterm.js in the app. ─────────
@@ -752,6 +835,7 @@ const httpServer = http.createServer(async (req, res) => {
             agentEnabled: AGENT_ENABLED,
             termEnabled: TERM_ENABLED,
             workspaceReady,
+            ...reverseWorkerHub.healthFields(),
         }));
         return;
     }
@@ -818,7 +902,11 @@ const agentWss = new WebSocketServer({ noServer: true, maxPayload: MAX_AGENT_WS_
 const termWss = new WebSocketServer({ noServer: true, maxPayload: MAX_TERM_WS_PAYLOAD_BYTES, perMessageDeflate: false });
 httpServer.on('upgrade', (req, socket, head) => {
     const { pathname } = new URL(req.url, `http://127.0.0.1:${PORT}`);
-    const route = pathname === '/app' ? wss : pathname === '/agent' ? agentWss : pathname === '/term' ? termWss : null;
+    const route = pathname === '/app' ? wss
+        : pathname === '/agent' ? agentWss
+        : pathname === '/term' ? termWss
+        : (REVERSE_WORKER_ENABLED && pathname === '/worker') ? reverseWorkerHub.wss
+        : null;
     if (!route || route.clients.size >= MAX_WS_CONNECTIONS) { socket.destroy(); return; }
     route.handleUpgrade(req, socket, head, (ws) => {
         // ws surfaces protocol/payload failures as 'error' events. Always consume
@@ -888,22 +976,72 @@ agentWss.on('connection', (ws) => {
         if (msg.type === 'hello') {
             if (!tokenMatches(msg.token)) { sendWsJson(ws, { type: 'agent', kind: 'error', text: 'unauthorized' }, MAX_AGENT_BUFFER_BYTES); ws.close(1008, 'unauthorized'); return; }
             authenticated();
-            if (!AGENT_ENABLED) { sendWsJson(ws, { type: 'agent', kind: 'error', text: 'remote agents disabled — restart with BROKER_AGENT=1 after reviewing the host-access warning' }, MAX_AGENT_BUFFER_BYTES); ws.close(1008, 'remote agents disabled'); return; }
+            if (!AGENT_ENABLED && !REVERSE_WORKER_ENABLED) { sendWsJson(ws, { type: 'agent', kind: 'error', text: 'remote agents disabled — restart with BROKER_AGENT=1 after reviewing the host-access warning' }, MAX_AGENT_BUFFER_BYTES); ws.close(1008, 'remote agents disabled'); return; }
             authed = true;
             const configuredAgents = Object.keys(AGENT_PROFILES);
             const availableAgents = configuredAgents.filter(name => hasCmd(AGENT_PROFILES[name].cmd));
             const workspaceReady = !agentWorkspaceProblem();
+            const workerAgents = reverseWorkerHub.advertisedAgents();
             // Existing Pro clients read only `agents`, so make that the usable
             // subset. `configuredAgents` preserves discovery/debug information.
-            sendWsJson(ws, { type: 'agent', kind: 'welcome', protocolVersion: PROTOCOL_VERSION, agents: workspaceReady ? availableAgents : [], availableAgents, configuredAgents, workspaceReady, running: agentBridge.running() && agentBridge.name }, MAX_AGENT_BUFFER_BYTES);
+            // Reverse workers contribute advertised CLIs even when the broker
+            // host has no prepared workspace and is not spawning locally.
+            const agents = [...new Set([
+                ...(AGENT_ENABLED && workspaceReady ? availableAgents : []),
+                ...workerAgents,
+            ])];
+            const availableMerged = [...new Set([
+                ...(AGENT_ENABLED ? availableAgents : []),
+                ...workerAgents,
+            ])];
+            sendWsJson(ws, { type: 'agent', kind: 'welcome', protocolVersion: PROTOCOL_VERSION, agents, availableAgents: availableMerged, configuredAgents, workspaceReady, running: agentBridge.running() && agentBridge.name }, MAX_AGENT_BUFFER_BYTES);
             return;
         }
         if (!authed) return;
-        if (msg.type === 'start') agentBridge.start(ws, msg.agent || 'claude');
-        else if (msg.type === 'input') { if (!agentBridge.input(String(msg.text || ''))) sendWsJson(ws, { type: 'agent', kind: 'error', text: 'no agent running' }, MAX_AGENT_BUFFER_BYTES); }
-        else if (msg.type === 'stop') agentBridge.stop();
+        if (msg.type === 'start') {
+            if (agentBridge.occupied() && agentBridge.ownerOpen() && agentBridge.ws !== ws) {
+                sendWsJson(ws, { type: 'agent', kind: 'error', text: 'agent session is already owned by another controller' }, MAX_AGENT_BUFFER_BYTES);
+                return;
+            }
+            if (agentBridge.occupied()) {
+                agentBridge.start(ws, msg.agent || 'claude');
+                return;
+            }
+            if (reverseWorkerHub.hasSession('agent')) {
+                reverseWorkerHub.tryStart('agent', ws, msg);
+                return;
+            }
+            if (!reverseWorkerHub.tryStart('agent', ws, msg)) agentBridge.start(ws, msg.agent || 'claude');
+        } else if (msg.type === 'input') {
+            if (reverseWorkerHub.hasSession('agent')) {
+                reverseWorkerHub.tryRelay('agent', ws, { type: 'input', text: String(msg.text || '') });
+                return;
+            }
+            if (agentBridge.occupied()) {
+                if (agentBridge.ownerOpen() && agentBridge.ws !== ws) {
+                    sendWsJson(ws, { type: 'agent', kind: 'error', text: 'agent session is already owned by another controller' }, MAX_AGENT_BUFFER_BYTES);
+                    return;
+                }
+                if (!agentBridge.input(String(msg.text || ''))) sendWsJson(ws, { type: 'agent', kind: 'error', text: 'no agent running' }, MAX_AGENT_BUFFER_BYTES);
+                return;
+            }
+            sendWsJson(ws, { type: 'agent', kind: 'error', text: 'no agent running' }, MAX_AGENT_BUFFER_BYTES);
+        } else if (msg.type === 'stop') {
+            if (reverseWorkerHub.hasSession('agent')) {
+                reverseWorkerHub.tryStop('agent', ws);
+                return;
+            }
+            if (agentBridge.occupied() && agentBridge.ownerOpen() && agentBridge.ws !== ws) {
+                sendWsJson(ws, { type: 'agent', kind: 'error', text: 'agent session is already owned by another controller' }, MAX_AGENT_BUFFER_BYTES);
+                return;
+            }
+            agentBridge.stop();
+        }
     });
-    ws.on('close', () => { if (agentBridge.ws === ws) agentBridge.stop(); });
+    ws.on('close', () => {
+        reverseWorkerHub.detach('agent', ws);
+        if (agentBridge.ws === ws || agentBridge.stoppedBy === ws) agentBridge.reset();
+    });
 });
 
 // /term: the app connects out to a real PTY (xterm.js front-end).
@@ -918,16 +1056,30 @@ termWss.on('connection', (ws) => {
             if (!tokenMatches(msg.token)) { sendWsJson(ws, { type: 'term', kind: 'error', text: 'unauthorized' }, MAX_TERM_WS_PAYLOAD_BYTES); ws.close(1008, 'unauthorized'); return; }
             authenticated();
             authed = true;
-            sendWsJson(ws, { type: 'term', kind: 'welcome', protocolVersion: PROTOCOL_VERSION, enabled: TERM_ENABLED, cmds: TERM_ENABLED ? TERM_CMDS : [] }, MAX_TERM_WS_PAYLOAD_BYTES);
+            const workerCmds = reverseWorkerHub.advertisedTermCmds();
+            const termOn = TERM_ENABLED || workerCmds.length > 0;
+            const cmds = [...new Set([
+                ...(TERM_ENABLED ? TERM_CMDS : []),
+                ...workerCmds,
+            ])];
+            sendWsJson(ws, { type: 'term', kind: 'welcome', protocolVersion: PROTOCOL_VERSION, enabled: termOn, cmds: termOn ? cmds : [] }, MAX_TERM_WS_PAYLOAD_BYTES);
             return;
         }
         if (!authed) return;
-        if (msg.type === 'start') termBridge.start(ws, { cmd: msg.cmd, cols: msg.cols, rows: msg.rows });
-        else if (msg.type === 'input') termBridge.input(String(msg.data || ''));
-        else if (msg.type === 'resize') termBridge.resize(msg.cols, msg.rows);
-        else if (msg.type === 'stop') termBridge.stop();
+        if (msg.type === 'start') {
+            if (termBridge.running() || !reverseWorkerHub.tryStart('term', ws, msg)) termBridge.start(ws, { cmd: msg.cmd, cols: msg.cols, rows: msg.rows });
+        } else if (msg.type === 'input') {
+            if (termBridge.running() || !reverseWorkerHub.tryRelay('term', ws, { type: 'input', data: String(msg.data || '') })) termBridge.input(String(msg.data || ''));
+        } else if (msg.type === 'resize') {
+            if (termBridge.running() || !reverseWorkerHub.tryRelay('term', ws, { type: 'resize', cols: msg.cols, rows: msg.rows })) termBridge.resize(msg.cols, msg.rows);
+        } else if (msg.type === 'stop') {
+            if (termBridge.running() || !reverseWorkerHub.tryStop('term', ws)) termBridge.stop();
+        }
     });
-    ws.on('close', () => termBridge.detach(ws)); // keep PTY alive for reconnect
+    ws.on('close', () => {
+        reverseWorkerHub.detach('term', ws);
+        termBridge.detach(ws);
+    }); // keep PTY alive for reconnect
 });
 
 httpServer.listen(PORT, HOST, () => {
@@ -943,8 +1095,9 @@ httpServer.listen(PORT, HOST, () => {
     console.log(`[broker]   agent WS:      ${AGENT_ENABLED ? 'ENABLED ws://' + displayHost + ':' + PORT + '/agent (agents: ' + Object.keys(AGENT_PROFILES).join(', ') + ')' : 'disabled (set BROKER_AGENT=1 after reviewing SECURITY.md)'}`);
     if (AGENT_ENABLED) console.log(`[broker]   agent access:  Claude ${AGENT_FULL_ACCESS ? 'full host tools' : 'allowlist ' + AGENT_ALLOWED_TOOLS}; other CLIs may retain normal host capabilities; environment ${AGENT_INHERIT_ENV ? 'inherited' : 'restricted'}`);
     console.log(`[broker]   terminal:      ${TERM_ENABLED ? 'ENABLED ws://' + displayHost + ':' + PORT + '/term (cmds: ' + TERM_CMDS.join(', ') + ')' + (TERM_NO_SHELL ? ' [no-shell: agents only, no shell escape]' : '') : 'disabled (set BROKER_TERM=1 to expose a PTY)'}`);
+    console.log(`[broker]   reverse worker:${REVERSE_WORKER_ENABLED ? ' ENABLED ws://' + displayHost + ':' + PORT + '/worker' + (REVERSE_WORKER_STRICT ? ' [strict: no local-spawn fallback]' : '') + ' (worker token ' + (WORKER_TOKEN_INFO.source === 'BROKER_WORKER_TOKEN' ? 'provided by BROKER_WORKER_TOKEN (not printed)' : 'stored in ' + WORKER_TOKEN_INFO.source + ' (mode 0600)') + ')' : ' disabled (set BROKER_REVERSE_WORKER=1 after --acknowledge-reverse-worker-command-relay)'}`);
     console.log(`[broker]   pairing token: ${TOKEN_INFO.source === 'BROKER_TOKEN' ? 'provided by BROKER_TOKEN (not printed)' : 'stored in ' + TOKEN_INFO.source + ' (mode 0600)'}`);
     console.log('[broker] For remote access, keep loopback binding and use Tailscale Serve or an SSH tunnel.');
 });
 
-export { httpServer, appBridge, agentBridge, termBridge, TOKEN, PORT, PROTOCOL_VERSION };
+export { httpServer, appBridge, agentBridge, termBridge, reverseWorkerHub, TOKEN, PORT, PROTOCOL_VERSION };

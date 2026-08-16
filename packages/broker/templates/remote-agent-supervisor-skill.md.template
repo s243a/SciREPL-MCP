@@ -7,8 +7,9 @@ description: Use when driving a coding agent (agy, gemini, codex) through the Sc
 
 You are the controller. A cheaper or more specialised agent does the volume
 work inside a repository; you send it tasks, review what it asks permission
-for, and verify what it produced. The broker sits between you: it spawns the
-agent on its host, and you speak to it over authenticated WebSockets.
+for, and verify what it produced. The broker sits between you: it either spawns the agent on its host or
+relays the same `/term` and `/agent` messages to a reverse worker that
+dialed out. You speak to the hub over authenticated WebSockets either way.
 
 ## Broker configuration to require
 

@@ -172,7 +172,21 @@ const AGENT_PROFILES = {
 };
 
 const term = { pty: null, label: null, cols: 80, rows: 24, grace: null };
-const agent = { child: null, profile: null, name: null, buf: '', sessionId: null, mode: null };
+const agent = { child: null, profile: null, name: null, buf: '', sessionId: null, sessionAgent: null, mode: null };
+
+function forgetResumeUnless(name) {
+    const owner = agent.sessionAgent || agent.name;
+    if (owner && owner !== name) {
+        agent.sessionId = null;
+        agent.sessionAgent = null;
+    }
+}
+
+function rememberResume(id) {
+    if (!id || !agent.name) return;
+    agent.sessionId = id;
+    agent.sessionAgent = agent.name;
+}
 
 let stopping = false;
 let activeWs = null;
@@ -291,22 +305,21 @@ function startAgent(name) {
     const prof = AGENT_PROFILES[name];
     if (!prof) { send({ type: 'agent', kind: 'error', text: `unknown agent: ${name}` }); return; }
     if (!AGENTS.includes(name)) { send({ type: 'agent', kind: 'error', text: `agent not advertised: ${name}` }); return; }
+    forgetResumeUnless(name);
     if (prof.mode === 'oneshot') {
-        if (agent.name && agent.name !== name) agent.sessionId = null;
-        stopAgent();
+        stopAgentChild();
         agent.profile = prof;
         agent.name = name;
         agent.mode = 'oneshot';
         send({ type: 'agent', kind: 'started', text: name, experimental: !!prof.experimental });
         return;
     }
-    agent.mode = 'persistent';
     if (agent.child && agent.name === name) {
+        agent.mode = 'persistent';
         send({ type: 'agent', kind: 'started', text: name, experimental: !!prof.experimental, reused: true });
         return;
     }
-    if (agent.name && agent.name !== name) agent.sessionId = null;
-    stopAgent();
+    stopAgentChild();
     const resume = agent.sessionId || null;
     let child;
     try { child = spawnChild(prof.cmd, prof.args({ resume }), ['pipe', 'pipe', 'pipe']); }
@@ -314,6 +327,7 @@ function startAgent(name) {
     agent.child = child;
     agent.profile = prof;
     agent.name = name;
+    agent.mode = 'persistent';
     agent.buf = '';
     child.once('spawn', () => {
         if (agent.child !== child) return;
@@ -335,7 +349,7 @@ function startAgent(name) {
             const line = agent.buf.slice(0, i); agent.buf = agent.buf.slice(i + 1);
             if (!line.trim()) continue;
             let o; try { o = JSON.parse(line); } catch { continue; }
-            if (o.session_id) agent.sessionId = o.session_id;
+            if (o.session_id) rememberResume(o.session_id);
             const n = prof.normalize(o);
             if (n) send({ type: 'agent', ...n });
         }
@@ -396,7 +410,7 @@ function oneshotTurn(text) {
             onClose(code) {
                 if (agent.child !== child) return;
                 agent.child = null;
-                if (!agent.sessionId) agent.sessionId = '_continue_';
+                if (!agent.sessionId) rememberResume('_continue_');
                 const out = agent.buf.trim();
                 if (out) send({ type: 'agent', kind: 'assistant', text: out });
                 send(code ? { type: 'agent', kind: 'error', text: `${agent.name} exited (${code})` } : { type: 'agent', kind: 'result', text: '' });
@@ -420,7 +434,7 @@ function oneshotTurn(text) {
             const line = agent.buf.slice(0, i); agent.buf = agent.buf.slice(i + 1);
             if (!line.trim()) continue;
             let o; try { o = JSON.parse(line); } catch { continue; }
-            const sid = prof.sessionIdFrom && prof.sessionIdFrom(o); if (sid) agent.sessionId = sid;
+            const sid = prof.sessionIdFrom && prof.sessionIdFrom(o); if (sid) rememberResume(sid);
             const n = prof.normalize(o); if (n) { if (n.kind === 'result') sawResult = true; send({ type: 'agent', ...n }); }
         }
     });
@@ -445,24 +459,31 @@ function oneshotTurn(text) {
 }
 
 function inputAgent(text) {
+    if (!agent.profile || !agent.mode) { send({ type: 'agent', kind: 'error', text: 'no agent running' }); return false; }
     if (agent.mode === 'oneshot') return oneshotTurn(text);
     if (!agent.child) { send({ type: 'agent', kind: 'error', text: 'no agent running' }); return false; }
     try { agent.child.stdin.write(agent.profile.encodeTurn(text)); return true; } catch { return false; }
 }
 
-function stopAgent() {
+function stopAgentChild() {
     const child = agent.child;
     agent.child = null;
     terminateChild(child);
 }
 
-function resetAgent() {
-    stopAgent();
+function stopAgent() {
+    if (agent.sessionId && agent.name) agent.sessionAgent = agent.name;
+    stopAgentChild();
     agent.profile = null;
     agent.name = null;
     agent.mode = null;
     agent.buf = '';
+}
+
+function resetAgent() {
+    stopAgent();
     agent.sessionId = null;
+    agent.sessionAgent = null;
 }
 
 function sessionClaim() {

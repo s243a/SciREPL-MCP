@@ -119,6 +119,12 @@ is empty and a start request fails closed. The app can then send:
 { "type": "stop" }
 ```
 
+`stop` ends the session: the adapter is deactivated and surface ownership
+is released, so a later `input` fails until `start`. Provider resume
+tokens are stored separately, keyed by agent name — a later `start` of
+the same CLI may resume, but switching agents cannot reuse the wrong
+session.
+
 Broker events use `{"type":"agent","kind":...}`. Kinds include `welcome`,
 `started`, `assistant`, `tool_use`, `result`, `stderr`, `error`, and `exit`.
 Adapter output is normalized, but raw CLI behaviour and privileges remain

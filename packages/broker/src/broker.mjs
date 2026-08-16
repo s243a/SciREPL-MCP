@@ -400,37 +400,53 @@ const AGENT_PROFILES = {
 //    redundant start from the app never wipes context. A genuine respawn (crash,
 //    or agent switch back) resumes via the captured session_id. ────────────────
 const agentBridge = {
-    ws: null, child: null, profile: null, name: null, buf: '', sessionId: null, mode: null,
+    ws: null, child: null, profile: null, name: null, buf: '', sessionId: null, sessionAgent: null, mode: null, stoppedBy: null,
     running() { return !!this.child; },
     occupied() { return !!this.child || !!(this.name && this.mode); },
     ownerOpen() { return !!(this.ws && this.ws.readyState === 1); },
+    forgetResumeUnless(name) {
+        const owner = this.sessionAgent || this.name;
+        if (owner && owner !== name) {
+            this.sessionId = null;
+            this.sessionAgent = null;
+        }
+    },
+    rememberResume(id) {
+        if (!id || !this.name) return;
+        this.sessionId = id;
+        this.sessionAgent = this.name;
+    },
+    killChild() {
+        if (!this.child) return;
+        try { this.child.kill('SIGTERM'); } catch (_) {}
+        this.child = null;
+    },
     start(ws, name) {
         if (!AGENT_ENABLED) { sendWsJson(ws, { type: 'agent', kind: 'error', text: 'remote agents disabled — restart with BROKER_AGENT=1 after reviewing the host-access warning' }, MAX_AGENT_BUFFER_BYTES); return; }
         const workspaceProblem = agentWorkspaceProblem();
         if (workspaceProblem) { sendWsJson(ws, { type: 'agent', kind: 'error', text: workspaceProblem }, MAX_AGENT_BUFFER_BYTES); return; }
         const prof = AGENT_PROFILES[name];
         if (!prof) { sendWsJson(ws, { type: 'agent', kind: 'error', text: `unknown agent: ${name}` }, MAX_AGENT_BUFFER_BYTES); return; }
+        this.forgetResumeUnless(name);
+        this.stoppedBy = null;
         // One-shot agents (codex/gemini): no long-lived process — each turn spawns a
         // fresh CLI and resumes by session id. Just (re)bind and signal ready.
         if (prof.mode === 'oneshot') {
-            if (this.name && this.name !== name) this.sessionId = null;
-            this.stop();
+            this.killChild();
             this.ws = ws; this.profile = prof; this.name = name; this.mode = 'oneshot';
             sendWsJson(ws, { type: 'agent', kind: 'started', text: name, experimental: !!prof.experimental }, MAX_AGENT_BUFFER_BYTES);
             console.log(`[broker] agent '${name}' ready (one-shot per turn)`);
             return;
         }
-        this.mode = 'persistent';
         // Reuse a healthy session for the same agent (the key context-preserving fix).
         if (this.child && this.name === name) {
+            this.mode = 'persistent';
             this.ws = ws; // re-bind to the (possibly reconnected) app WS
             sendWsJson(ws, { type: 'agent', kind: 'started', text: name, experimental: !!prof.experimental, reused: true }, MAX_AGENT_BUFFER_BYTES);
             console.log(`[broker] agent '${name}' start reused (pid ${this.child.pid})`);
             return;
         }
-        // Switching to a different agent → drop any old session context.
-        if (this.name && this.name !== name) this.sessionId = null;
-        this.stop();
+        this.killChild();
         const env = spawnEnv();
         const resume = this.sessionId || null; // respawn of the same agent → resume context
         let child;
@@ -439,7 +455,7 @@ const agentBridge = {
         } catch (e) {
             sendWsJson(ws, { type: 'agent', kind: 'error', text: `spawn failed: ${e.message}` }, MAX_AGENT_BUFFER_BYTES); return;
         }
-        this.ws = ws; this.child = child; this.profile = prof; this.name = name; this.buf = '';
+        this.ws = ws; this.child = child; this.profile = prof; this.name = name; this.mode = 'persistent'; this.buf = '';
         const send = (m) => this.ws === ws && sendWsJson(ws, { type: 'agent', ...m }, MAX_AGENT_BUFFER_BYTES);
         child.stdout.on('data', (d) => {
             if (this.child !== child) return;
@@ -457,7 +473,7 @@ const agentBridge = {
                 const line = this.buf.slice(0, i); this.buf = this.buf.slice(i + 1);
                 if (!line.trim()) continue;
                 let o; try { o = JSON.parse(line); } catch { continue; }
-                if (o.session_id) this.sessionId = o.session_id; // capture for --resume
+                if (o.session_id) this.rememberResume(o.session_id); // capture for --resume
                 const n = prof.normalize(o);
                 if (n) send(n);
             }
@@ -483,6 +499,7 @@ const agentBridge = {
         console.log(`[broker] agent '${name}' launch requested${child.pid ? ' (pid ' + child.pid + ')' : ''}${resume ? ' [resumed ' + resume.slice(0, 8) + ']' : ''}`);
     },
     input(text) {
+        if (!this.profile || !this.mode) return false;
         if (this.mode === 'oneshot') return this._oneshotTurn(text);
         if (!this.child) return false;
         try { this.child.stdin.write(this.profile.encodeTurn(text)); return true; } catch { return false; }
@@ -527,7 +544,7 @@ const agentBridge = {
                 onClose(code) {
                     if (agentBridge.child !== child) return;
                     agentBridge.child = null;
-                    if (!agentBridge.sessionId) agentBridge.sessionId = '_continue_';
+                    if (!agentBridge.sessionId) agentBridge.rememberResume('_continue_');
                     const out = agentBridge.buf.trim();
                     if (out) send({ kind: 'assistant', text: out });
                     send(code ? { kind: 'error', text: `${agentBridge.name} exited (${code})` } : { kind: 'result', text: '' });
@@ -551,7 +568,7 @@ const agentBridge = {
                 const line = this.buf.slice(0, i); this.buf = this.buf.slice(i + 1);
                 if (!line.trim()) continue;
                 let o; try { o = JSON.parse(line); } catch { continue; }
-                const sid = prof.sessionIdFrom && prof.sessionIdFrom(o); if (sid) this.sessionId = sid;
+                const sid = prof.sessionIdFrom && prof.sessionIdFrom(o); if (sid) this.rememberResume(sid);
                 const n = prof.normalize(o); if (n) { if (n.kind === 'result') sawResult = true; send(n); }
             }
         });
@@ -575,9 +592,30 @@ const agentBridge = {
         return true;
     },
     stop() {
-        if (this.child) { try { this.child.kill('SIGTERM'); } catch (_) {} this.child = null; console.log('[broker] agent stopped'); }
+        const had = this.occupied();
+        this.stoppedBy = this.ws;
+        if (this.sessionId && this.name) this.sessionAgent = this.name;
+        this.killChild();
+        this.ws = null;
+        this.profile = null;
+        this.name = null;
+        this.mode = null;
+        this.buf = '';
+        if (had) console.log('[broker] agent stopped');
     },
-    reset() { this.stop(); this.sessionId = null; this.name = null; this.mode = null; },
+    reset() {
+        const had = this.occupied();
+        this.killChild();
+        this.ws = null;
+        this.profile = null;
+        this.name = null;
+        this.mode = null;
+        this.buf = '';
+        this.sessionId = null;
+        this.sessionAgent = null;
+        this.stoppedBy = null;
+        if (had) console.log('[broker] agent stopped');
+    },
 };
 
 // ── Terminal bridge (§14C): a real PTY relayed to xterm.js in the app. ─────────
@@ -1002,7 +1040,7 @@ agentWss.on('connection', (ws) => {
     });
     ws.on('close', () => {
         if (reverseWorkerHub.detach('agent', ws)) return;
-        if (agentBridge.ws === ws) agentBridge.reset();
+        if (agentBridge.ws === ws || agentBridge.stoppedBy === ws) agentBridge.reset();
     });
 });
 

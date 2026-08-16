@@ -480,7 +480,7 @@ try {
     strictChild.kill('SIGTERM');
 }
 
-const { httpServer, reverseWorkerHub, termBridge } = await import('../src/broker.mjs');
+const { httpServer, reverseWorkerHub, termBridge, agentBridge } = await import('../src/broker.mjs');
 await sleep(250);
 
 console.log('\nCredential classes and registration\n');
@@ -1483,6 +1483,91 @@ try {
 } catch (e) {
     console.log('  ✗ two-controller ownership error: ' + (e.stack || e));
     failed++;
+}
+
+console.log('\nLocal /agent Stop releases ownership\n');
+try {
+    async function assertStopReleases(agentName, label) {
+        const a = await connectController('/agent');
+        await a.first;
+        const started = collectUntil(a.ws, (m) => m.kind === 'started' && m.text === agentName);
+        a.ws.send(JSON.stringify({ type: 'start', agent: agentName }));
+        const startedGot = await started;
+        ok(startedGot.some(m => m.kind === 'started' && m.via === undefined),
+            `controller A starts local ${label}`);
+        a.ws.send(JSON.stringify({ type: 'stop' }));
+        const waitReleased = Date.now() + 1000;
+        while (agentBridge.occupied() && Date.now() < waitReleased) await sleep(20);
+        ok(!agentBridge.occupied() && !agentBridge.name && !agentBridge.mode && !agentBridge.profile,
+            `explicit Stop releases ${label} ownership and deactivates the adapter`);
+        const afterStop = collectUntil(a.ws, (m) => m.kind === 'error');
+        a.ws.send(JSON.stringify({ type: 'input', text: 'another turn after stop' }));
+        const afterStopGot = await afterStop;
+        ok(afterStopGot.some(m => /no agent running/.test(m.text || '')),
+            `controller A cannot submit another ${label} turn without starting again`);
+        const b = await connectController('/agent');
+        await b.first;
+        const bStarted = collectUntil(b.ws, (m) => m.kind === 'started' || m.kind === 'error');
+        b.ws.send(JSON.stringify({ type: 'start', agent: agentName }));
+        const bGot = await bStarted;
+        ok(bGot.some(m => m.kind === 'started' && m.text === agentName && m.via === undefined) &&
+            !bGot.some(m => /already owned/.test(m.text || '')),
+            `controller B can start local ${label} immediately after A stops`);
+        try { a.ws.close(); } catch (_) {}
+        try { b.ws.close(); } catch (_) {}
+        const waitClear = Date.now() + 1000;
+        while (agentBridge.occupied() && Date.now() < waitClear) await sleep(20);
+        agentBridge.reset();
+        await sleep(50);
+    }
+
+    await assertStopReleases('codex', 'one-shot Codex');
+
+    const aResume = await connectController('/agent');
+    await aResume.first;
+    aResume.ws.send(JSON.stringify({ type: 'start', agent: 'codex' }));
+    await collectUntil(aResume.ws, (m) => m.kind === 'started');
+    agentBridge.sessionId = 'thread-from-codex';
+    aResume.ws.send(JSON.stringify({ type: 'stop' }));
+    const waitPark = Date.now() + 1000;
+    while (agentBridge.occupied() && Date.now() < waitPark) await sleep(20);
+    ok(agentBridge.sessionId === 'thread-from-codex' && agentBridge.sessionAgent === 'codex' && !agentBridge.occupied(),
+        'Stop parks resume identity separately from ownership');
+    aResume.ws.send(JSON.stringify({ type: 'start', agent: 'codex' }));
+    await collectUntil(aResume.ws, (m) => m.kind === 'started');
+    ok(agentBridge.sessionId === 'thread-from-codex' && agentBridge.sessionAgent === 'codex' && agentBridge.name === 'codex',
+        'a later start of the same agent keeps the parked resume');
+    aResume.ws.send(JSON.stringify({ type: 'stop' }));
+    const waitPark2 = Date.now() + 1000;
+    while (agentBridge.occupied() && Date.now() < waitPark2) await sleep(20);
+    const bSwitch = await connectController('/agent');
+    await bSwitch.first;
+    bSwitch.ws.send(JSON.stringify({ type: 'start', agent: 'gemini' }));
+    await collectUntil(bSwitch.ws, (m) => m.kind === 'started');
+    ok(agentBridge.sessionId === null && agentBridge.sessionAgent === null && agentBridge.name === 'gemini',
+        'starting a different provider after Stop does not reuse the parked session');
+    try { aResume.ws.close(); } catch (_) {}
+    try { bSwitch.ws.close(); } catch (_) {}
+    agentBridge.reset();
+    await sleep(50);
+
+    const binDir = path.join(testRoot, 'stop-bin');
+    const fakeScript = path.join(binDir, 'sleep-cli.mjs');
+    fs.mkdirSync(binDir, { recursive: true });
+    fs.writeFileSync(fakeScript, 'process.stdin.resume();\nsetInterval(() => {}, 60000);\n');
+    writeCliWrapper(binDir, 'claude', fakeScript);
+    const prevPath = process.env.PATH;
+    process.env.PATH = `${binDir}${path.delimiter}${prevPath || ''}`;
+    try {
+        await assertStopReleases('claude', 'persistent Claude');
+    } finally {
+        process.env.PATH = prevPath;
+        agentBridge.reset();
+    }
+} catch (e) {
+    console.log('  ✗ local-stop-release error: ' + (e.stack || e));
+    failed++;
+    try { agentBridge.reset(); } catch (_) {}
 }
 
 ok(reverseWorkerHub.enabled === true, 'imported broker exposed the reverse-worker hub');

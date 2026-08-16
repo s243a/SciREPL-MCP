@@ -353,9 +353,12 @@ also stops the previous reverse session before selecting.
 locally ready one-shot session (no child yet) occupies the surface the
 same way a running child does: another controller cannot start a
 simultaneous reverse session, and inputs never fall through from a bound
-reverse worker to a newly started local child. `/term` stays local while
-a PTY is already running. Reverse mode must not create a second live
-session beside a local one.
+reverse worker to a newly started local child. Explicit `/agent` `stop`
+releases that ownership and deactivates the adapter; a later `input`
+fails until `start`. Resume identifiers are stored separately, keyed by
+agent name, so switching providers cannot reuse the wrong session.
+`/term` stays local while a PTY is already running. Reverse mode must not
+create a second live session beside a local one.
 
 Operators who need a specific machine should give that worker a
 unique advertised CLI, or run one worker name per broker. Explicit
@@ -818,6 +821,9 @@ Implementation covers at least:
 - a locally ready one-shot `/agent` session occupies the surface so a
   second controller cannot start a simultaneous reverse session, and
   inputs stay on the bound reverse worker;
+- explicit local `/agent` `stop` releases ownership for both one-shot and
+  persistent adapters so another controller can start immediately, while
+  parked resume identity is not reused across providers;
 - audit lines ignore worker-supplied `cmd`/`text` and log stop as
   requested rather than completed.
 

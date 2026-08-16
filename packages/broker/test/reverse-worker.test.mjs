@@ -1570,6 +1570,109 @@ try {
     try { agentBridge.reset(); } catch (_) {}
 }
 
+console.log('\nParked resume does not survive controller disconnect\n');
+try {
+    async function laterLocalStartHasNoResume(label) {
+        const later = await connectController('/agent');
+        await later.first;
+        later.ws.send(JSON.stringify({ type: 'start', agent: 'codex' }));
+        await collectUntil(later.ws, (m) => m.kind === 'started');
+        ok(agentBridge.sessionId === null && agentBridge.sessionAgent === null,
+            `${label}: later local start receives no prior resume context`);
+        try { later.ws.close(); } catch (_) {}
+        agentBridge.reset();
+        await sleep(50);
+    }
+
+    const { ws: agyWorker, welcome: agyWelcome } = await connectWorker({
+        name: 'resume-agy',
+        capabilities: { surfaces: ['agent'], agents: ['agy'] },
+    });
+    await agyWelcome;
+    agyWorker.on('message', (buf) => {
+        let msg; try { msg = JSON.parse(buf.toString()); } catch { return; }
+        if (msg.type === 'start') agyWorker.send(JSON.stringify({ type: 'agent', kind: 'started', text: msg.agent }));
+    });
+    const aRev = await connectController('/agent');
+    await aRev.first;
+    aRev.ws.send(JSON.stringify({ type: 'start', agent: 'codex' }));
+    await collectUntil(aRev.ws, (m) => m.kind === 'started');
+    agentBridge.sessionId = 'thread-after-reverse';
+    const aRevOwner = agentBridge.ws;
+    aRev.ws.send(JSON.stringify({ type: 'stop' }));
+    const waitRevPark = Date.now() + 1000;
+    while (agentBridge.occupied() && Date.now() < waitRevPark) await sleep(20);
+    ok(agentBridge.sessionId === 'thread-after-reverse' && agentBridge.stoppedBy === aRevOwner,
+        'Stop parks resume before switching to reverse');
+    const revStarted = collectUntil(aRev.ws, (m) => m.kind === 'started');
+    aRev.ws.send(JSON.stringify({ type: 'start', agent: 'agy' }));
+    const revGot = await revStarted;
+    ok(revGot.some(m => m.kind === 'started' && m.via === 'resume-agy'),
+        'same socket can start reverse Agy after local Stop');
+    ok(agentBridge.sessionId === 'thread-after-reverse' && agentBridge.stoppedBy === aRevOwner,
+        'reverse start does not drop the parked local resume ticket');
+    const aRevClosed = new Promise((resolve) => aRev.ws.once('close', resolve));
+    try { aRev.ws.close(); } catch (_) {}
+    await aRevClosed;
+    await sleep(50);
+    ok(agentBridge.sessionId === null && agentBridge.sessionAgent === null && agentBridge.stoppedBy === null,
+        'disconnect clears parked local resume independently of reverse detach');
+    try { agyWorker.close(); } catch (_) {}
+    await sleep(50);
+    await laterLocalStartHasNoResume('local Stop then reverse start then disconnect');
+
+    const aDup = await connectController('/agent');
+    await aDup.first;
+    aDup.ws.send(JSON.stringify({ type: 'start', agent: 'codex' }));
+    await collectUntil(aDup.ws, (m) => m.kind === 'started');
+    agentBridge.sessionId = 'thread-duplicate-stop';
+    const aDupOwner = agentBridge.ws;
+    aDup.ws.send(JSON.stringify({ type: 'stop' }));
+    const waitDup = Date.now() + 1000;
+    while (agentBridge.occupied() && Date.now() < waitDup) await sleep(20);
+    ok(agentBridge.stoppedBy === aDupOwner && agentBridge.sessionId === 'thread-duplicate-stop',
+        'first Stop parks resume and records the parking controller');
+    aDup.ws.send(JSON.stringify({ type: 'stop' }));
+    await sleep(30);
+    ok(agentBridge.stoppedBy === aDupOwner && agentBridge.sessionId === 'thread-duplicate-stop',
+        'duplicate Stop while unoccupied preserves stoppedBy and the parked ticket');
+    const aDupClosed = new Promise((resolve) => aDup.ws.once('close', resolve));
+    try { aDup.ws.close(); } catch (_) {}
+    await aDupClosed;
+    await sleep(50);
+    ok(agentBridge.sessionId === null && agentBridge.stoppedBy === null,
+        'disconnect after duplicate Stop still destroys the parked ticket');
+    await laterLocalStartHasNoResume('duplicate Stop');
+
+    const aIdle = await connectController('/agent');
+    await aIdle.first;
+    aIdle.ws.send(JSON.stringify({ type: 'start', agent: 'codex' }));
+    await collectUntil(aIdle.ws, (m) => m.kind === 'started');
+    agentBridge.sessionId = 'thread-foreign-idle';
+    const aIdleOwner = agentBridge.ws;
+    aIdle.ws.send(JSON.stringify({ type: 'stop' }));
+    const waitIdle = Date.now() + 1000;
+    while (agentBridge.occupied() && Date.now() < waitIdle) await sleep(20);
+    const bIdle = await connectController('/agent');
+    await bIdle.first;
+    bIdle.ws.send(JSON.stringify({ type: 'stop' }));
+    await sleep(30);
+    ok(agentBridge.stoppedBy === aIdleOwner && agentBridge.sessionId === 'thread-foreign-idle',
+        'foreign idle Stop does not take over or drop the parked resume ticket');
+    const aIdleClosed = new Promise((resolve) => aIdle.ws.once('close', resolve));
+    try { aIdle.ws.close(); } catch (_) {}
+    await aIdleClosed;
+    await sleep(50);
+    ok(agentBridge.sessionId === null && agentBridge.stoppedBy === null,
+        'parking controller disconnect after foreign idle Stop destroys the ticket');
+    try { bIdle.ws.close(); } catch (_) {}
+    await laterLocalStartHasNoResume('foreign idle Stop');
+} catch (e) {
+    console.log('  ✗ parked-resume-disconnect error: ' + (e.stack || e));
+    failed++;
+    try { agentBridge.reset(); } catch (_) {}
+}
+
 ok(reverseWorkerHub.enabled === true, 'imported broker exposed the reverse-worker hub');
 
 console.log(`\n${passed} passed, ${failed} failed`);

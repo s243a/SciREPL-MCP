@@ -357,6 +357,9 @@ reverse worker to a newly started local child. Explicit `/agent` `stop`
 releases that ownership and deactivates the adapter; a later `input`
 fails until `start`. Resume identifiers are stored separately, keyed by
 agent name, so switching providers cannot reuse the wrong session.
+Disconnect destroys that parked ticket independently of reverse-session
+detach; a repeated or idle `stop` does not forget which controller
+parked it.
 `/term` stays local while a PTY is already running. Reverse mode must not
 create a second live session beside a local one.
 
@@ -824,6 +827,10 @@ Implementation covers at least:
 - explicit local `/agent` `stop` releases ownership for both one-shot and
   persistent adapters so another controller can start immediately, while
   parked resume identity is not reused across providers;
+- disconnect clears a parked local resume even after the same socket
+  started a reverse session; duplicate or foreign idle `stop` does not
+  drop the parking controller, so a later local start has no prior
+  resume context;
 - audit lines ignore worker-supplied `cmd`/`text` and log stop as
   requested rather than completed.
 

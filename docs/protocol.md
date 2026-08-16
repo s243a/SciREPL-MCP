@@ -123,7 +123,9 @@ is empty and a start request fails closed. The app can then send:
 is released, so a later `input` fails until `start`. Provider resume
 tokens are stored separately, keyed by agent name — a later `start` of
 the same CLI may resume, but switching agents cannot reuse the wrong
-session.
+session. Controller disconnect destroys that parked ticket, even if the
+same socket later bound a reverse session. A repeated or idle `stop`
+does not forget which controller parked it.
 
 Broker events use `{"type":"agent","kind":...}`. Kinds include `welcome`,
 `started`, `assistant`, `tool_use`, `result`, `stderr`, `error`, and `exit`.

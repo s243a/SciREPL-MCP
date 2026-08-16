@@ -24,6 +24,9 @@
   after stdio close. `/agent` has one surface-wide owner; explicit Stop
   releases that ownership and deactivates the adapter, parking resume
   identity separately so a different provider cannot reuse it.
+  Disconnect destroys that parked ticket even after a reverse start on
+  the same socket; a repeated or idle Stop does not forget the parking
+  controller.
   `--grace-ms 0`
   stops a parked PTY immediately. Shim SIGTERM waits for process-tree
   SIGKILL. The hub pings workers and drops half-open sockets after a

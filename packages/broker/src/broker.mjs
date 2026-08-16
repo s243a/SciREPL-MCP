@@ -593,7 +593,7 @@ const agentBridge = {
     },
     stop() {
         const had = this.occupied();
-        this.stoppedBy = this.ws;
+        if (had) this.stoppedBy = this.ws;
         if (this.sessionId && this.name) this.sessionAgent = this.name;
         this.killChild();
         this.ws = null;
@@ -1039,7 +1039,7 @@ agentWss.on('connection', (ws) => {
         }
     });
     ws.on('close', () => {
-        if (reverseWorkerHub.detach('agent', ws)) return;
+        reverseWorkerHub.detach('agent', ws);
         if (agentBridge.ws === ws || agentBridge.stoppedBy === ws) agentBridge.reset();
     });
 });

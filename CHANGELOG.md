@@ -59,3 +59,8 @@
 - Repair the missing executable bit in `node-pty` 1.1.0's macOS prebuilt
   `spawn-helper` without changing other platforms, and verify terminal setup by
   opening a real PTY rather than only importing the dependency.
+- Decode agent stdout and stderr incrementally so UTF-8 characters split across
+  process chunks cannot be silently replaced with U+FFFD.
+- Manage Antigravity's workspace-local `.agents/mcp_config.json` alongside the
+  existing provider files, using its required `serverUrl` schema and the current
+  broker connection credentials.

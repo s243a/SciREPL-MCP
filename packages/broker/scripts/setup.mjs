@@ -7,6 +7,7 @@ import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { prepareNodePty } from '../src/node-pty-support.mjs';
 import { workerWebSocketUrl } from '../src/reverse-worker.mjs';
+import { REQUIRED_APP_WS_PAYLOAD_BYTES, createWorkbookFileTransfer } from '../src/workbook-files.mjs';
 import { preflightWorkspace, randomToken, setupWorkspace, targetState, writePrivateFile } from '../src/workspace.mjs';
 
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
@@ -40,6 +41,7 @@ Options:
                                         reachable example when the broker binds
                                         loopback; otherwise a BROKER_HOST
                                         placeholder is written.
+  --workbook-io-config PATH             Enable allowlisted workbook file transfer
   --no-install                          Do not install npm dependencies
   --adopt                               Allow an existing unmarked setup directory
   --repair                              Back up and replace changed generated files
@@ -69,6 +71,7 @@ function parseArgs(argv) {
         enableReverseWorker: false,
         acknowledgeReverseWorker: false,
         workerUrl: '',
+        workbookIoConfig: null,
         install: true,
         adopt: false,
         repair: false,
@@ -91,6 +94,7 @@ function parseArgs(argv) {
         else if (arg === '--enable-reverse-worker') options.enableReverseWorker = true;
         else if (arg === '--acknowledge-reverse-worker-command-relay') options.acknowledgeReverseWorker = true;
         else if (arg === '--worker-url') options.workerUrl = value();
+        else if (arg === '--workbook-io-config') options.workbookIoConfig = value();
         else if (arg === '--no-install') options.install = false;
         else if (arg === '--adopt') options.adopt = true;
         else if (arg === '--repair') options.repair = true;
@@ -161,8 +165,12 @@ function validate(options) {
     if (process.platform === 'win32' && (options.enableAgent || options.enableTerminal || options.enableReverseWorker)) {
         throw new Error('agent, terminal, and reverse-worker modes currently require Linux, macOS, or WSL; use the PowerShell setup for the core broker only');
     }
+    if (options.workbookIoConfig && !path.isAbsolute(options.workbookIoConfig)) {
+        throw new Error('--workbook-io-config must be an absolute path');
+    }
 
     options.output = path.resolve(options.output.replace(/^~(?=$|[\\/])/, os.homedir()));
+    if (options.workbookIoConfig) options.workbookIoConfig = path.resolve(options.workbookIoConfig);
     const dangerous = [path.parse(options.output).root, os.homedir(), REPO_DIR, PACKAGE_DIR];
     if (dangerous.some(candidate => path.resolve(candidate) === options.output) ||
         isWithin(REPO_DIR, options.output) || isWithin(options.output, REPO_DIR)) {
@@ -210,6 +218,10 @@ function environment(options, tokenFile, workspace) {
         env.BROKER_REVERSE_WORKER = '1';
         env.BROKER_WORKER_TOKEN_FILE = options.workerTokenFile;
     }
+    if (options.workbookIoConfig) {
+        env.BROKER_WORKBOOK_IO_CONFIG = options.workbookIoConfig;
+        env.BROKER_MAX_APP_WS_PAYLOAD_BYTES = String(REQUIRED_APP_WS_PAYLOAD_BYTES);
+    }
     return env;
 }
 
@@ -238,6 +250,7 @@ function setupManifest(options, files) {
         agentEnabled: options.enableAgent,
         terminalEnabled: options.enableTerminal,
         reverseWorkerEnabled: options.enableReverseWorker,
+        workbookIoConfig: options.workbookIoConfig,
         generatedFiles: files,
     }, null, 2) + '\n';
 }
@@ -511,6 +524,14 @@ function main() {
     const workerTokenFile = path.join(options.output, 'worker-token');
     const workspace = path.join(options.output, 'workspace');
     options.workerTokenFile = workerTokenFile;
+    if (options.workbookIoConfig) {
+        createWorkbookFileTransfer({
+            configPath: options.workbookIoConfig,
+            agentWorkspace: workspace,
+            maxAppWsPayloadBytes: REQUIRED_APP_WS_PAYLOAD_BYTES,
+            log() {},
+        });
+    }
     const token = ensureToken(tokenFile, true);
     const env = environment(options, tokenFile, workspace);
     const targets = generatedTargets(options, env);
@@ -554,6 +575,7 @@ function main() {
     console.log(`[setup] agent: ${options.enableAgent ? 'enabled with an explicit session workspace' : 'disabled'}`);
     console.log(`[setup] terminal: ${options.enableTerminal ? 'enabled' : 'disabled'}`);
     console.log(`[setup] reverse worker: ${options.enableReverseWorker ? 'enabled (command relay; worker token stored privately; install the shim on another account/host)' : 'disabled'}`);
+    console.log(`[setup] workbook I/O: ${options.workbookIoConfig ? 'enabled with ' + options.workbookIoConfig : 'disabled'}`);
     if (workspaceResult) console.log(`[setup] agent context: ${workspaceResult.created.length} created, ${workspaceResult.updated.length} repaired`);
     if (options.dryRun && workerMigration.planned) {
         console.log(`[setup] would retire same-host worker launchers: ${workerMigration.disabled.join(', ')}`);

@@ -32,7 +32,10 @@ jobs:
       - run: npm run test:security
       - run: npm run test:unmanaged
       - run: npm run test:broker
+      - run: npm run test:workbook
       - run: npm run test:missing-agent
+      - run: npm run test:utf8-pipes
+      - run: npm run test:utf8-agent
       - run: npm run test:reverse-worker
 
   broker-terminal:

@@ -32,6 +32,9 @@ not expose tool definitions, notebook data, tokens, or host paths.
 files and backs up/replaces stale ones only when the broker was started with
 `BROKER_MANAGE_WORKSPACE=1`, which the explicit agent setup launcher supplies.
 Ordinary broker startup never seeds agent instructions or provider settings.
+Managed settings include Antigravity's workspace-local
+`.agents/mcp_config.json`; GET reports it like any other managed file, while
+POST is required to create or repair it.
 
 ## App bridge (`/app`)
 
@@ -79,15 +82,22 @@ is mapped to an MCP image content block.
 Only one app bridge is logically active. Tool definitions are supplied by the
 app, not hard-coded into this repository.
 
-### Planned broker-owned workbook file tools
+### Broker-owned workbook file tools
 
-A future, explicitly configured broker can add synthetic
-`export_workbook_to_file` and `import_workbook_from_file` tools when the app
-advertises their base workbook tools. These wrappers relocate bytes through an
-allowlisted host directory and return a content-free receipt; they are **not
-implemented in protocol version 1 today**. The authoritative security, schema,
-path, and transport design is [Workbook file transfer through the
-broker](workbook-file-transfer.md).
+An explicitly configured broker adds `export_workbook_to_file` and
+`import_workbook_from_file` when the app advertises the corresponding base
+workbook tool. These protocol-v1 wrappers relocate exact UTF-8 bytes through an
+allowlisted host directory and return a content-free receipt. They do not alter,
+cache, or pre-answer the app's per-call workbook permission. The authoritative
+schemas, receipt, path-hardening, transport budget, and audit contract are in
+[Workbook file transfer through the broker](workbook-file-transfer.md).
+
+For the internal app call, the broker adds reserved `brokerRoot` and
+`brokerPath` fields containing only the validated public root alias and relative
+path. They are display context for a future destination-aware SciREPL Pro
+confirmation, not app-side path authority, and an ordinary MCP caller may not
+claim them. Existing Pro versions safely ignore the extra fields; their
+localized confirmation-string update is a separate app follow-up.
 
 ## Remote agent (`/agent`)
 

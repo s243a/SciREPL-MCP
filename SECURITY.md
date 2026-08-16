@@ -51,6 +51,25 @@ reads, writes, and execution are then governed by the app's own permission
 settings. Those settings protect the notebook; they do not control the broker
 host.
 
+When `BROKER_WORKBOOK_IO_CONFIG` is set, the broker also reads or writes workbook
+files below explicitly named host roots. The app's default-Off workbook
+permission controls whether a notebook transfer occurs; the immutable broker
+allowlist independently controls where host bytes may move. Run the broker as a
+minimally privileged account, keep the config outside agent-writable locations,
+and review the documented same-account race and portable reparse limitations.
+For a Git project root, `denyGitIgnoredWrites:true` additionally denies workbook
+exports to paths Git reports as ignored and to `.git` metadata paths. This is a
+per-root, fail-closed agent-sandbox parity guard: enable it for a project whose
+ignored paths must remain unwritable through MCP, and leave it off for a scratch
+root that is not a Git worktree. It applies equally to every agent and model.
+
+Allowlisting a stable parent such as
+`/home/s243a/.gemini/antigravity-cli/brain` avoids config churn as scratch
+session IDs change, but authorizes configured transfers throughout that parent,
+including other sessions. Treat that broader cross-session scope as an explicit
+host-trust decision; the pathname identifies the deployed scratch layout, not a
+particular model's security boundary.
+
 ### Playwright driver
 
 The Playwright package is a stdio MCP server and does not listen on a network

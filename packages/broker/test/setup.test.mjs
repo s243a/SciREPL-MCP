@@ -47,6 +47,31 @@ if (process.platform !== 'win32') {
 ok(!fs.existsSync(path.join(core, 'workspace', 'AGENTS.md')),
     'core-only setup does not create active agent instruction files');
 
+const workbookArtifacts = path.join(testRoot, 'workbook-artifacts');
+const workbookPrivate = path.join(testRoot, 'workbook-private');
+const workbookSetup = path.join(testRoot, 'workbook-setup');
+fs.mkdirSync(workbookArtifacts);
+fs.mkdirSync(workbookPrivate);
+const workbookConfig = path.join(workbookPrivate, 'workbook-io.json');
+fs.writeFileSync(workbookConfig, JSON.stringify({
+    schemaVersion: 1,
+    maxContentBytes: 1048576,
+    roots: [{ name: 'artifacts', path: workbookArtifacts, read: true, write: true, allowOverwrite: false }],
+}), { mode: 0o600 });
+const workbookRun = run('--output', workbookSetup, '--no-install', '--workbook-io-config', workbookConfig);
+const workbookLaunchers = workbookRun.status === 0
+    ? fs.readFileSync(path.join(workbookSetup, 'start-broker.sh'), 'utf8') +
+      fs.readFileSync(path.join(workbookSetup, 'Start-Broker.ps1'), 'utf8')
+    : '';
+ok(workbookRun.status === 0 && workbookLaunchers.includes('BROKER_WORKBOOK_IO_CONFIG') &&
+    workbookLaunchers.includes(workbookConfig) && workbookLaunchers.includes('BROKER_MAX_APP_WS_PAYLOAD_BYTES'),
+    'setup validates and preserves an absolute workbook allowlist plus its required wire budget');
+const relativeWorkbook = run('--output', path.join(testRoot, 'relative-workbook'), '--no-install',
+    '--workbook-io-config', 'relative-config.json');
+ok(relativeWorkbook.status !== 0 && /absolute path/.test(relativeWorkbook.stderr) &&
+    !fs.existsSync(path.join(testRoot, 'relative-workbook')),
+    'setup rejects a relative workbook allowlist before writing');
+
 const terminal = path.join(testRoot, 'terminal');
 const terminalRun = run('--output', terminal, '--no-install', '--enable-terminal', '--acknowledge-terminal-host-access');
 if (process.platform === 'win32') {
@@ -80,8 +105,21 @@ if (process.platform === 'win32') {
         'acknowledged agent setup creates provider context only in the dedicated workspace');
     ok(fs.existsSync(path.join(workspace, '.scirepl-mcp', 'manifest.json')) &&
         fs.existsSync(path.join(workspace, '.claude', 'skills', 'scirepl-notebook', 'SKILL.md')) &&
-        fs.existsSync(path.join(workspace, '.codex', 'config.toml')),
+        fs.existsSync(path.join(workspace, '.codex', 'config.toml')) &&
+        fs.existsSync(path.join(workspace, '.agents', 'mcp_config.json')),
         'agent setup installs its marker, notebook guide, and client configuration');
+    const antigravityFile = path.join(workspace, '.agents', 'mcp_config.json');
+    const antigravity = JSON.parse(fs.readFileSync(antigravityFile, 'utf8'));
+    const antigravityServer = antigravity.mcpServers?.scirepl;
+    const agentToken = fs.readFileSync(path.join(agent, 'broker-token'), 'utf8').trim();
+    const managedFiles = JSON.parse(fs.readFileSync(path.join(workspace, '.scirepl-mcp', 'manifest.json'), 'utf8')).managedFiles;
+    const expectedAntigravity = { mcpServers: { scirepl: {
+        serverUrl: 'http://127.0.0.1:8087/mcp',
+        headers: { Authorization: `Bearer ${agentToken}` },
+    } } };
+    ok(JSON.stringify(antigravity) === JSON.stringify(expectedAntigravity) &&
+        managedFiles.includes('.agents/mcp_config.json'),
+    'Antigravity receives its exact serverUrl schema and the doctor manifest owns the file');
     ok(!['AGENTS.md', 'CLAUDE.md', 'GEMINI.md'].some(name => fs.existsSync(path.join(repoDir, name))),
         'setup never places active agent instructions in the repository root');
 
@@ -235,6 +273,16 @@ if (process.platform !== 'win32') {
     ok(linkedRun.status !== 0 && /unsafe managed paths/.test(linkedRun.stderr) &&
         !fs.existsSync(path.join(linked, 'broker-token')) && !fs.existsSync(path.join(linked, 'workspace', 'AGENTS.md')),
         'agent setup rejects a symlinked managed path before creating any files');
+
+    const linkedConfig = path.join(testRoot, 'linked-antigravity-config');
+    const outsideConfig = path.join(testRoot, 'outside-mcp-config.json');
+    fs.mkdirSync(path.join(linkedConfig, 'workspace', '.agents'), { recursive: true });
+    fs.writeFileSync(outsideConfig, '{}\n');
+    fs.symlinkSync(outsideConfig, path.join(linkedConfig, 'workspace', '.agents', 'mcp_config.json'));
+    const linkedConfigRun = run('--output', linkedConfig, '--no-install', '--adopt', '--enable-agent', '--acknowledge-agent-host-access');
+    ok(linkedConfigRun.status !== 0 && /unsafe managed paths/.test(linkedConfigRun.stderr) &&
+        !fs.existsSync(path.join(linkedConfig, 'broker-token')) && fs.readFileSync(outsideConfig, 'utf8') === '{}\n',
+    'agent setup rejects a symlinked Antigravity MCP file without touching its target');
 }
 
 console.log(`\n${passed} passed, ${failed} failed`);

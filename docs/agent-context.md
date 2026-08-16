@@ -31,10 +31,22 @@ workspace, by default `~/scirepl-broker/workspace`. It writes provider-specific
 copies, local MCP configuration, a canonical readable guide, and
 `.scirepl-mcp/manifest.json` recording the managed boundary.
 
+Antigravity/Agy reads its workspace MCP servers from
+`.agents/mcp_config.json`. Setup writes the required `serverUrl` form there,
+along with the broker's current loopback URL and bearer header. This differs
+from Gemini CLI's `.gemini/settings.json`, which uses `url`; the two formats are
+managed separately. Both files contain connection credentials and are written
+privately (mode 0600 where supported).
+
 Normal broker startup only inspects this workspace. It does not create or update
 agent instructions. An authenticated `POST /doctor` can perform an explicit
 repair only when the generated launcher has set `BROKER_MANAGE_WORKSPACE=1`.
-Changed generated files are backed up before replacement.
+Changed generated files and files whose private permissions have drifted are
+backed up before replacement.
+
+The doctor owns each generated file as a complete document; it does not merge
+unrelated user entries into a provider configuration. A backup of an edited MCP
+configuration can contain credentials and is therefore also written privately.
 
 ## Existing and custom directories
 
@@ -46,6 +58,12 @@ than pointing setup at a source checkout or home directory.
 Advanced users who supply and audit all agent context themselves can set
 `BROKER_ALLOW_UNMANAGED_AGENT_WORKSPACE=1`. That bypass is intentionally explicit:
 without a prepared workspace or that override, `/agent` will not launch a CLI.
+
+Antigravity may also load a user-global MCP file. Invalid JSON in that global
+file can prevent the provider from reaching an otherwise valid workspace
+configuration. Setup and doctor intentionally do not inspect or overwrite global
+provider settings; validate them separately if Agy reports a configuration parse
+error.
 
 ## Trust boundary
 

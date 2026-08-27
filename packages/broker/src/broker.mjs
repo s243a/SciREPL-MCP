@@ -24,6 +24,7 @@ import path from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
 import { WebSocketServer } from 'ws';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
+import { catalogFor, TOS_DISCLAIMER, TOS_DISCLAIMER_VERSION } from './agent-catalog.mjs';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { ListToolsRequestSchema, CallToolRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import { inspectWorkspace, setupWorkspace, writePrivateFile } from './workspace.mjs';
@@ -895,7 +896,7 @@ agentWss.on('connection', (ws) => {
             const workspaceReady = !agentWorkspaceProblem();
             // Existing Pro clients read only `agents`, so make that the usable
             // subset. `configuredAgents` preserves discovery/debug information.
-            sendWsJson(ws, { type: 'agent', kind: 'welcome', protocolVersion: PROTOCOL_VERSION, agents: workspaceReady ? availableAgents : [], availableAgents, configuredAgents, workspaceReady, running: agentBridge.running() && agentBridge.name }, MAX_AGENT_BUFFER_BYTES);
+            sendWsJson(ws, { type: 'agent', kind: 'welcome', protocolVersion: PROTOCOL_VERSION, agents: workspaceReady ? availableAgents : [], availableAgents, configuredAgents, workspaceReady, running: agentBridge.running() && agentBridge.name, catalog: catalogFor(configuredAgents), tos: { disclaimer: TOS_DISCLAIMER, version: TOS_DISCLAIMER_VERSION } }, MAX_AGENT_BUFFER_BYTES);
             return;
         }
         if (!authed) return;
@@ -918,7 +919,7 @@ termWss.on('connection', (ws) => {
             if (!tokenMatches(msg.token)) { sendWsJson(ws, { type: 'term', kind: 'error', text: 'unauthorized' }, MAX_TERM_WS_PAYLOAD_BYTES); ws.close(1008, 'unauthorized'); return; }
             authenticated();
             authed = true;
-            sendWsJson(ws, { type: 'term', kind: 'welcome', protocolVersion: PROTOCOL_VERSION, enabled: TERM_ENABLED, cmds: TERM_ENABLED ? TERM_CMDS : [] }, MAX_TERM_WS_PAYLOAD_BYTES);
+            sendWsJson(ws, { type: 'term', kind: 'welcome', protocolVersion: PROTOCOL_VERSION, enabled: TERM_ENABLED, cmds: TERM_ENABLED ? TERM_CMDS : [], catalog: TERM_ENABLED ? catalogFor(TERM_CMDS) : [], tos: { disclaimer: TOS_DISCLAIMER, version: TOS_DISCLAIMER_VERSION } }, MAX_TERM_WS_PAYLOAD_BYTES);
             return;
         }
         if (!authed) return;

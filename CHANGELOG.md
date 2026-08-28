@@ -2,6 +2,36 @@
 
 ## 0.1.0 - Unreleased
 
+- Add optional reverse-worker mode: a worker dials `/worker` with a distinct
+  credential and the broker relays the existing `/agent` and `/term` controller
+  messages to it. Default off; setup requires
+  `--acknowledge-reverse-worker-command-relay` and writes enrollment material
+  rather than a same-host worker launcher. Upgrading a `b3f8f99` same-host
+  layout requires `--repair` before leftover launchers are retired and the
+  worker token is rotated. Local spawn is
+  unchanged when the flag is unset. Relayed `started` events carry a
+  broker-authored `via` worker name; `BROKER_REVERSE_WORKER_STRICT=1` fails
+  closed instead of falling through to local spawn. The worker shim can pass
+  provider API keys or inherit its environment the same way local spawn does,
+  and still does not inject the controller pairing token. Stop clears the
+  reverse session so the next start re-selects a capable worker; controller
+  `/term` detach starts shim grace; worker-link loss kills `/agent` children
+  with SIGTERM then SIGKILL (process-group SIGKILL stays scheduled after the
+  leader exits) and clears adapter session ids. Duplicate worker names are
+  rejected while the existing socket is open. Child PATH/PATHEXT are
+  preserved on Windows and CLIs are launched with cross-spawn so npm
+  `.cmd` shims run. Agent pipes decode UTF-8 incrementally and finalize
+  after stdio close. `/agent` has one surface-wide owner; explicit Stop
+  releases that ownership and deactivates the adapter, parking resume
+  identity separately so a different provider cannot reuse it.
+  Disconnect destroys that parked ticket even after a reverse start on
+  the same socket; a repeated or idle Stop does not forget the parking
+  controller.
+  `--grace-ms 0`
+  stops a parked PTY immediately. Shim SIGTERM waits for process-tree
+  SIGKILL. The hub pings workers and drops half-open sockets after a
+  bounded pong deadline.
+
 - Extract the SciREPL host-side MCP broker into an independently installable
   repository.
 - Add the MCP-to-app bridge, opt-in remote-agent bridge, optional PTY terminal,

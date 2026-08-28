@@ -36,7 +36,9 @@ npm ci --omit=optional
 WSL is the recommended Windows environment for agent and terminal modes because
 the current command adapters use POSIX shell quoting and process conventions.
 Structured `/agent` adapters do not require `node-pty`; interactive agent/TUI
-sessions exposed through `/term` do.
+sessions exposed through `/term` do. Reverse-worker mode uses the same POSIX
+process conventions; the worker shim needs `node-pty` on the worker host when
+it advertises `/term`.
 
 The current implementation has been exercised directly under WSL. Termux is
 also directly tested as described below; other Linux distributions use the same

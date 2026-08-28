@@ -40,6 +40,29 @@ Decisions encoded there:
   (`~/scirepl-broker/broker-token`, mode 0600) is still required on every
   connection.
 
+## Reverse workers: same surfaces, other host
+
+The pattern above assumes the broker **spawns** the worker CLI on its own
+machine. [Reverse-worker mode](reverse-worker.md) is a transport swap behind
+the same `/term` and `/agent` messages: a shim on another machine, container,
+or VM dials `/worker` with a **worker** credential and the broker relays
+commands to it. `term-drive.mjs` and `agent-drive.mjs` do not change.
+
+Enable it only with the setup acknowledgement
+`--acknowledge-reverse-worker-command-relay`. Point the shim's `--cwd` at the
+git repository that remains the shared state. The worker token authorizes "be
+commanded" and must stay distinct from the pairing token; a stolen worker
+credential is impersonation of a commanded host, not a second controller.
+When the point of reverse mode is that execution must not happen on the
+broker host, set `BROKER_REVERSE_WORKER_STRICT=1` so a missing worker fails
+closed instead of falling through to local spawn. Relayed `started` events
+carry a broker-authored `via` field naming the worker.
+
+The supervision claim — every action prompted, logged, attributed — survives
+because relayed starts appear in the same `[broker]` audit trail, attributed
+to the worker's registered name. Local-spawn lines are unchanged when the
+mode is off.
+
 ## Two surfaces, one choice
 
 **`/agent` (headless one-shot).** The broker spawns the CLI per turn
@@ -234,54 +257,71 @@ value order:
    nothing copyable to steal, revocation via ACLs, and actions attribute
    to a node in the audit trail instead of to "whoever had the string".
 
-## Terms-of-service posture, and the consent gate
+## Remote-access notice and terms references
 
-The broker will host whatever CLI you name in `BROKER_AGENT` profiles or
-`BROKER_TERM_CMDS`; it does not decide policy. But *which* agent a person drives has
-a real terms-of-service dimension — driving `agy` from a third-party tool is not the
-same act as running an open BYO-key CLI — and the SciREPL app should surface that
-honestly before a human picks one. The broker ships the reference data for that gate
-in [`src/agent-catalog.mjs`](../packages/broker/src/agent-catalog.mjs), advertised
-additively in the `/agent` and `/term` welcomes as a `catalog` array plus a `tos`
-block. Clients that ignore it are unaffected.
+The broker will host the commands allowed by its local configuration and by
+connected reverse workers. It cannot determine which account, plan, credentials,
+or worker-host environment an operator uses. Those details can change which terms
+apply, so the broker supplies references rather than a permission or risk verdict.
 
-### The axis that matters is *access*, not *open-source-ness*
+[`src/agent-catalog.mjs`](../packages/broker/src/agent-catalog.mjs) is advertised
+additively in `/agent` and `/term` welcome messages:
 
-The tempting split — "open tools are safe, proprietary ones are risky" — is wrong.
-An open BYO-key CLI is not compliant *because* it is open; a vendor's own CLI is not
-risky *because* it is proprietary. The catalog categorises by how the **model
-provider** is being reached:
+- `catalog` describes the choices in that exact welcome message. This includes
+  reverse-worker-only choices; its IDs match `agents` or `cmds`.
+- `remoteAccess.notice` is a combined provider-terms and remote-host security
+  notice. `remoteAccess.noticeVersion` lets a client ask again after a material
+  wording change.
 
-| Category | What it means |
+Older clients can ignore both fields. The broker does not record acceptance or
+enforce a legal conclusion. SciREPL Pro uses the versioned notice as a product gate
+before enabling its remote controls.
+
+### What the catalog does—and does not—say
+
+The catalog has two independent axes:
+
+| Field | Meaning |
 | --- | --- |
-| `byo-key` | You supply your own model API key, so the provider's **API terms** apply — generally permitting programmatic use. (opencode, cline, roo.) The tool being open source does not, by itself, make a use compliant; the key and plan do. |
-| `first-party` | The vendor's **own CLI** (claude, codex, gemini). Interactive use is intended; driving it *headlessly*, or under a consumer *subscription* rather than an API key, can exceed that — check the plan's terms. Often the **lowest**-risk path, not the highest. |
-| `discouraged` | The provider's terms **discourage** third-party/programmatic driving. Real account-suspension risk. (`agy` — Antigravity; accounts have been suspended for exactly this.) |
-| `shell` | Not an agent — a raw shell. No provider terms, but no agent permission prompt either; the most dangerous option. |
+| `integrationStatus` | Whether the command is a provider-documented integration surface, a community integration, or an unknown/custom command. |
+| `termsReview` | Whether to review generally applicable terms or provider material specifically relevant to authentication/access through another app. |
 
-### What the gate is, and is not
+These are navigation aids, not compliance ratings. The provider documentation now
+describes programmatic surfaces for all four built-in agent CLIs:
 
-The consent step is **informed consent and a logged acknowledgement — not legal
-protection.** A checkbox does not stop a provider suspending an account, and the
-disclaimer says so. Its value is that the person was shown the issue and chose
-anyway, and that the choice is recorded. Recommended flow for the app:
+- OpenAI documents [Codex non-interactive mode](https://developers.openai.com/codex/non-interactive-mode)
+  and [app-server](https://developers.openai.com/codex/app-server).
+- Google documents [Gemini CLI headless mode](https://geminicli.com/docs/cli/headless/)
+  and [ACP mode](https://geminicli.com/docs/cli/acp-mode/).
+- Anthropic documents the [Claude Code print and streaming
+  interface](https://docs.anthropic.com/en/docs/claude-code/cli-usage).
+- Google documents [Antigravity CLI headless
+  mode](https://antigravity.google/docs/cli/headless/). Its
+  [additional terms](https://antigravity.google/terms) also contain language about
+  third-party access, so the catalog links both and asks the operator to review
+  them for the actual setup and sign-in method.
 
-1. **List every agent** (do not bury the mainstream first-party CLIs behind an
-   "other" gate — that warns hardest about the *safest* options and confuses users).
-2. On first use of *any* remote agent, take **one acknowledgement** of the
-   `tos.disclaimer`, recorded with `tos.version` and a timestamp. Re-prompt when the
-   version bumps (i.e. when the text changes).
-3. Render each agent's `categoryLabel` + `blurb`, and its per-agent `note` when
-   present, from the catalog — one payload, no hard-coded copy in the client.
-4. For a `warn` agent (`discouraged`, `shell`), show a **stronger inline warning**
-   and take a **separate** acknowledgement — a blanket unlock is not enough for the
-   suspension-risk case.
+Sources in the wire payload include a review date so maintainers can see when a
+reference needs checking again. A documented interface still does not establish
+the terms for every authentication method. Conversely, an open-source tool does
+not establish which model provider or plan is in use. Unknown commands therefore
+remain `custom`; they never fall back to an optimistic API-key category.
 
-### The disclaimer makes no claim of compliance
+### One notice, two distinct concerns
 
-`TOS_DISCLAIMER` deliberately states the design's *reasoning* and pushes
-responsibility to the operator, rather than asserting the app "meets the
-requirements" — because asserting compliance is a representation the project should
-not make, and it would contradict "not legal advice / enforcement at the provider's
-discretion" in the same breath. If you localise or reword it, bump
-`TOS_DISCLAIMER_VERSION` so acknowledgements re-prompt.
+SciREPL Pro presents one acknowledgement before enabling any remote surface,
+including both named agents and a raw shell. Within that notice, the concerns stay
+separate:
+
+1. **Service terms.** Review the current terms for each service, account, plan,
+   authentication method, and integration you use. SciREPL cannot determine whether
+   a particular setup is permitted.
+2. **Remote-host security.** A holder of the broker token can exchange notebook or
+   tool data, send prompts and terminal input, and run commands on the broker or
+   worker computer. A raw shell is especially powerful because it runs with the
+   operating-system account's permissions and adds no agent permission prompt.
+
+The acknowledgement enables a feature; it does not ask the person to certify legal
+compliance. Bump `REMOTE_ACCESS_NOTICE_VERSION` when the meaning changes. In the Pro
+UI, the nearby help button opens the notice until it is acknowledged and ordinary
+remote setup help afterward; Settings keeps a way to review the notice again.

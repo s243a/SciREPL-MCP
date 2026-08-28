@@ -12,6 +12,34 @@ function installedNodePtyDirectory() {
     }
 }
 
+function nodePtySpawn() {
+    const pty = require('node-pty');
+    const spawn = typeof pty.spawn === 'function' ? pty.spawn : pty.default?.spawn;
+    if (typeof spawn !== 'function') throw new Error('node-pty.spawn is not a function');
+    return spawn;
+}
+
+/**
+ * Load the native addon and spawn a throwaway PTY. Resolving the package path
+ * is not enough: a broken prebuild can still be "installed".
+ */
+export function nodePtyUsable() {
+    try {
+        const spawn = nodePtySpawn();
+        const child = spawn(process.execPath, ['-e', 'process.exit(0)'], {
+            name: 'xterm-256color',
+            cols: 2,
+            rows: 2,
+            cwd: process.cwd(),
+            env: process.env,
+        });
+        try { child.kill(); } catch (_) {}
+        return true;
+    } catch (_) {
+        return false;
+    }
+}
+
 /**
  * node-pty 1.1.0's macOS prebuilds package spawn-helper without an executable
  * bit. Restoring that bit is narrowly scoped to the helper selected on Darwin;

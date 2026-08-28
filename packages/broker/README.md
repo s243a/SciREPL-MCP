@@ -281,6 +281,49 @@ Use `BROKER_TERM_NO_SHELL=1` to remove the standalone shell option and prevent a
 agent from dropping to a shell after it exits. This reduces convenience but does
 not turn an agent CLI into a sandbox.
 
+Both `/agent` and `/term` welcome messages include additive `catalog` and
+`remoteAccess` metadata. The catalog links to current integration documentation
+and applicable provider material; it does not infer an account, plan, or
+authentication method from a command name. The combined notice asks clients to
+keep two concerns distinct: review the terms for services they use, and protect
+the remote host and broker token. Shell is represented only as a host-security
+capability, not as a model-provider terms category. See the
+[remote-agent control guide](https://github.com/s243a/SciREPL-MCP/blob/main/docs/remote-agent-control.md#remote-access-notice-and-terms-references)
+and [wire protocol](https://github.com/s243a/SciREPL-MCP/blob/main/docs/protocol.md).
+
+## Optional reverse worker
+
+Reverse-worker mode lets the CLI run on another machine, container, or VM while
+controllers keep speaking `/agent` and `/term` at this broker. A worker shim
+dials `/worker` with a **worker** token that cannot drive controller surfaces.
+Setup requires a separate acknowledgement because the broker becomes a
+command-relay hub:
+
+```bash
+./setup-broker.sh \
+  --enable-reverse-worker \
+  --acknowledge-reverse-worker-command-relay
+```
+
+That writes `worker-token` and `worker-enroll.txt`. Copy the worker token
+to another account, container, or host and run the shim there with only
+the capabilities that host has. Pass `--worker-url` so the enrollment
+names a reachable dial address; loopback setup writes a `BROKER_HOST`
+placeholder instead of this machine's Node path or `127.0.0.1`. Setup
+does not generate a same-host worker launcher beside `broker-token`.
+Upgrading a `b3f8f99` same-host layout requires `--repair` so leftover
+`start-reverse-worker.sh` / `Start-Reverse-Worker.ps1` can be retired and
+the worker token rotated — then restart the broker and stop any old
+shim. It does not enable
+local spawn; add the agent and
+terminal pairs if the broker host should still be able to run CLIs itself.
+Set `BROKER_REVERSE_WORKER_STRICT=1` when execution must not fall back to the
+broker host. Relayed `started` events include `"via":"<worker-name>"`. The
+shim's `--use-api-key` and `--inherit-env` match local spawn's environment
+flags and still do not inject the pairing token.
+`term-drive.mjs` and `agent-drive.mjs` are unchanged. See
+[Reverse-worker mode](https://github.com/s243a/SciREPL-MCP/blob/main/docs/reverse-worker.md).
+
 ## Platforms
 
 - **Linux and WSL:** supported for the core broker, agent adapters, and optional

@@ -108,10 +108,36 @@ The app first sends:
 ```
 
 When enabled, the broker responds with detected CLI names in both `agents`
-(for existing clients) and `availableAgents`, the complete adapter list in
-`configuredAgents`, the `workspaceReady` state, and the protocol version. If the
-workspace is unprepared and the advanced unmanaged override is absent, `agents`
-is empty and a start request fails closed. The app can then send:
+(for existing clients) and `availableAgents`, the complete local adapter list in
+`configuredAgents`, the `workspaceReady` state, and the protocol version. `agents`
+can also include CLIs advertised by reverse workers. The additive `catalog` array
+describes exactly the IDs in `agents`; `remoteAccess` carries a versioned combined
+terms/security notice. For example (copy abbreviated):
+
+```json
+{
+  "type": "agent",
+  "kind": "welcome",
+  "agents": ["codex"],
+  "catalog": [{
+    "id": "codex",
+    "kind": "agent",
+    "integrationStatus": "provider-documented",
+    "termsReview": "review",
+    "sources": [{ "label": "Codex app-server", "url": "https://developers.openai.com/codex/app-server", "reviewedAt": "2026-08-27" }]
+  }],
+  "remoteAccess": {
+    "noticeVersion": 1,
+    "notice": { "title": "Before enabling remote controls", "terms": "…", "security": "…", "acknowledgement": "…" }
+  }
+}
+```
+
+The metadata is advisory: a command name does not reveal the account, plan, or
+credentials used on a local or reverse-worker host. Clients must not interpret an
+integration status as a compliance decision. If the workspace is unprepared and
+the advanced unmanaged override is absent, locally configured entries are omitted
+from `agents` and a local start request fails closed. The app can then send:
 
 ```json
 { "type": "start", "agent": "claude" }
@@ -149,8 +175,11 @@ After an authenticated hello, the app can send:
 ```
 
 The broker replies with `{"type":"term","kind":...}` events such as
-`welcome`, `started`, `data`, `exit`, and `error`. Terminal mode is a privileged
-feature and is disabled by default. When reverse-worker mode is enabled, `/term`
+`welcome`, `started`, `data`, `exit`, and `error`. Its welcome includes `catalog`
+entries whose IDs match the advertised `cmds`, plus the same versioned
+`remoteAccess` notice. A `shell` entry carries host-security guidance rather than
+a model-provider terms classification. Terminal mode is a privileged feature and
+is disabled by default. When reverse-worker mode is enabled, `/term`
 and `/agent` keep these exact controller message shapes and the broker may
 relay them instead of spawning locally. Relayed `started` events include a
 broker-authored `via` field naming the worker; local-spawn `started` events do

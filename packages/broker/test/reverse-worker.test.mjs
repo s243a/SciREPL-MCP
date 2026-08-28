@@ -604,6 +604,15 @@ try {
     const termWelcome = await term.first;
     ok(termWelcome.kind === 'welcome' && termWelcome.enabled === true && (termWelcome.cmds || []).includes('shell'),
         '/term welcome lists the reverse worker\'s advertised cmds');
+    ok((termWelcome.catalog || []).map(entry => entry.id).join(',') === (termWelcome.cmds || []).join(','),
+        '/term catalog IDs exactly match reverse-worker-advertised cmds');
+    ok((termWelcome.catalog || []).some(entry => entry.id === 'shell' && entry.kind === 'shell' &&
+        !entry.termsReview && /permissions/i.test(entry.securityNote || '')),
+        '/term keeps shell host security separate from provider terms');
+    ok(Number.isInteger(termWelcome.remoteAccess?.noticeVersion) &&
+        /review the terms/i.test(termWelcome.remoteAccess?.notice?.terms || '') &&
+        /broker token|raw shell/i.test(termWelcome.remoteAccess?.notice?.security || ''),
+        '/term welcome carries one versioned terms-and-security notice');
     const termEvents = collectUntil(term.ws, (m) => m.kind === 'data' && /HELLO_42/.test(m.data || ''));
     term.ws.send(JSON.stringify({ type: 'start', cmd: 'shell', cols: 80, rows: 24 }));
     await sleep(50);
@@ -623,6 +632,13 @@ try {
     const agentWelcome = await agent.first;
     ok(agentWelcome.kind === 'welcome' && (agentWelcome.agents || []).includes('agy'),
         '/agent welcome lists the reverse worker\'s advertised agents');
+    ok((agentWelcome.catalog || []).map(entry => entry.id).join(',') === (agentWelcome.agents || []).join(','),
+        '/agent catalog IDs exactly match reverse-worker-advertised agents');
+    ok((agentWelcome.catalog || []).some(entry => entry.id === 'agy' &&
+        entry.integrationStatus === 'provider-documented' && entry.termsReview === 'specific-review'),
+        '/agent describes Agy as documented while linking provider-specific terms for review');
+    ok(agentWelcome.remoteAccess?.noticeVersion === termWelcome.remoteAccess?.noticeVersion,
+        '/agent and /term advertise the same notice version');
     const agentEvents = collectUntil(agent.ws, (m) => m.kind === 'result');
     agent.ws.send(JSON.stringify({ type: 'start', agent: 'agy' }));
     await sleep(50);

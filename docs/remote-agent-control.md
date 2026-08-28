@@ -256,3 +256,72 @@ value order:
    headers replace the bearer secret with asserted tailnet identity:
    nothing copyable to steal, revocation via ACLs, and actions attribute
    to a node in the audit trail instead of to "whoever had the string".
+
+## Remote-access notice and terms references
+
+The broker will host the commands allowed by its local configuration and by
+connected reverse workers. It cannot determine which account, plan, credentials,
+or worker-host environment an operator uses. Those details can change which terms
+apply, so the broker supplies references rather than a permission or risk verdict.
+
+[`src/agent-catalog.mjs`](../packages/broker/src/agent-catalog.mjs) is advertised
+additively in `/agent` and `/term` welcome messages:
+
+- `catalog` describes the choices in that exact welcome message. This includes
+  reverse-worker-only choices; its IDs match `agents` or `cmds`.
+- `remoteAccess.notice` is a combined provider-terms and remote-host security
+  notice. `remoteAccess.noticeVersion` lets a client ask again after a material
+  wording change.
+
+Older clients can ignore both fields. The broker does not record acceptance or
+enforce a legal conclusion. SciREPL Pro uses the versioned notice as a product gate
+before enabling its remote controls.
+
+### What the catalog does—and does not—say
+
+The catalog has two independent axes:
+
+| Field | Meaning |
+| --- | --- |
+| `integrationStatus` | Whether the command is a provider-documented integration surface, a community integration, or an unknown/custom command. |
+| `termsReview` | Whether to review generally applicable terms or provider material specifically relevant to authentication/access through another app. |
+
+These are navigation aids, not compliance ratings. The provider documentation now
+describes programmatic surfaces for all four built-in agent CLIs:
+
+- OpenAI documents [Codex non-interactive mode](https://developers.openai.com/codex/non-interactive-mode)
+  and [app-server](https://developers.openai.com/codex/app-server).
+- Google documents [Gemini CLI headless mode](https://geminicli.com/docs/cli/headless/)
+  and [ACP mode](https://geminicli.com/docs/cli/acp-mode/).
+- Anthropic documents the [Claude Code print and streaming
+  interface](https://docs.anthropic.com/en/docs/claude-code/cli-usage).
+- Google documents [Antigravity CLI headless
+  mode](https://antigravity.google/docs/cli/headless/). Its
+  [additional terms](https://antigravity.google/terms) also contain language about
+  third-party access, so the catalog links both and asks the operator to review
+  them for the actual setup and sign-in method.
+
+Sources in the wire payload include a review date so maintainers can see when a
+reference needs checking again. A documented interface still does not establish
+the terms for every authentication method. Conversely, an open-source tool does
+not establish which model provider or plan is in use. Unknown commands therefore
+remain `custom`; they never fall back to an optimistic API-key category.
+
+### One notice, two distinct concerns
+
+SciREPL Pro presents one acknowledgement before enabling any remote surface,
+including both named agents and a raw shell. Within that notice, the concerns stay
+separate:
+
+1. **Service terms.** Review the current terms for each service, account, plan,
+   authentication method, and integration you use. SciREPL cannot determine whether
+   a particular setup is permitted.
+2. **Remote-host security.** A holder of the broker token can exchange notebook or
+   tool data, send prompts and terminal input, and run commands on the broker or
+   worker computer. A raw shell is especially powerful because it runs with the
+   operating-system account's permissions and adds no agent permission prompt.
+
+The acknowledgement enables a feature; it does not ask the person to certify legal
+compliance. Bump `REMOTE_ACCESS_NOTICE_VERSION` when the meaning changes. In the Pro
+UI, the nearby help button opens the notice until it is acknowledged and ordinary
+remote setup help afterward; Settings keeps a way to review the notice again.

@@ -281,6 +281,16 @@ Use `BROKER_TERM_NO_SHELL=1` to remove the standalone shell option and prevent a
 agent from dropping to a shell after it exits. This reduces convenience but does
 not turn an agent CLI into a sandbox.
 
+Both `/agent` and `/term` welcome messages include additive `catalog` and
+`remoteAccess` metadata. The catalog links to current integration documentation
+and applicable provider material; it does not infer an account, plan, or
+authentication method from a command name. The combined notice asks clients to
+keep two concerns distinct: review the terms for services they use, and protect
+the remote host and broker token. Shell is represented only as a host-security
+capability, not as a model-provider terms category. See the
+[remote-agent control guide](https://github.com/s243a/SciREPL-MCP/blob/main/docs/remote-agent-control.md#remote-access-notice-and-terms-references)
+and [wire protocol](https://github.com/s243a/SciREPL-MCP/blob/main/docs/protocol.md).
+
 ## Optional reverse worker
 
 Reverse-worker mode lets the CLI run on another machine, container, or VM while

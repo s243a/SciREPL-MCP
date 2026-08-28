@@ -24,6 +24,11 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { WebSocketServer } from 'ws';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
+import {
+    catalogFor,
+    REMOTE_ACCESS_NOTICE,
+    REMOTE_ACCESS_NOTICE_VERSION,
+} from './agent-catalog.mjs';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { ListToolsRequestSchema, CallToolRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import { inspectWorkspace, setupWorkspace, writePrivateFile } from './workspace.mjs';
@@ -994,7 +999,21 @@ agentWss.on('connection', (ws) => {
                 ...(AGENT_ENABLED ? availableAgents : []),
                 ...workerAgents,
             ])];
-            sendWsJson(ws, { type: 'agent', kind: 'welcome', protocolVersion: PROTOCOL_VERSION, agents, availableAgents: availableMerged, configuredAgents, workspaceReady, running: agentBridge.running() && agentBridge.name }, MAX_AGENT_BUFFER_BYTES);
+            sendWsJson(ws, {
+                type: 'agent',
+                kind: 'welcome',
+                protocolVersion: PROTOCOL_VERSION,
+                agents,
+                availableAgents: availableMerged,
+                configuredAgents,
+                workspaceReady,
+                running: agentBridge.running() && agentBridge.name,
+                catalog: catalogFor(agents),
+                remoteAccess: {
+                    noticeVersion: REMOTE_ACCESS_NOTICE_VERSION,
+                    notice: REMOTE_ACCESS_NOTICE,
+                },
+            }, MAX_AGENT_BUFFER_BYTES);
             return;
         }
         if (!authed) return;
@@ -1062,7 +1081,19 @@ termWss.on('connection', (ws) => {
                 ...(TERM_ENABLED ? TERM_CMDS : []),
                 ...workerCmds,
             ])];
-            sendWsJson(ws, { type: 'term', kind: 'welcome', protocolVersion: PROTOCOL_VERSION, enabled: termOn, cmds: termOn ? cmds : [] }, MAX_TERM_WS_PAYLOAD_BYTES);
+            const advertisedCmds = termOn ? cmds : [];
+            sendWsJson(ws, {
+                type: 'term',
+                kind: 'welcome',
+                protocolVersion: PROTOCOL_VERSION,
+                enabled: termOn,
+                cmds: advertisedCmds,
+                catalog: catalogFor(advertisedCmds),
+                remoteAccess: {
+                    noticeVersion: REMOTE_ACCESS_NOTICE_VERSION,
+                    notice: REMOTE_ACCESS_NOTICE,
+                },
+            }, MAX_TERM_WS_PAYLOAD_BYTES);
             return;
         }
         if (!authed) return;

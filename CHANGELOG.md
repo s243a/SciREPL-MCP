@@ -2,6 +2,11 @@
 
 ## 0.1.0 - Unreleased
 
+This entry covers the repository's first public source release and the first
+release of the app-connected broker, both as `v0.1.0`. The included Playwright
+driver keeps its independent package version, `1.0.0`; this repository release
+does not reset or replace that version.
+
 - Add optional reverse-worker mode: a worker dials `/worker` with a distinct
   credential and the broker relays the existing `/agent` and `/term` controller
   messages to it. Default off; setup requires
@@ -58,6 +63,10 @@
 - Add shared Bash and PowerShell setup entry points, private generated launchers,
   conflict-safe repair with backups, symlink/path checks, and deterministic setup
   and no-implicit-seeding tests.
+- Bootstrap setup without installed dependencies so help, the Node 20+ version
+  guard, and fresh-source dependency installation work before `ws` is present;
+  invoke `npm.cmd` correctly during native-Windows setup and cover clean source
+  copies with regression tests.
 - Pin generated launchers to the Node 20+ executable that setup validated, so a
   service or new shell cannot silently fall back to an older system Node.
 - Expose `scirepl-mcp-setup` for an installed package and verify its existing
@@ -75,3 +84,6 @@
 - Manage Antigravity's workspace-local `.agents/mcp_config.json` alongside the
   existing provider files, using its required `serverUrl` schema and the current
   broker connection credentials.
+- Refresh audited transitive dependencies, reconcile third-party notices with
+  the locks, and document source-only release checks and package-version
+  semantics.

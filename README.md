@@ -69,6 +69,21 @@ npm run audit
 `npm run setup` is the explicit broker-environment setup command, not the
 repository dependency-install command.
 
+## Versions and releases
+
+The first public source release uses tag `v0.1.0`, matching the repository and
+app-connected broker versions. The Playwright driver is independently versioned
+and remains `1.0.0`; including it in the `v0.1.0` source snapshot does not change
+its package version. Both package manifests set `private: true`; this release
+publishes neither package to npm.
+
+Get the current tagged source and its verification files from the
+[latest release](https://github.com/s243a/SciREPL-MCP/releases/latest).
+
+Maintainers should use the [release checklist](docs/releasing.md) before moving
+the changelog out of `Unreleased`, tagging a commit, or creating a GitHub
+release.
+
 ## Security and privacy
 
 The app-connected broker binds to loopback by default and requires a pairing
@@ -96,10 +111,9 @@ controller-side rules ship as
 
 ## Project relationship
 
-This standalone repository is intended to be the canonical public home for both
-SciREPL MCP servers. After its initial publication it can be referenced from
-UnifyWeaver at `examples/sci-repl/mcp` as a Git submodule, without mixing its
-history into the UnifyWeaver repository.
+This standalone public repository is the canonical home for both SciREPL MCP
+servers. It can be referenced from UnifyWeaver at `examples/sci-repl/mcp` as a
+Git submodule, without mixing its history into the UnifyWeaver repository.
 
 The browser driver was originally developed in the public UnifyWeaver project;
 the app-connected broker was extracted from SciREPL Pro. See

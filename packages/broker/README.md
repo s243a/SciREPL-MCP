@@ -147,9 +147,10 @@ and `npm start` from this package. Ordinary startup does not materialize active
 agent context; see the
 [agent-context guide](https://github.com/s243a/SciREPL-MCP/blob/main/docs/agent-context.md).
 
-An already installed package exposes the equivalent `scirepl-mcp-setup`
-command. In that layout dependencies were installed by the package manager, so
-setup verifies them instead of expecting the source checkout's lockfile.
+A package installation, including a local install from this source tree, exposes
+the equivalent `scirepl-mcp-setup` command. In that layout dependencies were
+installed by the package manager, so setup verifies them instead of expecting
+the source checkout's lockfile. The package is not currently published to npm.
 
 ## Private Android access with Tailscale
 

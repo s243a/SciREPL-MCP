@@ -165,14 +165,23 @@ current protocol uses the pairing token and feature flags, not transport identit
 for authorization. See the security policy before designing different “local”
 and “remote” privilege levels.
 
-## Reproducible release direction
+## Release and distribution direction
 
-Before the first public binary or npm release, the project should add:
+The initial release is source-only. Its maintainer-built source archives and
+checksums, GitHub's convenience archives for the reviewed `v0.1.0` tag, or a
+clone of that tag followed by `npm ci` on the target device are the intended
+distribution methods. No prebuilt broker, `node_modules` archive, Android
+package, or native `node-pty` binary is included or published. Building the
+optional terminal dependency on its target device avoids mixing operating
+systems and CPU architectures.
 
-- signed Git tags;
-- source-archive SHA-256 checksums;
-- a recorded `node-pty` build matrix for tested devices;
-- dependency-license and vulnerability reports attached to each release.
+Follow the [release checklist](releasing.md) for the source-release tests,
+dependency audit, notice review, signed tag, versioned source archives, and
+SHA-256 checksums. GitHub's generated source links are convenient, but their
+compressed bytes may change; the attached maintainer-built archives are the
+stable checksum targets.
 
-Until then, cloning a tagged source revision and running `npm ci` on the target
-device is the intended distribution method.
+Before a future binary or npm release, add a recorded `node-pty` build matrix
+for every advertised platform and architecture, reproducible artifact builds
+and checksums, and release-specific dependency-license and vulnerability
+reports.

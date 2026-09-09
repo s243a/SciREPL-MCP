@@ -29,6 +29,5 @@ made client-neutral, and compatibility and security defects were corrected.
 The imported code does not include the SciREPL application, the UnifyWeaver
 source tree, or the adjacent SciREPL Git submodule.
 
-This repository is intended to become the canonical source for both host-side
-servers. SciREPL Pro remains the source for the Android app and its app-side
-bridge.
+This repository is the canonical source for both host-side servers. SciREPL Pro
+remains the source for the Android app and its app-side bridge.

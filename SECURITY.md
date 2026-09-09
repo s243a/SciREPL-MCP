@@ -181,8 +181,8 @@ public gateway.
 
 ## Reporting a vulnerability
 
-Once the GitHub repository is public, use its **Security → Report a
-vulnerability** form so details are not disclosed in a public issue. If private
-reporting is temporarily unavailable, open a minimal issue asking the maintainer
-for a private contact method and do not include exploit details, tokens, personal
-data, or private notebook contents.
+Use the GitHub repository's **Security → Report a vulnerability** form so
+details are not disclosed in a public issue. If private reporting is temporarily
+unavailable, open a minimal issue asking the maintainer for a private contact
+method and do not include exploit details, tokens, personal data, or private
+notebook contents.

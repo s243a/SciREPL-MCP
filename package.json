@@ -4,8 +4,8 @@
   "private": true,
   "description": "Independent MCP servers for SciREPL app integration and browser automation",
   "scripts": {
-    "setup": "node packages/broker/scripts/setup.mjs",
-    "setup:broker": "node packages/broker/scripts/setup.mjs",
+    "setup": "node packages/broker/scripts/setup.cjs",
+    "setup:broker": "node packages/broker/scripts/setup.cjs",
     "install:all": "npm --prefix packages/broker ci && npm --prefix packages/playwright-driver ci",
     "check": "npm --prefix packages/broker run check && npm --prefix packages/playwright-driver run check",
     "test": "npm run test:broker && npm run test:playwright",

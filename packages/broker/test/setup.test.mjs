@@ -8,7 +8,7 @@ import { spawnSync } from 'node:child_process';
 const packageDir = process.cwd();
 const repoDir = path.resolve(packageDir, '../..');
 const testRoot = fs.mkdtempSync(path.join(fs.realpathSync(process.platform === 'win32' ? os.tmpdir() : '/tmp'), 'scirepl-mcp-setup-'));
-const script = path.join(packageDir, 'scripts', 'setup.mjs');
+const script = path.join(packageDir, 'scripts', 'setup.cjs');
 
 let passed = 0, failed = 0;
 const ok = (condition, message) => {
@@ -21,6 +21,54 @@ let hasPty = false;
 try { await import('node-pty'); hasPty = true; } catch (_) {}
 
 console.log('Explicit broker setup — deterministic tests\n');
+
+const oldNodeRun = spawnSync(process.execPath, ['-e', [
+    "Object.defineProperty(process.versions, 'node', { value: '18.20.8' });",
+    `require(${JSON.stringify(script)});`,
+].join('')], { cwd: packageDir, encoding: 'utf8' });
+ok(oldNodeRun.status === 1 &&
+    /Node\.js 20 or newer is required \(found 18\.20\.8\)/.test(oldNodeRun.stderr) &&
+    !/SyntaxError|ERR_MODULE_NOT_FOUND/.test(oldNodeRun.stderr),
+    'the setup bootstrap rejects old Node versions before loading current-syntax modules');
+
+const cleanCheckout = path.join(testRoot, 'clean-checkout');
+const cleanPackage = path.join(cleanCheckout, 'packages', 'broker');
+fs.mkdirSync(path.dirname(cleanPackage), { recursive: true });
+fs.cpSync(packageDir, cleanPackage, {
+    recursive: true,
+    filter(source) {
+        const relative = path.relative(packageDir, source);
+        if (!relative) return true;
+        return !relative.split(path.sep).some(part => part === 'node_modules' || part === '.test-workspaces');
+    },
+});
+const cleanScript = path.join(cleanPackage, 'scripts', 'setup.cjs');
+const cleanHelp = spawnSync(process.execPath, [cleanScript, '--help'], {
+    cwd: cleanPackage,
+    encoding: 'utf8',
+});
+ok(cleanHelp.status === 0 && /SciREPL MCP broker setup/.test(cleanHelp.stdout) &&
+    !/ERR_MODULE_NOT_FOUND|Cannot find package/.test(cleanHelp.stderr),
+    'setup help works from a dependency-free source copy');
+
+const fakeBin = path.join(testRoot, 'fake-bin');
+fs.mkdirSync(fakeBin);
+if (process.platform === 'win32') {
+    fs.writeFileSync(path.join(fakeBin, 'npm.cmd'), '@echo off\r\necho clean-tree-npm-reached 1>&2\r\nexit /b 37\r\n');
+} else {
+    fs.writeFileSync(path.join(fakeBin, 'npm'), '#!/bin/sh\necho clean-tree-npm-reached >&2\nexit 37\n', { mode: 0o755 });
+}
+const cleanInstallOutput = path.join(testRoot, 'clean-install-output');
+const cleanInstall = spawnSync(process.execPath, [cleanScript, '--output', cleanInstallOutput], {
+    cwd: cleanPackage,
+    encoding: 'utf8',
+    env: { ...process.env, PATH: fakeBin + path.delimiter + (process.env.PATH || '') },
+});
+ok(cleanInstall.status !== 0 && /clean-tree-npm-reached/.test(cleanInstall.stderr) &&
+    /npm ci --omit=optional failed with exit code 37/.test(cleanInstall.stderr) &&
+    !/ERR_MODULE_NOT_FOUND|Cannot find package/.test(cleanInstall.stderr) &&
+    !fs.existsSync(cleanInstallOutput),
+    'fresh-source setup reaches dependency installation before loading external packages');
 
 const core = path.join(testRoot, 'core');
 const coreRun = run('--output', core, '--no-install');

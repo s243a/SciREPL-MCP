@@ -14,6 +14,7 @@ import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { WebSocketServer } from 'ws';
 import { writePrivateFile } from './workspace.mjs';
+export { workerWebSocketUrl } from './reverse-worker-url.mjs';
 
 export const WORKER_NAME_RE = /^[a-z][a-z0-9_-]{0,63}$/;
 export const KNOWN_TERM_CMDS = Object.freeze(['shell', 'claude', 'codex', 'gemini', 'agy']);
@@ -152,12 +153,6 @@ export function auditSafeIdentity(value) {
 
 export function defaultWorkerTokenFile() {
     return process.env.BROKER_WORKER_TOKEN_FILE || path.join(os.homedir(), 'scirepl-broker', 'worker-token');
-}
-
-export function workerWebSocketUrl(host, port, pathname = '/worker') {
-    const dial = host === '0.0.0.0' || host === '::' ? '127.0.0.1' : String(host || '');
-    const hostname = dial.includes(':') ? `[${dial}]` : dial;
-    return `ws://${hostname}:${port}${pathname}`;
 }
 
 export function loadWorkerToken({ controllerToken, env = process.env } = {}) {

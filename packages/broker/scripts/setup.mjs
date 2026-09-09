@@ -6,7 +6,7 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { prepareNodePty } from '../src/node-pty-support.mjs';
-import { workerWebSocketUrl } from '../src/reverse-worker.mjs';
+import { workerWebSocketUrl } from '../src/reverse-worker-url.mjs';
 import { REQUIRED_APP_WS_PAYLOAD_BYTES, createWorkbookFileTransfer } from '../src/workbook-files.mjs';
 import { preflightWorkspace, randomToken, setupWorkspace, targetState, writePrivateFile } from '../src/workspace.mjs';
 
@@ -20,7 +20,7 @@ function usage() {
     console.log(`SciREPL MCP broker setup
 
 Usage:
-  node scripts/setup.mjs [options]
+  node scripts/setup.cjs [options]
 
 Options:
   --output PATH                         Setup directory (default: ~/scirepl-broker)
@@ -410,12 +410,18 @@ function installDependencies(options) {
         console.log('[setup] installed-package layout detected; using its existing dependencies');
         return;
     }
-    const command = process.platform === 'win32' ? 'npm.cmd' : 'npm';
-    const args = options.enableTerminal ? ['ci'] : ['ci', '--omit=optional'];
+    const npmArgs = options.enableTerminal ? ['ci'] : ['ci', '--omit=optional'];
+    // Windows cannot execute a .cmd shim directly with shell:false. Keep the
+    // command and all arguments fixed while using cmd.exe only as that shim's
+    // required interpreter.
+    const command = process.platform === 'win32' ? (process.env.ComSpec || 'cmd.exe') : 'npm';
+    const args = process.platform === 'win32'
+        ? ['/d', '/s', '/c', 'npm.cmd', ...npmArgs]
+        : npmArgs;
     console.log(`[setup] installing broker dependencies (${options.enableTerminal ? 'including optional terminal support' : 'core only'})`);
     const result = spawnSync(command, args, { cwd: PACKAGE_DIR, stdio: 'inherit', shell: false });
     if (result.error) throw result.error;
-    if (result.status !== 0) throw new Error(`npm ${args.join(' ')} failed with exit code ${result.status}`);
+    if (result.status !== 0) throw new Error(`npm ${npmArgs.join(' ')} failed with exit code ${result.status}`);
 }
 
 function verifyCoreDependencies(options) {

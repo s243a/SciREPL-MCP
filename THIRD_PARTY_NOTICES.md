@@ -5,7 +5,7 @@ SciREPL MCP uses the following direct dependencies:
 | Package | Locked version | License | Used by | Project |
 |---|---:|---|---|---|
 | `@modelcontextprotocol/sdk` | 1.30.0 | MIT | Both servers | [Model Context Protocol TypeScript SDK](https://github.com/modelcontextprotocol/typescript-sdk) |
-| `ws` | 8.21.2 | MIT | App-connected broker | [ws](https://github.com/websockets/ws) |
+| `ws` | 8.21.3 | MIT | App-connected broker | [ws](https://github.com/websockets/ws) |
 | `node-pty` (optional) | 1.1.0 | MIT | App-connected broker terminal | [node-pty](https://github.com/microsoft/node-pty) |
 | `playwright` / `playwright-core` | 1.62.1 | Apache-2.0 | Playwright driver | [Playwright](https://github.com/microsoft/playwright) |
 

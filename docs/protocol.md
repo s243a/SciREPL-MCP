@@ -131,11 +131,18 @@ does not forget which controller parked it.
 
 `reset` is distinct from `stop`: it kills any active child and forgets the
 provider resume identifier and adapter identity. The broker replies only after
-that state is cleared and the child is quiesced, using
+all local and reverse-worker agent state owned by that controller is cleared and
+every child is observed to exit (with a SIGKILL fallback), using
 `{"type":"agent","kind":"reset","requestId":"clear-7","ok":true}`. A
 correlated failure uses the same event with `ok:false` and `error`. Clients must wait
 for the matching acknowledgement before starting another session. Repeating a
-reset after the state is already empty is safe.
+reset after the state is already empty is safe. A stopped reverse session keeps
+its original controller owner until reset; another controller cannot claim its
+parked context. Disconnect destroys that parked context, and a reset interrupted
+by worker or controller disconnect is failed rather than parked. If termination
+cannot be confirmed, the failure remains tracked and a later reset retries it;
+an older reverse worker without reset support is disconnected rather than
+allowed to retain a parked context.
 
 Broker events use `{"type":"agent","kind":...}`. Kinds include `welcome`,
 `started`, `assistant`, `tool_use`, `result`, `stderr`, `error`, `exit`, and

@@ -250,9 +250,19 @@ The worker replies with the same event objects controllers already consume:
 ```
 
 For reset, the worker clears name/profile/buffer/resume state, terminates the
-child, and only then acknowledges. The hub suppresses all other events from the
+whole child process group (SIGTERM followed by SIGKILL when needed), observes
+exit, and only then acknowledges. The hub suppresses all other events from the
 invalidated session while reset is pending and clears its route on the matching
-acknowledgement.
+acknowledgement. The controller-facing broker treats local and reverse state as
+one reset transaction: a success is sent only after both namespaces quiesce.
+Worker loss returns a correlated failure; controller loss cancels routing and
+never turns the pending reset into a parked session. A failed process-tree
+termination stays tracked for a later reset attempt. If a connected legacy
+worker cannot acknowledge reset, the hub closes that worker instead of dropping
+only the broker-side ticket. A worker that stays connected without answering is
+closed after `BROKER_AGENT_RESET_TIMEOUT_MS` (default 4000 ms, leaving margin
+before the app's 5-second acknowledgement timeout), with a
+correlated timeout failure returned to the controller.
 
 The broker forwards those events to the bound controller socket without
 changing `type`, `kind`, or payload fields. It may drop an event whose
@@ -373,7 +383,10 @@ fails until `start`. Resume identifiers are stored separately, keyed by
 agent name, so switching providers cannot reuse the wrong session.
 Disconnect destroys that parked ticket independently of reverse-session
 detach; a repeated or idle `stop` does not forget which controller
-parked it.
+parked it. The parked reverse ticket likewise retains its original owner: a
+foreign controller cannot reset or resume it. When its owner disconnects, the
+hub asks the worker to destroy the resume context before a fresh start is
+accepted.
 `/term` stays local while a PTY is already running. Reverse mode must not
 create a second live session beside a local one.
 

@@ -7,6 +7,7 @@
  */
 import { WebSocket } from 'ws';
 import { spawn, spawnSync } from 'node:child_process';
+import { EventEmitter } from 'node:events';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -34,6 +35,7 @@ process.env.BROKER_TERM = '1';
 process.env.BROKER_ALLOW_UNMANAGED_AGENT_WORKSPACE = '1';
 process.env.BROKER_WORKSPACE = path.join(testRoot, 'workspace');
 process.env.BROKER_AGENT_CWD = process.env.BROKER_WORKSPACE;
+process.env.BROKER_AGENT_RESET_TIMEOUT_MS = '2500';
 
 let passed = 0, failed = 0;
 const ok = (c, m) => { if (c) { console.log('  ✓ ' + m); passed++; } else { console.log('  ✗ ' + m); failed++; } };
@@ -60,6 +62,21 @@ function collectUntil(ws, predicate, timeoutMs = 4000) {
         };
         ws.on('message', onMsg);
     });
+}
+
+async function startAgentEventually(ws, name, timeoutMs = 6000) {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+        const attempt = collectUntil(ws,
+            (m) => (m.kind === 'started' && (m.text === name || m.cmd === name)) ||
+                (m.kind === 'error' && /has not quiesced/.test(m.text || '')),
+            Math.max(100, deadline - Date.now()));
+        ws.send(JSON.stringify({ type: 'start', agent: name }));
+        const events = await attempt;
+        if (events.some(m => m.kind === 'started' && (m.text === name || m.cmd === name))) return events;
+        await sleep(50);
+    }
+    throw new Error(`${name} did not start after the prior child quiesced`);
 }
 
 function openWs(url) {
@@ -335,6 +352,55 @@ setInterval(() => {}, 1000);
         'process-group SIGKILL still fires after the leader exits on SIGTERM, reaping a stubborn descendant');
 } else {
     console.log('  - stubborn-descendant process-group test skipped (Windows uses taskkill /t /f)');
+}
+
+{
+    const leader = new EventEmitter();
+    leader.pid = 424242;
+    leader.exitCode = null;
+    leader.signalCode = null;
+    leader.kill = () => true;
+    const taskkill = new EventEmitter();
+    const terminated = terminateChild(leader, 10, {
+        platform: 'win32',
+        spawnTaskkill(command, args) {
+            ok(command === 'taskkill' && args.includes('/t') && args.includes('/f'),
+                'Windows termination invokes taskkill for the whole descendant tree');
+            return taskkill;
+        },
+        failureMs: 100,
+    });
+    leader.exitCode = 0;
+    leader.emit('exit', 0, null);
+    const beforeTreeKill = await Promise.race([
+        terminated.then(() => 'resolved'),
+        sleep(30).then(() => 'pending'),
+    ]);
+    taskkill.emit('close', 0);
+    await terminated;
+    ok(beforeTreeKill === 'pending',
+        'Windows leader exit does not resolve Reset before taskkill /t completes');
+}
+
+{
+    const leader = new EventEmitter();
+    leader.pid = 424243;
+    leader.exitCode = null;
+    leader.signalCode = null;
+    leader.kill = () => true;
+    const taskkill = new EventEmitter();
+    const terminated = terminateChild(leader, 0, {
+        platform: 'win32',
+        spawnTaskkill() { return taskkill; },
+        failureMs: 30,
+    });
+    leader.exitCode = 0;
+    leader.emit('exit', 0, null);
+    taskkill.emit('close', 1);
+    let failure = '';
+    try { await terminated; } catch (error) { failure = error?.message || String(error); }
+    ok(/did not exit/.test(failure),
+        'Windows taskkill failure rejects conservatively instead of claiming tree quiescence');
 }
 
 ok(workerWebSocketUrl('127.0.0.1', 8087) === 'ws://127.0.0.1:8087/worker',
@@ -641,6 +707,18 @@ try {
     ok(agentGot.some(m => m.kind === 'assistant' && m.text === 'pong:ping') && agentGot.some(m => m.kind === 'result'),
         '/agent input/assistant/result round-trips through the reverse worker');
 
+    agent.ws.send(JSON.stringify({ type: 'stop' }));
+    const stopSeen = Date.now() + 1000;
+    while (!forwarded.some(m => m.type === 'stop' && m.surface === 'agent') && Date.now() < stopSeen) await sleep(20);
+    const foreign = await connectController('/agent');
+    await foreign.first;
+    const foreignReset = collectUntil(foreign.ws, (m) => m.kind === 'reset' && m.requestId === 'foreign-parked-clear');
+    foreign.ws.send(JSON.stringify({ type: 'reset', requestId: 'foreign-parked-clear' }));
+    const foreignGot = await foreignReset;
+    ok(foreignGot.some(m => m.kind === 'reset' && m.ok === false && /owned/.test(m.error || '')),
+        'a foreign controller cannot reset the original controller\'s parked reverse session');
+    try { foreign.ws.close(); } catch (_) {}
+
     const afterReset = [];
     const recordAfterReset = (buf) => {
         try { afterReset.push(JSON.parse(buf.toString())); } catch (_) {}
@@ -666,6 +744,254 @@ try {
 } catch (e) {
     console.log('  ✗ unexpected relay error: ' + (e.stack || e));
     failed++;
+}
+
+console.log('\nParked ownership and pending-reset disconnects\n');
+try {
+    const { ws: worker, welcome } = await connectWorker({
+        name: 'reset-lifecycle-box',
+        capabilities: { surfaces: ['agent'], agents: ['agy'], resetSession: true },
+    });
+    await welcome;
+    const commands = [];
+    let holdReset = false;
+    worker.on('message', (buf) => {
+        let msg; try { msg = JSON.parse(buf.toString()); } catch { return; }
+        if (msg.type === 'welcome') return;
+        commands.push(msg);
+        if (msg.type === 'start') worker.send(JSON.stringify({ type: 'agent', kind: 'started', text: msg.agent }));
+        if (msg.type === 'reset' && !holdReset) {
+            setTimeout(() => worker.send(JSON.stringify({ type: 'agent', kind: 'reset', requestId: msg.requestId, ok: true })), 25);
+        }
+    });
+
+    const owner = await connectController('/agent');
+    await owner.first;
+    const firstStarted = collectUntil(owner.ws, (m) => m.kind === 'started');
+    owner.ws.send(JSON.stringify({ type: 'start', agent: 'agy' }));
+    await firstStarted;
+    owner.ws.send(JSON.stringify({ type: 'stop' }));
+    const stopped = Date.now() + 1000;
+    while (!commands.some(m => m.type === 'stop') && Date.now() < stopped) await sleep(20);
+    const ownerClosed = new Promise(resolve => owner.ws.once('close', resolve));
+    owner.ws.close();
+    await ownerClosed;
+    const resetAfterDisconnect = Date.now() + 2000;
+    while ((!commands.some(m => m.type === 'reset') || reverseWorkerHub.hasSession('agent')) && Date.now() < resetAfterDisconnect) await sleep(20);
+
+    const fresh = await connectController('/agent');
+    await fresh.first;
+    const freshStarted = collectUntil(fresh.ws, (m) => m.kind === 'started');
+    fresh.ws.send(JSON.stringify({ type: 'start', agent: 'agy' }));
+    await freshStarted;
+    const firstResetIndex = commands.findIndex(m => m.type === 'reset');
+    const lastStartIndex = commands.map(m => m.type).lastIndexOf('start');
+    ok(firstResetIndex >= 0 && lastStartIndex > firstResetIndex && reverseWorkerHub._parkedAgent() === null,
+        'Stop then owner disconnect destroys the parked ticket/context before a fresh Start');
+
+    // While reset is pending, controller loss must destroy routing rather than
+    // turning it back into a resumable parked ticket.
+    fresh.ws.send(JSON.stringify({ type: 'stop' }));
+    await sleep(30);
+    holdReset = true;
+    fresh.ws.send(JSON.stringify({ type: 'reset', requestId: 'controller-drop-reset' }));
+    const pendingForward = Date.now() + 1000;
+    while (!commands.some(m => m.type === 'reset' && m.requestId === 'controller-drop-reset') && Date.now() < pendingForward) await sleep(20);
+    const freshClosed = new Promise(resolve => fresh.ws.once('close', resolve));
+    fresh.ws.close();
+    await freshClosed;
+    await sleep(40);
+    ok(!reverseWorkerHub.hasSession('agent') && reverseWorkerHub._parkedAgent() === null,
+        'controller disconnect during reset fails the operation without parking pending state');
+    holdReset = false;
+
+    // A worker disappearing mid-reset must produce one correlated failure for
+    // the still-connected controller and leave no resumable route.
+    const dropController = await connectController('/agent');
+    await dropController.first;
+    const dropStarted = collectUntil(dropController.ws, (m) => m.kind === 'started');
+    dropController.ws.send(JSON.stringify({ type: 'start', agent: 'agy' }));
+    await dropStarted;
+    holdReset = true;
+    const failedAck = collectUntil(dropController.ws, (m) => m.kind === 'reset' && m.requestId === 'worker-drop-reset');
+    dropController.ws.send(JSON.stringify({ type: 'reset', requestId: 'worker-drop-reset' }));
+    const dropForward = Date.now() + 1000;
+    while (!commands.some(m => m.type === 'reset' && m.requestId === 'worker-drop-reset') && Date.now() < dropForward) await sleep(20);
+    worker.close();
+    const failed = await failedAck;
+    ok(failed.some(m => m.kind === 'reset' && m.requestId === 'worker-drop-reset' && m.ok === false && /disconnected/.test(m.error || '')) &&
+        !reverseWorkerHub.hasSession('agent') && reverseWorkerHub._parkedAgent() === null,
+    'worker disconnect during reset returns correlated ok:false and never parks pending reset');
+    try { dropController.ws.close(); } catch (_) {}
+} catch (e) {
+    console.log('  ✗ reset-lifecycle error: ' + (e.stack || e));
+    failed++;
+}
+
+console.log('\nUnanswered reverse reset deadline\n');
+try {
+    const silent = await connectWorker({
+        name: 'silent-reset-box',
+        capabilities: { surfaces: ['agent'], agents: ['agy'], resetSession: true },
+    });
+    await silent.welcome;
+    silent.ws.on('message', (buf) => {
+        let msg; try { msg = JSON.parse(buf.toString()); } catch { return; }
+        if (msg.type === 'start') {
+            silent.ws.send(JSON.stringify({ type: 'agent', kind: 'started', text: msg.agent }));
+        }
+        // Deliberately do not acknowledge reset.
+    });
+    const controller = await connectController('/agent');
+    await controller.first;
+    const started = collectUntil(controller.ws, (m) => m.kind === 'started');
+    controller.ws.send(JSON.stringify({ type: 'start', agent: 'agy' }));
+    await started;
+    const workerClosed = new Promise(resolve => silent.ws.once('close', resolve));
+    const timedOutAck = collectUntil(controller.ws,
+        (m) => m.kind === 'reset' && m.requestId === 'silent-reset', 5000);
+    controller.ws.send(JSON.stringify({ type: 'reset', requestId: 'silent-reset' }));
+    const timedOut = await timedOutAck;
+    await workerClosed;
+    const unregistered = Date.now() + 1000;
+    while (reverseWorkerHub._workers.has('silent-reset-box') && Date.now() < unregistered) await sleep(20);
+    ok(timedOut.some(m => m.kind === 'reset' && m.ok === false && /timed out/.test(m.error || '')) &&
+        !reverseWorkerHub.hasSession('agent') && reverseWorkerHub._parkedAgent() === null &&
+        !reverseWorkerHub._workers.has('silent-reset-box'),
+    'an authenticated worker that never acknowledges reset is failed, unrouted, and disconnected');
+    controller.ws.close();
+} catch (e) {
+    console.log('  ✗ unanswered-reset-deadline error: ' + (e.stack || e));
+    failed++;
+}
+
+console.log('\nLegacy worker parked-session destruction\n');
+try {
+    const legacy = await connectWorker({
+        name: 'legacy-reset-box',
+        capabilities: { surfaces: ['agent'], agents: ['agy'], resetSession: false },
+    });
+    await legacy.welcome;
+    const legacyCommands = [];
+    legacy.ws.on('message', (buf) => {
+        let msg; try { msg = JSON.parse(buf.toString()); } catch { return; }
+        if (msg.type === 'welcome') return;
+        legacyCommands.push(msg);
+        if (msg.type === 'start') {
+            legacy.ws.send(JSON.stringify({ type: 'agent', kind: 'started', text: msg.agent }));
+        }
+    });
+    const owner = await connectController('/agent');
+    await owner.first;
+    const started = collectUntil(owner.ws, (m) => m.kind === 'started');
+    owner.ws.send(JSON.stringify({ type: 'start', agent: 'agy' }));
+    await started;
+    owner.ws.send(JSON.stringify({ type: 'stop' }));
+    const stopped = Date.now() + 1000;
+    while (!legacyCommands.some(m => m.type === 'stop') && Date.now() < stopped) await sleep(20);
+
+    const workerClosed = new Promise(resolve => legacy.ws.once('close', resolve));
+    const ownerClosed = new Promise(resolve => owner.ws.once('close', resolve));
+    owner.ws.close();
+    await ownerClosed;
+    await workerClosed;
+    const unregisterDeadline = Date.now() + 1000;
+    while (reverseWorkerHub._workers.has('legacy-reset-box') && Date.now() < unregisterDeadline) await sleep(20);
+    ok(legacyCommands.some(m => m.type === 'stop') &&
+        !reverseWorkerHub._workers.has('legacy-reset-box') &&
+        !reverseWorkerHub.hasSession('agent') && reverseWorkerHub._parkedAgent() === null,
+    'owner disconnect closes a legacy worker that cannot prove parked-context reset');
+
+    // A replacement worker with the same identity receives a genuinely fresh
+    // Start; no broker-side ticket from the disconnected worker can resume.
+    const replacement = await connectWorker({
+        name: 'legacy-reset-box',
+        capabilities: { surfaces: ['agent'], agents: ['agy'], resetSession: false },
+    });
+    await replacement.welcome;
+    const replacementCommands = [];
+    replacement.ws.on('message', (buf) => {
+        let msg; try { msg = JSON.parse(buf.toString()); } catch { return; }
+        if (msg.type === 'welcome') return;
+        replacementCommands.push(msg);
+        if (msg.type === 'start') {
+            replacement.ws.send(JSON.stringify({ type: 'agent', kind: 'started', text: msg.agent }));
+        }
+    });
+    const fresh = await connectController('/agent');
+    await fresh.first;
+    const freshStarted = collectUntil(fresh.ws, (m) => m.kind === 'started');
+    fresh.ws.send(JSON.stringify({ type: 'start', agent: 'agy' }));
+    await freshStarted;
+    ok(replacementCommands.filter(m => m.type === 'start').length === 1 &&
+        reverseWorkerHub._parkedAgent() === null,
+    'a fresh controller Start after legacy cleanup binds only to the replacement worker');
+    const replacementClosed = new Promise(resolve => replacement.ws.once('close', resolve));
+    fresh.ws.close();
+    await replacementClosed;
+} catch (e) {
+    console.log('  ✗ legacy-reset-lifecycle error: ' + (e.stack || e));
+    failed++;
+}
+
+console.log('\nHybrid local + reverse reset\n');
+try {
+    const { ws: worker, welcome } = await connectWorker({
+        name: 'hybrid-box',
+        capabilities: { surfaces: ['agent'], agents: ['agy'], resetSession: true },
+    });
+    await welcome;
+    const commands = [];
+    worker.on('message', (buf) => {
+        let msg; try { msg = JSON.parse(buf.toString()); } catch { return; }
+        if (msg.type === 'welcome') return;
+        commands.push(msg);
+        if (msg.type === 'start') worker.send(JSON.stringify({ type: 'agent', kind: 'started', text: msg.agent }));
+        if (msg.type === 'reset') setTimeout(() => worker.send(JSON.stringify({ type: 'agent', kind: 'reset', requestId: msg.requestId, ok: true })), 40);
+    });
+    const controller = await connectController('/agent');
+    await controller.first;
+
+    const activeStarted = collectUntil(controller.ws, (m) => m.kind === 'started');
+    controller.ws.send(JSON.stringify({ type: 'start', agent: 'agy' }));
+    await activeStarted;
+    agentBridge.sessionId = 'parked-local-context';
+    agentBridge.sessionAgent = 'codex';
+    agentBridge.stoppedBy = reverseWorkerHub._sessions.agent.controllerWs;
+    const activeAck = collectUntil(controller.ws, (m) => m.kind === 'reset' && m.requestId === 'hybrid-active-reverse');
+    controller.ws.send(JSON.stringify({ type: 'reset', requestId: 'hybrid-active-reverse' }));
+    const activeResult = await activeAck;
+    const activeClean = activeResult.some(m => m.ok === true) && agentBridge.hasState() === false &&
+        !reverseWorkerHub.hasSession('agent') && reverseWorkerHub._parkedAgent() === null;
+    ok(activeClean,
+    'one reset clears active reverse state plus parked local context before success');
+
+    const parkedStarted = collectUntil(controller.ws, (m) => m.kind === 'started');
+    controller.ws.send(JSON.stringify({ type: 'start', agent: 'agy' }));
+    await parkedStarted;
+    controller.ws.send(JSON.stringify({ type: 'stop' }));
+    await sleep(30);
+    agentBridge.ws = reverseWorkerHub._parkedAgent().ownerWs;
+    agentBridge.profile = {};
+    agentBridge.name = 'codex';
+    agentBridge.mode = 'oneshot';
+    agentBridge.sessionId = 'active-local-context';
+    agentBridge.sessionAgent = 'codex';
+    const parkedAck = collectUntil(controller.ws, (m) => m.kind === 'reset' && m.requestId === 'hybrid-parked-reverse');
+    controller.ws.send(JSON.stringify({ type: 'reset', requestId: 'hybrid-parked-reverse' }));
+    const parkedResult = await parkedAck;
+    const parkedClean = parkedResult.some(m => m.ok === true) && agentBridge.hasState() === false &&
+        !reverseWorkerHub.hasSession('agent') && reverseWorkerHub._parkedAgent() === null &&
+        commands.some(m => m.type === 'reset' && m.requestId === 'hybrid-parked-reverse');
+    ok(parkedClean, 'one reset clears active local state plus parked reverse context before success');
+
+    try { controller.ws.close(); } catch (_) {}
+    try { worker.close(); } catch (_) {}
+    await sleep(80);
+} catch (e) {
+    console.log('  ✗ hybrid-reset error: ' + (e.stack || e));
+    failed++;
+    try { await agentBridge.reset(); } catch (_) {}
 }
 
 console.log('\nReconnect semantics\n');
@@ -1135,7 +1461,10 @@ let resetShim, resetController;
 try {
     const binDir = path.join(testRoot, 'reset-bin');
     const fixture = path.join(binDir, 'codex-reset-fixture.mjs');
+    const stubbornFixture = path.join(binDir, 'claude-reset-fixture.mjs');
     const argsFile = path.join(testRoot, 'reset-codex-args.jsonl');
+    const stubbornPidFile = path.join(testRoot, 'reset-stubborn.pid');
+    const stubbornTermFile = path.join(testRoot, 'reset-stubborn-sigterm');
     fs.mkdirSync(binDir, { recursive: true });
     fs.writeFileSync(fixture, `import fs from 'node:fs';
 fs.appendFileSync(${JSON.stringify(path.join(testRoot, 'reset-codex-args.jsonl'))}, JSON.stringify(process.argv.slice(3)) + '\\n');
@@ -1143,13 +1472,20 @@ process.stdout.write(JSON.stringify({ type: 'thread.started', thread_id: 'captur
 process.stdout.write(JSON.stringify({ type: 'turn.completed' }) + '\\n');
 `);
     writeCliWrapper(binDir, 'codex', fixture);
+    fs.writeFileSync(stubbornFixture, `import fs from 'node:fs';
+process.on('SIGTERM', () => fs.writeFileSync(${JSON.stringify(stubbornTermFile)}, 'received'));
+fs.writeFileSync(${JSON.stringify(stubbornPidFile)}, String(process.pid));
+process.stdin.resume();
+setInterval(() => {}, 1000);
+`);
+    writeCliWrapper(binDir, 'claude', stubbornFixture);
     resetShim = spawn(process.execPath, [
         path.join(packageDir, 'scripts', 'reverse-worker.mjs'),
         '--url', `ws://127.0.0.1:${PORT}/worker`,
         '--token-file', workerTokenFile,
         '--name', 'reset-box',
         '--surfaces', 'agent',
-        '--agents', 'codex',
+        '--agents', 'codex,claude',
         '--cwd', process.env.BROKER_WORKSPACE,
     ], {
         cwd: packageDir,
@@ -1162,9 +1498,7 @@ process.stdout.write(JSON.stringify({ type: 'turn.completed' }) + '\\n');
     ok(resetWelcome.capabilities?.resetSession === true,
         'controller sees resetSession support with a real reverse worker');
 
-    const firstStarted = collectUntil(resetController.ws, (m) => m.kind === 'started' && m.text === 'codex');
-    resetController.ws.send(JSON.stringify({ type: 'start', agent: 'codex' }));
-    await firstStarted;
+    await startAgentEventually(resetController.ws, 'codex');
     const firstResult = collectUntil(resetController.ws, (m) => m.kind === 'result');
     resetController.ws.send(JSON.stringify({ type: 'input', text: 'first turn' }));
     await firstResult;
@@ -1177,9 +1511,7 @@ process.stdout.write(JSON.stringify({ type: 'turn.completed' }) + '\\n');
     ok(acked.some(m => m.kind === 'reset' && m.requestId === 'real-shim-clear' && m.ok === true),
         'real shim acknowledges reset after clearing its parked agent state');
 
-    const secondStarted = collectUntil(resetController.ws, (m) => m.kind === 'started' && m.text === 'codex');
-    resetController.ws.send(JSON.stringify({ type: 'start', agent: 'codex' }));
-    await secondStarted;
+    await startAgentEventually(resetController.ws, 'codex');
     const secondResult = collectUntil(resetController.ws, (m) => m.kind === 'result');
     resetController.ws.send(JSON.stringify({ type: 'input', text: 'second turn' }));
     await secondResult;
@@ -1187,6 +1519,18 @@ process.stdout.write(JSON.stringify({ type: 'turn.completed' }) + '\\n');
     ok(invocations.length === 2 && !invocations[1].includes('resume') &&
         !invocations[1].includes('captured-reset-thread'),
     'post-reset turn starts fresh instead of resuming the captured provider session');
+
+    await startAgentEventually(resetController.ws, 'claude');
+    const pidDeadline = Date.now() + 2000;
+    while (!fs.existsSync(stubbornPidFile) && Date.now() < pidDeadline) await sleep(20);
+    const stubbornPid = fs.existsSync(stubbornPidFile) ? Number(fs.readFileSync(stubbornPidFile, 'utf8')) : 0;
+    resetController.ws.send(JSON.stringify({ type: 'stop' }));
+    const stubbornAck = collectUntil(resetController.ws, (m) => m.kind === 'reset' && m.requestId === 'stubborn-stop-clear');
+    resetController.ws.send(JSON.stringify({ type: 'reset', requestId: 'stubborn-stop-clear' }));
+    const stubbornResult = await stubbornAck;
+    ok(stubbornResult.some(m => m.kind === 'reset' && m.ok === true) && stubbornPid > 0 && !pidAlive(stubbornPid) &&
+        (process.platform === 'win32' || fs.existsSync(stubbornTermFile)),
+    'real worker Stop then Reset waits for SIGKILL of a child that ignores SIGTERM');
 } catch (e) {
     console.log('  ✗ real-reset-shim error: ' + (e.stack || e));
     failed++;
@@ -1318,9 +1662,7 @@ else process.exit(2);
     const expectedStderr = STDERR_SENTINEL + 'a'.repeat(499) + '😀';
     for (const name of ['claude', 'gemini', 'agy']) {
         const startAt = Date.now();
-        const started = collectUntil(utf8Agent.ws, (m) => m.kind === 'started' && (m.text === name || m.cmd === name), 6000);
-        utf8Agent.ws.send(JSON.stringify({ type: 'start', agent: name }));
-        await started;
+        await startAgentEventually(utf8Agent.ws, name);
         const finished = collectUntil(utf8Agent.ws, (m, got) => {
             const assistant = got.filter(x => x.kind === 'assistant').map(x => x.text || '').join('');
             const stderr = got.filter(x => x.kind === 'stderr').map(x => x.text || '').join('');
@@ -1412,9 +1754,7 @@ setImmediate(() => process.exit(0));
     lateAgent = await connectController('/agent');
     await lateAgent.first;
     for (const name of ['claude', 'gemini', 'agy']) {
-        const started = collectUntil(lateAgent.ws, (m) => m.kind === 'started' && m.text === name, 6000);
-        lateAgent.ws.send(JSON.stringify({ type: 'start', agent: name }));
-        await started;
+        await startAgentEventually(lateAgent.ws, name);
         const finished = collectUntil(lateAgent.ws, (m, got) => {
             const assistant = got.filter(x => x.kind === 'assistant').map(x => x.text || '').join('');
             const stderr = got.filter(x => x.kind === 'stderr').map(x => x.text || '').join('');
@@ -1430,15 +1770,11 @@ setImmediate(() => process.exit(0));
         lateAgent.ws.send(JSON.stringify({ type: 'stop' }));
         await sleep(50);
     }
-    const leakStarted = collectUntil(lateAgent.ws, (m) => m.kind === 'started' && m.text === 'claude', 6000);
-    lateAgent.ws.send(JSON.stringify({ type: 'start', agent: 'claude' }));
-    await leakStarted;
+    await startAgentEventually(lateAgent.ws, 'claude');
     lateAgent.ws.send(JSON.stringify({ type: 'input', text: 'first session' }));
     await sleep(20);
     lateAgent.ws.send(JSON.stringify({ type: 'stop' }));
-    const leakAgyStarted = collectUntil(lateAgent.ws, (m) => m.kind === 'started' && m.text === 'agy', 6000);
-    lateAgent.ws.send(JSON.stringify({ type: 'start', agent: 'agy' }));
-    await leakAgyStarted;
+    await startAgentEventually(lateAgent.ws, 'agy');
     const leakDone = collectUntil(lateAgent.ws, (m, got) => got.some(x => x.kind === 'result' || x.kind === 'exit'), 6000);
     lateAgent.ws.send(JSON.stringify({ type: 'input', text: 'other session' }));
     const leakGot = await leakDone;

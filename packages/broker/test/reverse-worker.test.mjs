@@ -87,6 +87,26 @@ function openWs(url) {
     });
 }
 
+function closeWs(ws, timeoutMs = 3000) {
+    if (!ws || ws.readyState === WebSocket.CLOSED) return Promise.resolve();
+    return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => {
+            ws.off('close', onClose);
+            reject(new Error('websocket close timeout'));
+        }, timeoutMs);
+        const onClose = () => {
+            clearTimeout(timer);
+            resolve();
+        };
+        ws.once('close', onClose);
+        try { ws.close(); } catch (error) {
+            clearTimeout(timer);
+            ws.off('close', onClose);
+            reject(error);
+        }
+    });
+}
+
 async function connectWorker({ name = 'agy-box', token = WORKER, capabilities, sessions } = {}) {
     const ws = await openWs(`ws://127.0.0.1:${PORT}/worker`);
     const hello = {
@@ -1228,7 +1248,11 @@ try {
     ok(agentDrive.status === 0 && /ok-from-reverse/.test(agentDrive.stdout || ''),
         'unmodified agent-drive.mjs drives a reverse worker through /agent');
 
-    await new Promise((resolve) => { worker.once('close', resolve); try { worker.close(); } catch (_) { resolve(); } });
+    // agent-drive closes its controller after receiving the result. Legacy
+    // workers cannot prove that their parked provider context was reset, so
+    // the broker may already have closed this socket before runDriver returns
+    // (Windows consistently completes that close before this cleanup runs).
+    await closeWs(worker);
 } catch (e) {
     console.log('  ✗ unexpected driver error: ' + (e.stack || e));
     failed++;

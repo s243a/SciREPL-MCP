@@ -97,10 +97,13 @@ Broker events remain `{"type":"term","kind":...}` with kinds `welcome`,
 { "type": "start", "agent": "claude" }
 { "type": "input", "text": "Review my notebook" }
 { "type": "stop" }
+{ "type": "reset", "requestId": "clear-7" }
 ```
 
 Broker events remain `{"type":"agent","kind":...}` with kinds `welcome`,
-`started`, `assistant`, `tool_use`, `result`, `stderr`, `error`, and `exit`.
+`started`, `assistant`, `tool_use`, `result`, `stderr`, `error`, `exit`, and the
+request-correlated `reset` acknowledgement. The welcome advertises
+`capabilities.resetSession: true`.
 
 The broker's job in reverse mode is to forward those controller messages to a
 registered worker and forward the worker's events back, without rewriting
@@ -171,7 +174,8 @@ Worker to broker:
   "capabilities": {
     "surfaces": ["term", "agent"],
     "cmds": ["agy"],
-    "agents": ["agy"]
+    "agents": ["agy"],
+    "resetSession": true
   },
   "sessions": {
     "term": { "live": false },
@@ -197,13 +201,16 @@ Rules:
 - A `term` surface requires at least one `cmds` entry. An `agent` surface
   requires at least one `agents` entry. `shell` is valid only as a `cmds`
   entry, never as an `agents` entry.
+- `capabilities.resetSession: true` declares that the worker can quiesce an
+  agent child, discard its resume identity, and return a correlated reset
+  acknowledgement. A broker will not relay reset to a worker that omits it.
 - `sessions` is optional and used on reconnect. See
   [Reconnect](#reconnect). Unknown fields are ignored.
 
 Broker acknowledgement:
 
 ```json
-{ "type": "welcome", "protocolVersion": 1, "name": "agy-box" }
+{ "type": "welcome", "protocolVersion": 1, "name": "agy-box", "capabilities": { "resetSession": true } }
 ```
 
 A validation or authentication failure sends
@@ -227,6 +234,7 @@ field, `surface`, so a single worker socket can carry both `/term` and
 { "type": "start", "surface": "agent", "agent": "agy" }
 { "type": "input", "surface": "agent", "text": "Review my notebook" }
 { "type": "stop", "surface": "agent" }
+{ "type": "reset", "surface": "agent", "requestId": "clear-7" }
 ```
 
 The worker replies with the same event objects controllers already consume:
@@ -238,7 +246,13 @@ The worker replies with the same event objects controllers already consume:
 { "type": "agent", "kind": "started", "text": "agy" }
 { "type": "agent", "kind": "assistant", "text": "..." }
 { "type": "agent", "kind": "result", "text": "" }
+{ "type": "agent", "kind": "reset", "requestId": "clear-7", "ok": true }
 ```
+
+For reset, the worker clears name/profile/buffer/resume state, terminates the
+child, and only then acknowledges. The hub suppresses all other events from the
+invalidated session while reset is pending and clears its route on the matching
+acknowledgement.
 
 The broker forwards those events to the bound controller socket without
 changing `type`, `kind`, or payload fields. It may drop an event whose

@@ -109,7 +109,8 @@ The app first sends:
 
 When enabled, the broker responds with detected CLI names in both `agents`
 (for existing clients) and `availableAgents`, the complete adapter list in
-`configuredAgents`, the `workspaceReady` state, and the protocol version. If the
+`configuredAgents`, the `workspaceReady` state, the protocol version, and
+`capabilities.resetSession: true`. If the
 workspace is unprepared and the advanced unmanaged override is absent, `agents`
 is empty and a start request fails closed. The app can then send:
 
@@ -117,6 +118,7 @@ is empty and a start request fails closed. The app can then send:
 { "type": "start", "agent": "claude" }
 { "type": "input", "text": "Review my notebook" }
 { "type": "stop" }
+{ "type": "reset", "requestId": "clear-7" }
 ```
 
 `stop` ends the session: the adapter is deactivated and surface ownership
@@ -127,8 +129,17 @@ session. Controller disconnect destroys that parked ticket, even if the
 same socket later bound a reverse session. A repeated or idle `stop`
 does not forget which controller parked it.
 
+`reset` is distinct from `stop`: it kills any active child and forgets the
+provider resume identifier and adapter identity. The broker replies only after
+that state is cleared and the child is quiesced, using
+`{"type":"agent","kind":"reset","requestId":"clear-7","ok":true}`. A
+correlated failure uses the same event with `ok:false` and `error`. Clients must wait
+for the matching acknowledgement before starting another session. Repeating a
+reset after the state is already empty is safe.
+
 Broker events use `{"type":"agent","kind":...}`. Kinds include `welcome`,
-`started`, `assistant`, `tool_use`, `result`, `stderr`, `error`, and `exit`.
+`started`, `assistant`, `tool_use`, `result`, `stderr`, `error`, `exit`, and
+the request-correlated `reset` acknowledgement.
 Adapter output is normalized, but raw CLI behaviour and privileges remain
 provider-specific.
 
@@ -163,6 +174,7 @@ Disabled unless `BROKER_REVERSE_WORKER=1`. A worker authenticates with a
 **worker** credential distinct from the controller pairing token, registers a
 name and advertised CLIs, and then receives the same `start` / `input` /
 `resize` / `stop` commands controllers already send on `/term` and `/agent`,
+plus request-correlated `/agent` `reset` when `capabilities.resetSession` is true,
 plus hub-only `detach` on `/term` so the worker can start reconnect grace.
 A second authenticated `hello` on the same socket is an error. The worker
 replies with the same `{"type":"term"|"agent","kind":...}` events. The

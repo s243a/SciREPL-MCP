@@ -172,7 +172,7 @@ const AGENT_PROFILES = {
 };
 
 const term = { pty: null, label: null, cols: 80, rows: 24, grace: null };
-const agent = { child: null, profile: null, name: null, buf: '', sessionId: null, sessionAgent: null, mode: null };
+const agent = { child: null, profile: null, name: null, buf: '', sessionId: null, sessionAgent: null, mode: null, resetting: null };
 
 function forgetResumeUnless(name) {
     const owner = agent.sessionAgent || agent.name;
@@ -302,6 +302,10 @@ function parkTerm() {
 }
 
 function startAgent(name) {
+    if (agent.resetting) {
+        send({ type: 'agent', kind: 'error', text: 'agent session reset is still in progress' });
+        return;
+    }
     const prof = AGENT_PROFILES[name];
     if (!prof) { send({ type: 'agent', kind: 'error', text: `unknown agent: ${name}` }); return; }
     if (!AGENTS.includes(name)) { send({ type: 'agent', kind: 'error', text: `agent not advertised: ${name}` }); return; }
@@ -481,9 +485,21 @@ function stopAgent() {
 }
 
 function resetAgent() {
-    stopAgent();
+    if (agent.resetting) return agent.resetting;
+    const child = agent.child;
+    agent.child = null;
+    agent.profile = null;
+    agent.name = null;
+    agent.mode = null;
+    agent.buf = '';
     agent.sessionId = null;
     agent.sessionAgent = null;
+    const operation = terminateChild(child).catch(() => {});
+    const tracked = operation.finally(() => {
+        if (agent.resetting === tracked) agent.resetting = null;
+    });
+    agent.resetting = tracked;
+    return tracked;
 }
 
 function sessionClaim() {
@@ -493,7 +509,7 @@ function sessionClaim() {
     };
 }
 
-async function handleCommand(msg) {
+async function handleCommand(msg, reply = send) {
     if (!msg || typeof msg !== 'object') return;
     if (msg.surface === 'term') {
         if (msg.type === 'start') await startTerm(msg);
@@ -507,6 +523,10 @@ async function handleCommand(msg) {
         if (msg.type === 'start') startAgent(msg.agent || 'claude');
         else if (msg.type === 'input') inputAgent(String(msg.text || ''));
         else if (msg.type === 'stop') stopAgent();
+        else if (msg.type === 'reset' && typeof msg.requestId === 'string' && msg.requestId) {
+            await resetAgent();
+            reply({ type: 'agent', kind: 'reset', requestId: msg.requestId, ok: true });
+        }
     }
 }
 
@@ -515,7 +535,7 @@ function helloPayload() {
         type: 'hello',
         token: TOKEN,
         name: NAME,
-        capabilities: { surfaces: SURFACES, cmds: CMDS, agents: AGENTS },
+        capabilities: { surfaces: SURFACES, cmds: CMDS, agents: AGENTS, resetSession: true },
         sessions: sessionClaim(),
     };
 }
@@ -532,7 +552,7 @@ function connectOnce() {
             if (activeWs === ws) activeWs = null;
             if (!stopping) {
                 parkTerm();
-                resetAgent();
+                void resetAgent();
             }
             if (err) reject(err); else resolve();
         };
@@ -562,7 +582,7 @@ function connectOnce() {
                 try { ws.close(); } catch (_) {}
                 return;
             }
-            handleCommand(msg).catch((e) => {
+            handleCommand(msg, (payload) => sendJson(ws, payload)).catch((e) => {
                 console.error('[reverse-worker] command failed: ' + (e.message || e));
             });
         });
@@ -587,16 +607,9 @@ async function main() {
 async function shutdown() {
     if (stopping) return;
     stopping = true;
-    const child = agent.child;
-    agent.child = null;
-    agent.profile = null;
-    agent.name = null;
-    agent.mode = null;
-    agent.buf = '';
-    agent.sessionId = null;
     try { if (activeWs) activeWs.close(); } catch (_) {}
     stopTerm();
-    await terminateChild(child);
+    await resetAgent();
     process.exit(0);
 }
 

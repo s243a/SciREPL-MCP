@@ -76,7 +76,7 @@ async function connectWorker({ name = 'agy-box', token = WORKER, capabilities, s
         type: 'hello',
         token,
         name,
-        capabilities: capabilities || { surfaces: ['term', 'agent'], cmds: ['shell', 'agy'], agents: ['agy'] },
+        capabilities: capabilities || { surfaces: ['term', 'agent'], cmds: ['shell', 'agy'], agents: ['agy'], resetSession: true },
     };
     if (sessions) hello.sessions = sessions;
     const welcome = onceMessage(ws);
@@ -95,8 +95,8 @@ console.log('Reverse-worker validation helpers\n');
 
 ok(validateWorkerHello({
     type: 'hello', name: 'agy-box',
-    capabilities: { surfaces: ['term', 'agent'], cmds: ['agy'], agents: ['agy'] },
-}).ok === true, 'valid worker hello is accepted');
+    capabilities: { surfaces: ['term', 'agent'], cmds: ['agy'], agents: ['agy'], resetSession: true },
+}).capabilities.resetSession === true, 'valid worker hello advertises agent-session reset');
 ok(validateWorkerHello({
     type: 'hello', name: 'BOX',
     capabilities: { surfaces: ['term'], cmds: ['agy'] },
@@ -518,8 +518,9 @@ try {
 
     const { ws: worker, welcome } = await connectWorker({ name: 'agy-box' });
     const welcomed = await welcome;
-    ok(welcomed.type === 'welcome' && welcomed.protocolVersion === 1 && welcomed.name === 'agy-box',
-        'worker hello is acknowledged with welcome and the registered name');
+    ok(welcomed.type === 'welcome' && welcomed.protocolVersion === 1 && welcomed.name === 'agy-box' &&
+        welcomed.capabilities?.resetSession === true,
+    'worker hello is acknowledged with reset capability and the registered name');
 
     const health1 = await (await fetch(`http://127.0.0.1:${PORT}/health`)).json();
     const listed = health1.workers || [];
@@ -597,6 +598,12 @@ try {
         } else if (msg.surface === 'agent' && msg.type === 'input') {
             worker.send(JSON.stringify({ type: 'agent', kind: 'assistant', text: 'pong:' + msg.text }));
             worker.send(JSON.stringify({ type: 'agent', kind: 'result', text: '' }));
+        } else if (msg.surface === 'agent' && msg.type === 'reset') {
+            worker.send(JSON.stringify({ type: 'agent', kind: 'assistant', text: 'late-before-reset-ack' }));
+            setTimeout(() => {
+                worker.send(JSON.stringify({ type: 'agent', kind: 'reset', requestId: msg.requestId, ok: true }));
+                worker.send(JSON.stringify({ type: 'agent', kind: 'assistant', text: 'late-after-reset-ack' }));
+            }, 30);
         }
     });
 
@@ -621,8 +628,9 @@ try {
 
     const agent = await connectController('/agent');
     const agentWelcome = await agent.first;
-    ok(agentWelcome.kind === 'welcome' && (agentWelcome.agents || []).includes('agy'),
-        '/agent welcome lists the reverse worker\'s advertised agents');
+    ok(agentWelcome.kind === 'welcome' && agentWelcome.capabilities?.resetSession === true &&
+        (agentWelcome.agents || []).includes('agy'),
+    '/agent welcome lists the reverse worker and reset capability');
     const agentEvents = collectUntil(agent.ws, (m) => m.kind === 'result');
     agent.ws.send(JSON.stringify({ type: 'start', agent: 'agy' }));
     await sleep(50);
@@ -632,6 +640,24 @@ try {
         '/agent started is unchanged except for a broker-authored via worker name');
     ok(agentGot.some(m => m.kind === 'assistant' && m.text === 'pong:ping') && agentGot.some(m => m.kind === 'result'),
         '/agent input/assistant/result round-trips through the reverse worker');
+
+    const afterReset = [];
+    const recordAfterReset = (buf) => {
+        try { afterReset.push(JSON.parse(buf.toString())); } catch (_) {}
+    };
+    agent.ws.on('message', recordAfterReset);
+    const resetAck = collectUntil(agent.ws, (m) => m.kind === 'reset' && m.requestId === 'reverse-clear-1');
+    agent.ws.send(JSON.stringify({ type: 'reset', requestId: 'reverse-clear-1' }));
+    agent.ws.send(JSON.stringify({ type: 'reset', requestId: 'reverse-clear-1' }));
+    await resetAck;
+    await sleep(80);
+    agent.ws.off('message', recordAfterReset);
+    ok(forwarded.filter(m => m.type === 'reset' && m.requestId === 'reverse-clear-1').length === 1,
+        'duplicate pending reset is idempotent and is relayed once');
+    ok(afterReset.some(m => m.kind === 'reset' && m.requestId === 'reverse-clear-1' && m.ok === true) &&
+        !afterReset.some(m => /late-(before|after)-reset-ack/.test(m.text || '')) &&
+        reverseWorkerHub.hasSession('agent') === false,
+    'correlated reset ack clears routing and suppresses late child events');
 
     try { term.ws.close(); } catch (_) {}
     try { agent.ws.close(); } catch (_) {}
@@ -1104,6 +1130,72 @@ function waitShimWelcome(child, label, timeoutMs = 5000) {
     });
 }
 
+console.log('\nReal reverse-worker session reset\n');
+let resetShim, resetController;
+try {
+    const binDir = path.join(testRoot, 'reset-bin');
+    const fixture = path.join(binDir, 'codex-reset-fixture.mjs');
+    const argsFile = path.join(testRoot, 'reset-codex-args.jsonl');
+    fs.mkdirSync(binDir, { recursive: true });
+    fs.writeFileSync(fixture, `import fs from 'node:fs';
+fs.appendFileSync(${JSON.stringify(path.join(testRoot, 'reset-codex-args.jsonl'))}, JSON.stringify(process.argv.slice(3)) + '\\n');
+process.stdout.write(JSON.stringify({ type: 'thread.started', thread_id: 'captured-reset-thread' }) + '\\n');
+process.stdout.write(JSON.stringify({ type: 'turn.completed' }) + '\\n');
+`);
+    writeCliWrapper(binDir, 'codex', fixture);
+    resetShim = spawn(process.execPath, [
+        path.join(packageDir, 'scripts', 'reverse-worker.mjs'),
+        '--url', `ws://127.0.0.1:${PORT}/worker`,
+        '--token-file', workerTokenFile,
+        '--name', 'reset-box',
+        '--surfaces', 'agent',
+        '--agents', 'codex',
+        '--cwd', process.env.BROKER_WORKSPACE,
+    ], {
+        cwd: packageDir,
+        env: { ...process.env, PATH: `${binDir}${path.delimiter}${process.env.PATH || ''}` },
+        stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    await waitShimWelcome(resetShim, 'reset shim');
+    resetController = await connectController('/agent');
+    const resetWelcome = await resetController.first;
+    ok(resetWelcome.capabilities?.resetSession === true,
+        'controller sees resetSession support with a real reverse worker');
+
+    const firstStarted = collectUntil(resetController.ws, (m) => m.kind === 'started' && m.text === 'codex');
+    resetController.ws.send(JSON.stringify({ type: 'start', agent: 'codex' }));
+    await firstStarted;
+    const firstResult = collectUntil(resetController.ws, (m) => m.kind === 'result');
+    resetController.ws.send(JSON.stringify({ type: 'input', text: 'first turn' }));
+    await firstResult;
+
+    resetController.ws.send(JSON.stringify({ type: 'stop' }));
+    await sleep(50);
+    const ack = collectUntil(resetController.ws, (m) => m.kind === 'reset' && m.requestId === 'real-shim-clear');
+    resetController.ws.send(JSON.stringify({ type: 'reset', requestId: 'real-shim-clear' }));
+    const acked = await ack;
+    ok(acked.some(m => m.kind === 'reset' && m.requestId === 'real-shim-clear' && m.ok === true),
+        'real shim acknowledges reset after clearing its parked agent state');
+
+    const secondStarted = collectUntil(resetController.ws, (m) => m.kind === 'started' && m.text === 'codex');
+    resetController.ws.send(JSON.stringify({ type: 'start', agent: 'codex' }));
+    await secondStarted;
+    const secondResult = collectUntil(resetController.ws, (m) => m.kind === 'result');
+    resetController.ws.send(JSON.stringify({ type: 'input', text: 'second turn' }));
+    await secondResult;
+    const invocations = fs.readFileSync(argsFile, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+    ok(invocations.length === 2 && !invocations[1].includes('resume') &&
+        !invocations[1].includes('captured-reset-thread'),
+    'post-reset turn starts fresh instead of resuming the captured provider session');
+} catch (e) {
+    console.log('  ✗ real-reset-shim error: ' + (e.stack || e));
+    failed++;
+} finally {
+    try { resetController?.ws.close(); } catch (_) {}
+    try { resetShim?.kill('SIGTERM'); } catch (_) {}
+    await sleep(150);
+}
+
 console.log('\nDuplicate real shims fail closed\n');
 let first, second;
 try {
@@ -1517,8 +1609,7 @@ try {
         try { b.ws.close(); } catch (_) {}
         const waitClear = Date.now() + 1000;
         while (agentBridge.occupied() && Date.now() < waitClear) await sleep(20);
-        agentBridge.reset();
-        await sleep(50);
+        await agentBridge.reset();
     }
 
     await assertStopReleases('codex', 'one-shot Codex');
@@ -1548,8 +1639,7 @@ try {
         'starting a different provider after Stop does not reuse the parked session');
     try { aResume.ws.close(); } catch (_) {}
     try { bSwitch.ws.close(); } catch (_) {}
-    agentBridge.reset();
-    await sleep(50);
+    await agentBridge.reset();
 
     const binDir = path.join(testRoot, 'stop-bin');
     const fakeScript = path.join(binDir, 'sleep-cli.mjs');
@@ -1562,12 +1652,12 @@ try {
         await assertStopReleases('claude', 'persistent Claude');
     } finally {
         process.env.PATH = prevPath;
-        agentBridge.reset();
+        await agentBridge.reset();
     }
 } catch (e) {
     console.log('  ✗ local-stop-release error: ' + (e.stack || e));
     failed++;
-    try { agentBridge.reset(); } catch (_) {}
+    try { await agentBridge.reset(); } catch (_) {}
 }
 
 console.log('\nParked resume does not survive controller disconnect\n');
@@ -1580,8 +1670,7 @@ try {
         ok(agentBridge.sessionId === null && agentBridge.sessionAgent === null,
             `${label}: later local start receives no prior resume context`);
         try { later.ws.close(); } catch (_) {}
-        agentBridge.reset();
-        await sleep(50);
+        await agentBridge.reset();
     }
 
     const { ws: agyWorker, welcome: agyWelcome } = await connectWorker({
@@ -1670,7 +1759,7 @@ try {
 } catch (e) {
     console.log('  ✗ parked-resume-disconnect error: ' + (e.stack || e));
     failed++;
-    try { agentBridge.reset(); } catch (_) {}
+    try { await agentBridge.reset(); } catch (_) {}
 }
 
 ok(reverseWorkerHub.enabled === true, 'imported broker exposed the reverse-worker hub');

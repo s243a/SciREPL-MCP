@@ -19,7 +19,7 @@ export const WORKER_NAME_RE = /^[a-z][a-z0-9_-]{0,63}$/;
 export const KNOWN_TERM_CMDS = Object.freeze(['shell', 'claude', 'codex', 'gemini', 'agy']);
 export const KNOWN_AGENTS = Object.freeze(['claude', 'codex', 'gemini', 'agy']);
 export const TERM_EVENT_KINDS = Object.freeze(['started', 'data', 'exit', 'error']);
-export const AGENT_EVENT_KINDS = Object.freeze(['started', 'assistant', 'tool_use', 'result', 'stderr', 'error', 'exit']);
+export const AGENT_EVENT_KINDS = Object.freeze(['started', 'assistant', 'tool_use', 'result', 'stderr', 'error', 'exit', 'reset']);
 export const CHILD_ENV_ALLOWLIST = Object.freeze([
     'HOME', 'PATH', 'SHELL', 'USER', 'LOGNAME', 'TMPDIR', 'TMP', 'TEMP',
     'LANG', 'LANGUAGE', 'COLORTERM', 'TERM', 'PREFIX', 'ANDROID_ROOT',
@@ -235,7 +235,7 @@ export function validateWorkerHello(msg) {
             }
         }
     }
-    return { ok: true, name: msg.name, capabilities: { surfaces, cmds, agents }, sessions };
+    return { ok: true, name: msg.name, capabilities: { surfaces, cmds, agents, resetSession: capabilities.resetSession === true }, sessions };
 }
 
 export function controllerCommand(surface, msg) {
@@ -296,6 +296,7 @@ export function createReverseWorkerHub({
 } = {}) {
     const workers = new Map();
     const sessions = { term: null, agent: null };
+    let parkedAgent = null;
     const wss = enabled
         ? new WebSocketServer({ noServer: true, maxPayload: maxPayloadBytes, perMessageDeflate: false })
         : null;
@@ -306,6 +307,7 @@ export function createReverseWorkerHub({
             surfaces: [...worker.capabilities.surfaces],
             cmds: [...worker.capabilities.cmds],
             agents: [...worker.capabilities.agents],
+            resetSession: worker.capabilities.resetSession,
         }));
     }
 
@@ -430,6 +432,7 @@ export function createReverseWorkerHub({
         if (!worker) return;
         if (workers.get(worker.name) !== worker) return;
         workers.delete(worker.name);
+        if (parkedAgent?.worker === worker) parkedAgent = null;
         audit(`worker '${auditSafeIdentity(worker.name)}' disconnected`);
         for (const surface of ['term', 'agent']) {
             const session = sessions[surface];
@@ -442,6 +445,23 @@ export function createReverseWorkerHub({
         const surface = msg.type;
         const session = sessions[surface];
         if (!session || session.worker !== worker) return;
+        if (surface === 'agent' && msg.kind === 'reset') {
+            if (!session.resetRequestId || msg.requestId !== session.resetRequestId) return;
+            const requestId = session.resetRequestId;
+            const controllerWs = session.controllerWs;
+            if (msg.ok === true) {
+                sessions.agent = null;
+                parkedAgent = null;
+                sendJson(controllerWs, { type: 'agent', kind: 'reset', requestId, ok: true }, maxPayloadBytes);
+                audit(`agent session reset via worker '${auditSafeIdentity(worker.name)}'`);
+            } else {
+                session.resetRequestId = null;
+                sendJson(controllerWs, { type: 'agent', kind: 'reset', requestId, ok: false, error: typeof msg.error === 'string' ? msg.error : 'reverse worker reset failed' }, maxPayloadBytes);
+            }
+            return;
+        }
+        // Once reset begins, no output from the invalidated child is current.
+        if (surface === 'agent' && session.resetRequestId) return;
         const { via: _ignored, ...rest } = msg;
         const outbound = rest.kind === 'started' ? { ...rest, via: worker.name } : rest;
         sendController(session, outbound);
@@ -495,7 +515,7 @@ export function createReverseWorkerHub({
                     authenticated();
                     authed = true;
                     watchWorkerLiveness(ws);
-                    sendJson(ws, { type: 'welcome', protocolVersion, name: parsed.name }, maxPayloadBytes);
+                    sendJson(ws, { type: 'welcome', protocolVersion, name: parsed.name, capabilities: { resetSession: true } }, maxPayloadBytes);
                     return;
                 }
                 if (!authed) return;
@@ -522,6 +542,7 @@ export function createReverseWorkerHub({
 
     function bindAndStart(surface, controllerWs, msg, worker, requested) {
         sessions[surface] = { worker, workerName: worker.name, controllerWs, requested };
+        if (surface === 'agent') parkedAgent = null;
         auditRequested(surface, requested, worker.name);
         const command = controllerCommand(surface, { ...msg, type: 'start' });
         if (command) forwardToWorker(worker, command);
@@ -551,6 +572,10 @@ export function createReverseWorkerHub({
             : String(msg.agent || 'claude').trim();
         const existing = sessions[surface];
         if (existing) {
+            if (surface === 'agent' && existing.resetRequestId) {
+                sendJson(controllerWs, { type: 'agent', kind: 'error', text: 'agent session reset is still in progress' }, maxPayloadBytes);
+                return true;
+            }
             if (existing.requested === requested && workerHandles(existing.worker, surface, requested)) {
                 existing.controllerWs = controllerWs;
                 auditRequested(surface, requested, existing.workerName || existing.worker.name);
@@ -583,6 +608,10 @@ export function createReverseWorkerHub({
         const session = sessions[surface];
         if (!session) return false;
         if (rejectForeignController(surface, controllerWs)) return true;
+        if (surface === 'agent' && session.resetRequestId) {
+            sendJson(controllerWs, { type: 'agent', kind: 'error', text: 'agent session reset is still in progress' }, maxPayloadBytes);
+            return true;
+        }
         session.controllerWs = controllerWs;
         if (!session.worker || !socketOpen(session.worker.ws)) {
             dropSession(surface, { notify: true });
@@ -598,12 +627,54 @@ export function createReverseWorkerHub({
         const session = sessions[surface];
         if (!session) return false;
         if (rejectForeignController(surface, controllerWs)) return true;
+        if (surface === 'agent' && session.resetRequestId) {
+            sendJson(controllerWs, { type: 'agent', kind: 'error', text: 'agent session reset is still in progress' }, maxPayloadBytes);
+            return true;
+        }
         session.controllerWs = controllerWs;
         if (session.worker && socketOpen(session.worker.ws)) {
             forwardToWorker(session.worker, { type: 'stop', surface });
         }
         auditStopRequested(surface, session.requested, session.workerName);
+        if (surface === 'agent') parkedAgent = { ...session, controllerWs };
         sessions[surface] = null;
+        return true;
+    }
+
+    function tryResetAgent(controllerWs, requestId) {
+        if (!enabled) return false;
+        let session = sessions.agent;
+        if (!session && parkedAgent) {
+            session = { ...parkedAgent, controllerWs };
+            parkedAgent = null;
+            sessions.agent = session;
+        }
+        if (!session) return false;
+        if (session.controllerWs && session.controllerWs !== controllerWs && socketOpen(session.controllerWs)) {
+            sendJson(controllerWs, { type: 'agent', kind: 'reset', requestId, ok: false, error: 'agent session is already owned by another controller' }, maxPayloadBytes);
+            return true;
+        }
+        session.controllerWs = controllerWs;
+        if (!session.worker || !socketOpen(session.worker.ws)) {
+            sessions.agent = null;
+            sendJson(controllerWs, { type: 'agent', kind: 'reset', requestId, ok: false, error: 'reverse worker disconnected before reset' }, maxPayloadBytes);
+            return true;
+        }
+        if (!session.worker.capabilities.resetSession) {
+            sendJson(controllerWs, { type: 'agent', kind: 'reset', requestId, ok: false, error: 'reverse worker does not support agent session reset' }, maxPayloadBytes);
+            return true;
+        }
+        if (session.resetRequestId) {
+            if (session.resetRequestId !== requestId) {
+                sendJson(controllerWs, { type: 'agent', kind: 'reset', requestId, ok: false, error: 'another agent session reset is already in progress' }, maxPayloadBytes);
+            }
+            return true;
+        }
+        session.resetRequestId = requestId;
+        if (!forwardToWorker(session.worker, { type: 'reset', surface: 'agent', requestId })) {
+            sessions.agent = null;
+            sendJson(controllerWs, { type: 'agent', kind: 'reset', requestId, ok: false, error: 'reverse worker disconnected before reset' }, maxPayloadBytes);
+        }
         return true;
     }
 
@@ -616,6 +687,7 @@ export function createReverseWorkerHub({
                 forwardToWorker(session.worker, { type: 'stop', surface: 'agent' });
             }
             auditStopRequested(surface, session.requested, session.workerName);
+            parkedAgent = { ...session, controllerWs: null };
             sessions.agent = null;
             return true;
         }
@@ -645,6 +717,7 @@ export function createReverseWorkerHub({
         tryStart,
         tryRelay,
         tryStop,
+        tryResetAgent,
         detach,
         _workers: workers,
         _sessions: sessions,

@@ -423,6 +423,35 @@ setInterval(() => {}, 1000);
         'Windows taskkill failure rejects conservatively instead of claiming tree quiescence');
 }
 
+{
+    const leader = new EventEmitter();
+    leader.pid = 424244;
+    leader.exitCode = null;
+    leader.signalCode = null;
+    leader.stdout = { destroyed: false, readableEnded: false };
+    leader.stderr = { destroyed: false, readableEnded: false };
+    leader.kill = () => true;
+    const taskkill = new EventEmitter();
+    const terminated = terminateChild(leader, 10, {
+        platform: 'win32',
+        spawnTaskkill() { return taskkill; },
+        failureMs: 100,
+    });
+    leader.exitCode = 0;
+    leader.emit('exit', 0, null);
+    taskkill.emit('close', 128);
+    const beforeStdioClose = await Promise.race([
+        terminated.then(() => 'resolved'),
+        sleep(30).then(() => 'pending'),
+    ]);
+    leader.stdout.destroyed = true;
+    leader.stderr.destroyed = true;
+    leader.emit('close', 0, null);
+    await terminated;
+    ok(beforeStdioClose === 'pending',
+        'Windows PID-not-found waits for child stdio close before accepting natural wrapper exit');
+}
+
 ok(workerWebSocketUrl('127.0.0.1', 8087) === 'ws://127.0.0.1:8087/worker',
     'worker URL leaves IPv4 hosts unbracketed');
 ok(workerWebSocketUrl('::1', 8087) === 'ws://[::1]:8087/worker',

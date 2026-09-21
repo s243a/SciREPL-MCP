@@ -100,7 +100,10 @@ export function terminateChild(child, graceMs = 1000, {
     return new Promise((resolve, reject) => {
         let settled = false;
         let leaderExited = initiallyExited;
+        let stdioClosed = initiallyExited && [child.stdout, child.stderr]
+            .every(stream => !stream || stream.destroyed || stream.readableEnded);
         let treeKillSucceeded = platform !== 'win32' || !pid;
+        let treeKillTargetMissing = false;
         let killTimer;
         let failureTimer;
         let pollTimer;
@@ -114,6 +117,7 @@ export function terminateChild(child, graceMs = 1000, {
             clearInterval(pollTimer);
             child.off('exit', onExit);
             child.off('error', onExit);
+            child.off('close', onClose);
         };
         const finish = () => {
             if (settled) return;
@@ -122,15 +126,30 @@ export function terminateChild(child, graceMs = 1000, {
             resolve();
         };
         const maybeFinish = () => {
-            if (leaderExited && treeKillSucceeded && !groupAlive()) finish();
+            // taskkill returns 128 when a fast Windows wrapper exits before it
+            // can enumerate the PID. In that narrow case, wait for ChildProcess
+            // close as well: unlike exit, close is held until inherited stdio
+            // handles from ordinary descendants are gone. Other taskkill
+            // failures remain fail-closed.
+            const windowsMissingButClosed = platform === 'win32' &&
+                treeKillTargetMissing && leaderExited && stdioClosed;
+            if (leaderExited && (treeKillSucceeded || windowsMissingButClosed) && !groupAlive()) finish();
         };
         const onExit = () => {
             leaderExited = true;
             maybeFinish();
         };
+        const onClose = () => {
+            leaderExited = true;
+            stdioClosed = true;
+            maybeFinish();
+        };
         if (!initiallyExited) {
             child.once('exit', onExit);
             child.once('error', onExit);
+        }
+        if (!stdioClosed) {
+            child.once('close', onClose);
         }
         if (leaderExited && treeKillSucceeded && !groupAlive()) {
             finish();
@@ -148,6 +167,7 @@ export function terminateChild(child, graceMs = 1000, {
                     // /t completion before Reset may acknowledge quiescence.
                     killer.once('close', (code) => {
                         if (code === 0) treeKillSucceeded = true;
+                        else if (code === 128) treeKillTargetMissing = true;
                         maybeFinish();
                     });
                     killer.once('error', () => {});

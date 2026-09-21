@@ -168,7 +168,7 @@ if (process.platform !== 'win32') {
     } catch (error) {
         ok(false, error.stack || String(error));
     } finally {
-        try { agentBridge.reset(); } catch (_) {}
+        try { await agentBridge.reset(); } catch (_) {}
         try { ws.terminate(); } catch (_) {}
         await new Promise(resolve => httpServer.close(resolve));
         fs.rmSync(testRoot, { recursive: true, force: true });

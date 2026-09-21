@@ -19,6 +19,7 @@ Configuration is read from environment variables when the broker starts.
 | `BROKER_MAX_TERM_WS_PAYLOAD_BYTES` | `1048576` | Maximum inbound `/term` message payload. |
 | `BROKER_MAX_WS_CONNECTIONS` | `4` | Connection cap for each WebSocket endpoint. |
 | `BROKER_WS_AUTH_TIMEOUT_MS` | `5000` | Time allowed for a WebSocket client to send an authenticated hello. |
+| `BROKER_AGENT_RESET_TIMEOUT_MS` | `4000` | Maximum time to wait for a reverse worker to acknowledge destructive agent reset before dropping its route and closing it. |
 
 ### Workbook file configuration
 

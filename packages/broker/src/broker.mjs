@@ -27,7 +27,7 @@ import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { ListToolsRequestSchema, CallToolRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import { inspectWorkspace, setupWorkspace, writePrivateFile } from './workspace.mjs';
-import { childProcessEnv, createReverseWorkerHub, loadWorkerToken } from './reverse-worker.mjs';
+import { childProcessEnv, createReverseWorkerHub, loadWorkerToken, terminateChild } from './reverse-worker.mjs';
 import { truncateCodePoints } from './utf8-pipes.mjs';
 import { finalizeAfterStdioClose, spawnUtf8Child } from './spawn-child.mjs';
 import { createWorkbookFileTransfer } from './workbook-files.mjs';
@@ -217,6 +217,9 @@ const TERM_GRACE_MS = integerSetting('BROKER_TERM_GRACE_MS', 600000, 0, 86400000
 // settings are read only when enabled so an unflagged broker ignores typos here.
 const REVERSE_WORKER_ENABLED = process.env.BROKER_REVERSE_WORKER === '1';
 const REVERSE_WORKER_STRICT = REVERSE_WORKER_ENABLED && process.env.BROKER_REVERSE_WORKER_STRICT === '1';
+const AGENT_RESET_TIMEOUT_MS = REVERSE_WORKER_ENABLED
+    ? integerSetting('BROKER_AGENT_RESET_TIMEOUT_MS', 4000, 100, 60000)
+    : 4000;
 const WORKER_TOKEN_INFO = REVERSE_WORKER_ENABLED ? loadWorkerToken({ controllerToken: TOKEN }) : null;
 const WORKER_TOKEN = WORKER_TOKEN_INFO ? WORKER_TOKEN_INFO.value : '';
 const MAX_WORKER_WS_PAYLOAD_BYTES = REVERSE_WORKER_ENABLED
@@ -230,6 +233,7 @@ const reverseWorkerHub = createReverseWorkerHub({
     maxPayloadBytes: MAX_WORKER_WS_PAYLOAD_BYTES,
     maxConnections: MAX_WS_CONNECTIONS,
     authTimeoutMs: WS_AUTH_TIMEOUT_MS,
+    resetTimeoutMs: AGENT_RESET_TIMEOUT_MS,
     sendJson: sendWsJson,
     audit: (msg) => console.log(`[broker] ${msg}`),
 });
@@ -400,10 +404,19 @@ const AGENT_PROFILES = {
 //    redundant start from the app never wipes context. A genuine respawn (crash,
 //    or agent switch back) resumes via the captured session_id. ────────────────
 const agentBridge = {
-    ws: null, child: null, profile: null, name: null, buf: '', sessionId: null, sessionAgent: null, mode: null, stoppedBy: null,
+    ws: null, child: null, profile: null, name: null, buf: '', sessionId: null, sessionAgent: null, mode: null, stoppedBy: null, resetting: null, resetOwner: null, quiescences: new Set(),
     running() { return !!this.child; },
     occupied() { return !!this.child || !!(this.name && this.mode); },
+    hasState() {
+        return this.occupied() || !!this.sessionId || !!this.sessionAgent || !!this.stoppedBy || this.quiescences.size > 0 || !!this.resetting;
+    },
     ownerOpen() { return !!(this.ws && this.ws.readyState === 1); },
+    resetOwnershipError(ws) {
+        if (this.ownerOpen() && this.ws !== ws) return 'agent session is already owned by another controller';
+        if (this.stoppedBy && this.stoppedBy.readyState === 1 && this.stoppedBy !== ws) return 'parked agent session is owned by another controller';
+        if (this.resetting && this.resetOwner !== ws) return 'another agent session reset is already in progress';
+        return null;
+    },
     forgetResumeUnless(name) {
         const owner = this.sessionAgent || this.name;
         if (owner && owner !== name) {
@@ -416,12 +429,47 @@ const agentBridge = {
         this.sessionId = id;
         this.sessionAgent = this.name;
     },
+    _beginQuiescence(child) {
+        if (!child) return Promise.resolve();
+        for (const existing of this.quiescences) {
+            if (existing.child !== child) continue;
+            if (existing.status !== 'failed') return existing.promise;
+            // A prior SIGKILL observation timed out. Keep that failure visible
+            // until Reset retries the same child instead of forgetting it and
+            // falsely reporting an empty bridge.
+            this.quiescences.delete(existing);
+            break;
+        }
+        const record = { child, status: 'pending', error: null, promise: null };
+        record.promise = terminateChild(child).then(() => {
+            record.status = 'fulfilled';
+            this.quiescences.delete(record);
+        }, (error) => {
+            record.status = 'failed';
+            record.error = error;
+            throw error;
+        });
+        // Stop is synchronous at the protocol layer. Keep the observed exit
+        // promise for Reset, while avoiding an unhandled rejection if no Reset
+        // follows before shutdown.
+        record.promise.catch(() => {});
+        this.quiescences.add(record);
+        return record.promise;
+    },
     killChild() {
-        if (!this.child) return;
-        try { this.child.kill('SIGTERM'); } catch (_) {}
+        if (!this.child) return Promise.resolve();
+        const child = this.child;
         this.child = null;
+        return this._beginQuiescence(child);
     },
     start(ws, name) {
+        if (this.resetting || this.quiescences.size > 0) {
+            const text = this.resetting
+                ? 'agent session reset is still in progress'
+                : 'previous agent process has not quiesced — retry Reset before starting another agent';
+            sendWsJson(ws, { type: 'agent', kind: 'error', text }, MAX_AGENT_BUFFER_BYTES);
+            return;
+        }
         if (!AGENT_ENABLED) { sendWsJson(ws, { type: 'agent', kind: 'error', text: 'remote agents disabled — restart with BROKER_AGENT=1 after reviewing the host-access warning' }, MAX_AGENT_BUFFER_BYTES); return; }
         const workspaceProblem = agentWorkspaceProblem();
         if (workspaceProblem) { sendWsJson(ws, { type: 'agent', kind: 'error', text: workspaceProblem }, MAX_AGENT_BUFFER_BYTES); return; }
@@ -451,7 +499,13 @@ const agentBridge = {
         const resume = this.sessionId || null; // respawn of the same agent → resume context
         let child;
         try {
-            child = spawnUtf8Child(prof.cmd, prof.args({ resume }), { env, cwd: AGENT_CWD, stdio: ['pipe', 'pipe', 'pipe'] });
+            child = spawnUtf8Child(prof.cmd, prof.args({ resume }), {
+                env,
+                cwd: AGENT_CWD,
+                stdio: ['pipe', 'pipe', 'pipe'],
+                detached: process.platform !== 'win32',
+                windowsHide: true,
+            });
         } catch (e) {
             sendWsJson(ws, { type: 'agent', kind: 'error', text: `spawn failed: ${e.message}` }, MAX_AGENT_BUFFER_BYTES); return;
         }
@@ -462,7 +516,7 @@ const agentBridge = {
             const chunk = d;
             if (Buffer.byteLength(this.buf) + Buffer.byteLength(chunk) > MAX_AGENT_BUFFER_BYTES) {
                 this.child = null;
-                try { child.kill('SIGTERM'); } catch (_) {}
+                this._beginQuiescence(child);
                 send({ kind: 'error', text: `agent output exceeded ${MAX_AGENT_BUFFER_BYTES} bytes without a complete event` });
                 send({ kind: 'exit', code: null });
                 return;
@@ -512,7 +566,15 @@ const agentBridge = {
         const prof = this.profile, ws = this.ws;
         const send = (m) => this.ws === ws && sendWsJson(ws, { type: 'agent', ...m }, MAX_AGENT_BUFFER_BYTES);
         let child;
-        try { child = spawnUtf8Child(prof.cmd, prof.buildArgs(text, this.sessionId), { env: spawnEnv(), cwd: AGENT_CWD, stdio: ['ignore', 'pipe', 'pipe'] }); }
+        try {
+            child = spawnUtf8Child(prof.cmd, prof.buildArgs(text, this.sessionId), {
+                env: spawnEnv(),
+                cwd: AGENT_CWD,
+                stdio: ['ignore', 'pipe', 'pipe'],
+                detached: process.platform !== 'win32',
+                windowsHide: true,
+            });
+        }
         catch (e) { send({ kind: 'error', text: 'spawn failed: ' + (e.message || e) }); send({ kind: 'result', text: '' }); return false; }
         this.child = child; this.buf = ''; let sawResult = false;
         if (prof.format === 'text') {
@@ -523,7 +585,7 @@ const agentBridge = {
                 const chunk = d;
                 if (Buffer.byteLength(this.buf) + Buffer.byteLength(chunk) > MAX_AGENT_BUFFER_BYTES) {
                     this.child = null;
-                    try { child.kill('SIGTERM'); } catch (_) {}
+                    this._beginQuiescence(child);
                     send({ kind: 'error', text: `agent output exceeded ${MAX_AGENT_BUFFER_BYTES} bytes` });
                     send({ kind: 'result', text: '' });
                     return;
@@ -557,7 +619,7 @@ const agentBridge = {
             const chunk = d;
             if (Buffer.byteLength(this.buf) + Buffer.byteLength(chunk) > MAX_AGENT_BUFFER_BYTES) {
                 this.child = null;
-                try { child.kill('SIGTERM'); } catch (_) {}
+                this._beginQuiescence(child);
                 send({ kind: 'error', text: `agent output exceeded ${MAX_AGENT_BUFFER_BYTES} bytes without a complete event` });
                 send({ kind: 'result', text: '' });
                 return;
@@ -603,9 +665,12 @@ const agentBridge = {
         this.buf = '';
         if (had) console.log('[broker] agent stopped');
     },
-    reset() {
+    reset(owner = null) {
+        if (this.resetting) return this.resetting;
         const had = this.occupied();
-        this.killChild();
+        const child = this.child;
+        this.child = null;
+        if (child) this._beginQuiescence(child);
         this.ws = null;
         this.profile = null;
         this.name = null;
@@ -614,7 +679,22 @@ const agentBridge = {
         this.sessionId = null;
         this.sessionAgent = null;
         this.stoppedBy = null;
-        if (had) console.log('[broker] agent stopped');
+        this.resetOwner = owner;
+        // Failed termination observations remain tracked and are attempted again
+        // by the next Reset. Fulfilled records remove themselves immediately.
+        const operations = [...this.quiescences].map(record =>
+            record.status === 'failed' ? this._beginQuiescence(record.child) : record.promise);
+        const operation = Promise.all(operations);
+        const tracked = operation.finally(() => {
+            if (this.resetting === tracked) {
+                this.resetting = null;
+                this.resetOwner = null;
+            }
+            if (had) console.log('[broker] agent session reset');
+        });
+        tracked.catch(() => {});
+        this.resetting = tracked;
+        return tracked;
     },
 };
 
@@ -970,6 +1050,7 @@ wss.on('connection', (ws) => {
 //   The broker streams normalized {type:'agent',kind,...} events back.
 agentWss.on('connection', (ws) => {
     let authed = false;
+    let pendingReset = null;
     const authenticated = authDeadline(ws);
     ws.on('message', (buf) => {
         let msg; try { msg = JSON.parse(buf.toString()); } catch { return; }
@@ -994,11 +1075,19 @@ agentWss.on('connection', (ws) => {
                 ...(AGENT_ENABLED ? availableAgents : []),
                 ...workerAgents,
             ])];
-            sendWsJson(ws, { type: 'agent', kind: 'welcome', protocolVersion: PROTOCOL_VERSION, agents, availableAgents: availableMerged, configuredAgents, workspaceReady, running: agentBridge.running() && agentBridge.name }, MAX_AGENT_BUFFER_BYTES);
+            sendWsJson(ws, { type: 'agent', kind: 'welcome', protocolVersion: PROTOCOL_VERSION, capabilities: { resetSession: true }, agents, availableAgents: availableMerged, configuredAgents, workspaceReady, running: agentBridge.running() && agentBridge.name }, MAX_AGENT_BUFFER_BYTES);
             return;
         }
         if (!authed) return;
         if (msg.type === 'start') {
+            // A failed local termination remains part of the global agent
+            // namespace even if a reverse worker is otherwise available.
+            // Route through the local guard so Start cannot create a second
+            // provider process beside the unquiesced child.
+            if (agentBridge.resetting || agentBridge.quiescences.size > 0) {
+                agentBridge.start(ws, msg.agent || 'claude');
+                return;
+            }
             if (agentBridge.occupied() && agentBridge.ownerOpen() && agentBridge.ws !== ws) {
                 sendWsJson(ws, { type: 'agent', kind: 'error', text: 'agent session is already owned by another controller' }, MAX_AGENT_BUFFER_BYTES);
                 return;
@@ -1036,11 +1125,48 @@ agentWss.on('connection', (ws) => {
                 return;
             }
             agentBridge.stop();
+        } else if (msg.type === 'reset') {
+            const requestId = typeof msg.requestId === 'string' && msg.requestId.length > 0 && Buffer.byteLength(msg.requestId) <= 128
+                ? msg.requestId
+                : null;
+            if (!requestId) {
+                sendWsJson(ws, { type: 'agent', kind: 'error', text: 'reset requires a non-empty requestId of at most 128 bytes' }, MAX_AGENT_BUFFER_BYTES);
+                return;
+            }
+            if (pendingReset) {
+                if (pendingReset.requestId !== requestId) {
+                    sendWsJson(ws, { type: 'agent', kind: 'reset', requestId, ok: false, error: 'another agent session reset is already in progress' }, MAX_AGENT_BUFFER_BYTES);
+                }
+                return;
+            }
+            const localError = agentBridge.resetOwnershipError(ws);
+            const reverseState = reverseWorkerHub.inspectAgentReset(ws);
+            const ownershipError = localError || reverseState.error;
+            if (ownershipError) {
+                sendWsJson(ws, { type: 'agent', kind: 'reset', requestId, ok: false, error: ownershipError }, MAX_AGENT_BUFFER_BYTES);
+                return;
+            }
+            // A controller can accumulate a parked local context and a live or
+            // parked reverse-worker context across routing changes. Clear owns
+            // both namespaces: one acknowledgement is emitted only after every
+            // controller-owned child/context has quiesced.
+            const operation = Promise.all([
+                agentBridge.reset(ws),
+                reverseState.present ? reverseWorkerHub.beginAgentReset(ws, requestId) : Promise.resolve(),
+            ]);
+            pendingReset = { requestId, operation };
+            operation.then(() => {
+                sendWsJson(ws, { type: 'agent', kind: 'reset', requestId, ok: true }, MAX_AGENT_BUFFER_BYTES);
+            }, (error) => {
+                sendWsJson(ws, { type: 'agent', kind: 'reset', requestId, ok: false, error: error?.message || 'agent session reset failed' }, MAX_AGENT_BUFFER_BYTES);
+            }).finally(() => {
+                if (pendingReset?.operation === operation) pendingReset = null;
+            });
         }
     });
     ws.on('close', () => {
         reverseWorkerHub.detach('agent', ws);
-        if (agentBridge.ws === ws || agentBridge.stoppedBy === ws) agentBridge.reset();
+        if (agentBridge.ws === ws || agentBridge.stoppedBy === ws || agentBridge.resetOwner === ws) agentBridge.reset(ws);
     });
 });
 

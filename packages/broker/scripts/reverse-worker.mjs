@@ -172,7 +172,7 @@ const AGENT_PROFILES = {
 };
 
 const term = { pty: null, label: null, cols: 80, rows: 24, grace: null };
-const agent = { child: null, profile: null, name: null, buf: '', sessionId: null, sessionAgent: null, mode: null };
+const agent = { child: null, profile: null, name: null, buf: '', sessionId: null, sessionAgent: null, mode: null, resetting: null, quiescences: new Set() };
 
 function forgetResumeUnless(name) {
     const owner = agent.sessionAgent || agent.name;
@@ -301,7 +301,36 @@ function parkTerm() {
     term.grace = setTimeout(() => { term.grace = null; stopTerm(); }, GRACE_MS);
 }
 
+function beginAgentQuiescence(child) {
+    if (!child) return Promise.resolve();
+    for (const existing of agent.quiescences) {
+        if (existing.child !== child) continue;
+        if (existing.status !== 'failed') return existing.promise;
+        agent.quiescences.delete(existing);
+        break;
+    }
+    const record = { child, status: 'pending', error: null, promise: null };
+    record.promise = terminateChild(child).then(() => {
+        record.status = 'fulfilled';
+        agent.quiescences.delete(record);
+    }, (error) => {
+        record.status = 'failed';
+        record.error = error;
+        throw error;
+    });
+    record.promise.catch(() => {});
+    agent.quiescences.add(record);
+    return record.promise;
+}
+
 function startAgent(name) {
+    if (agent.resetting || agent.quiescences.size > 0) {
+        const text = agent.resetting
+            ? 'agent session reset is still in progress'
+            : 'previous agent process has not quiesced — retry Reset before starting another agent';
+        send({ type: 'agent', kind: 'error', text });
+        return;
+    }
     const prof = AGENT_PROFILES[name];
     if (!prof) { send({ type: 'agent', kind: 'error', text: `unknown agent: ${name}` }); return; }
     if (!AGENTS.includes(name)) { send({ type: 'agent', kind: 'error', text: `agent not advertised: ${name}` }); return; }
@@ -338,7 +367,7 @@ function startAgent(name) {
         const chunk = typeof d === 'string' ? d : d.toString();
         if (Buffer.byteLength(agent.buf) + Buffer.byteLength(chunk) > MAX_AGENT_BUFFER_BYTES) {
             agent.child = null;
-            terminateChild(child);
+            beginAgentQuiescence(child);
             send({ type: 'agent', kind: 'error', text: `agent output exceeded ${MAX_AGENT_BUFFER_BYTES} bytes without a complete event` });
             send({ type: 'agent', kind: 'exit', code: null });
             return;
@@ -389,7 +418,7 @@ function oneshotTurn(text) {
             const chunk = typeof d === 'string' ? d : d.toString();
             if (Buffer.byteLength(agent.buf) + Buffer.byteLength(chunk) > MAX_AGENT_BUFFER_BYTES) {
                 agent.child = null;
-                terminateChild(child);
+                beginAgentQuiescence(child);
                 send({ type: 'agent', kind: 'error', text: `agent output exceeded ${MAX_AGENT_BUFFER_BYTES} bytes` });
                 send({ type: 'agent', kind: 'result', text: '' });
                 return;
@@ -423,7 +452,7 @@ function oneshotTurn(text) {
         const chunk = typeof d === 'string' ? d : d.toString();
         if (Buffer.byteLength(agent.buf) + Buffer.byteLength(chunk) > MAX_AGENT_BUFFER_BYTES) {
             agent.child = null;
-            terminateChild(child);
+            beginAgentQuiescence(child);
             send({ type: 'agent', kind: 'error', text: `agent output exceeded ${MAX_AGENT_BUFFER_BYTES} bytes without a complete event` });
             send({ type: 'agent', kind: 'result', text: '' });
             return;
@@ -468,7 +497,7 @@ function inputAgent(text) {
 function stopAgentChild() {
     const child = agent.child;
     agent.child = null;
-    terminateChild(child);
+    return beginAgentQuiescence(child);
 }
 
 function stopAgent() {
@@ -481,9 +510,27 @@ function stopAgent() {
 }
 
 function resetAgent() {
-    stopAgent();
+    if (agent.resetting) return agent.resetting;
+    const child = agent.child;
+    agent.child = null;
+    if (child) beginAgentQuiescence(child);
+    agent.profile = null;
+    agent.name = null;
+    agent.mode = null;
+    agent.buf = '';
     agent.sessionId = null;
     agent.sessionAgent = null;
+    const operations = [...agent.quiescences].map(record =>
+        record.status === 'failed' ? beginAgentQuiescence(record.child) : record.promise);
+    const operation = Promise.all(operations);
+    const tracked = operation.finally(() => {
+        if (agent.resetting === tracked) {
+            agent.resetting = null;
+        }
+    });
+    tracked.catch(() => {});
+    agent.resetting = tracked;
+    return tracked;
 }
 
 function sessionClaim() {
@@ -493,7 +540,7 @@ function sessionClaim() {
     };
 }
 
-async function handleCommand(msg) {
+async function handleCommand(msg, reply = send) {
     if (!msg || typeof msg !== 'object') return;
     if (msg.surface === 'term') {
         if (msg.type === 'start') await startTerm(msg);
@@ -507,6 +554,20 @@ async function handleCommand(msg) {
         if (msg.type === 'start') startAgent(msg.agent || 'claude');
         else if (msg.type === 'input') inputAgent(String(msg.text || ''));
         else if (msg.type === 'stop') stopAgent();
+        else if (msg.type === 'reset' && typeof msg.requestId === 'string' && msg.requestId) {
+            try {
+                await resetAgent();
+                reply({ type: 'agent', kind: 'reset', requestId: msg.requestId, ok: true });
+            } catch (error) {
+                reply({
+                    type: 'agent',
+                    kind: 'reset',
+                    requestId: msg.requestId,
+                    ok: false,
+                    error: error?.message || 'agent session reset failed',
+                });
+            }
+        }
     }
 }
 
@@ -515,7 +576,7 @@ function helloPayload() {
         type: 'hello',
         token: TOKEN,
         name: NAME,
-        capabilities: { surfaces: SURFACES, cmds: CMDS, agents: AGENTS },
+        capabilities: { surfaces: SURFACES, cmds: CMDS, agents: AGENTS, resetSession: true },
         sessions: sessionClaim(),
     };
 }
@@ -532,7 +593,7 @@ function connectOnce() {
             if (activeWs === ws) activeWs = null;
             if (!stopping) {
                 parkTerm();
-                resetAgent();
+                void resetAgent();
             }
             if (err) reject(err); else resolve();
         };
@@ -562,7 +623,7 @@ function connectOnce() {
                 try { ws.close(); } catch (_) {}
                 return;
             }
-            handleCommand(msg).catch((e) => {
+            handleCommand(msg, (payload) => sendJson(ws, payload)).catch((e) => {
                 console.error('[reverse-worker] command failed: ' + (e.message || e));
             });
         });
@@ -587,16 +648,9 @@ async function main() {
 async function shutdown() {
     if (stopping) return;
     stopping = true;
-    const child = agent.child;
-    agent.child = null;
-    agent.profile = null;
-    agent.name = null;
-    agent.mode = null;
-    agent.buf = '';
-    agent.sessionId = null;
     try { if (activeWs) activeWs.close(); } catch (_) {}
     stopTerm();
-    await terminateChild(child);
+    await resetAgent();
     process.exit(0);
 }
 

@@ -19,7 +19,7 @@ export const WORKER_NAME_RE = /^[a-z][a-z0-9_-]{0,63}$/;
 export const KNOWN_TERM_CMDS = Object.freeze(['shell', 'claude', 'codex', 'gemini', 'agy']);
 export const KNOWN_AGENTS = Object.freeze(['claude', 'codex', 'gemini', 'agy']);
 export const TERM_EVENT_KINDS = Object.freeze(['started', 'data', 'exit', 'error']);
-export const AGENT_EVENT_KINDS = Object.freeze(['started', 'assistant', 'tool_use', 'result', 'stderr', 'error', 'exit']);
+export const AGENT_EVENT_KINDS = Object.freeze(['started', 'assistant', 'tool_use', 'result', 'stderr', 'error', 'exit', 'reset']);
 export const CHILD_ENV_ALLOWLIST = Object.freeze([
     'HOME', 'PATH', 'SHELL', 'USER', 'LOGNAME', 'TMPDIR', 'TMP', 'TEMP',
     'LANG', 'LANGUAGE', 'COLORTERM', 'TERM', 'PREFIX', 'ANDROID_ROOT',
@@ -87,30 +87,106 @@ export function childProcessEnv({ inheritEnv = false, useApiKey = false, source 
     return env;
 }
 
-export function terminateChild(child, graceMs = 1000) {
+export function terminateChild(child, graceMs = 1000, {
+    platform = process.platform,
+    spawnTaskkill = spawn,
+    failureMs = 2000,
+} = {}) {
     if (!child) return Promise.resolve();
     const pid = child.pid;
     const waitMs = Number.isFinite(graceMs) ? Math.max(0, graceMs) : 1000;
-    try {
-        if (process.platform === 'win32') {
-            if (pid) spawn('taskkill', ['/pid', String(pid), '/t', '/f'], { stdio: 'ignore', windowsHide: true });
-            else child.kill();
-        } else if (pid) {
-            try { process.kill(-pid, 'SIGTERM'); } catch (_) { try { child.kill('SIGTERM'); } catch (_) {} }
-        } else {
-            child.kill('SIGTERM');
-        }
-    } catch (_) {}
-    return new Promise((resolve) => {
+    const failureWaitMs = Number.isFinite(failureMs) ? Math.max(0, failureMs) : 2000;
+    const initiallyExited = child.exitCode !== null || child.signalCode !== null;
+    return new Promise((resolve, reject) => {
         let settled = false;
+        let leaderExited = initiallyExited;
+        let stdioClosed = initiallyExited && [child.stdout, child.stderr]
+            .every(stream => !stream || stream.destroyed || stream.readableEnded);
+        let treeKillSucceeded = platform !== 'win32' || !pid;
+        let treeKillTargetMissing = false;
+        let killTimer;
+        let failureTimer;
+        let pollTimer;
+        const groupAlive = () => {
+            if (platform === 'win32' || !pid) return false;
+            try { process.kill(-pid, 0); return true; } catch { return false; }
+        };
+        const cleanup = () => {
+            clearTimeout(killTimer);
+            clearTimeout(failureTimer);
+            clearInterval(pollTimer);
+            child.off('exit', onExit);
+            child.off('error', onExit);
+            child.off('close', onClose);
+        };
         const finish = () => {
             if (settled) return;
             settled = true;
+            cleanup();
             resolve();
         };
-        setTimeout(() => {
+        const maybeFinish = () => {
+            // taskkill returns 128 when a fast Windows wrapper exits before it
+            // can enumerate the PID. In that narrow case, wait for ChildProcess
+            // close as well: unlike exit, close is held until inherited stdio
+            // handles from ordinary descendants are gone. Other taskkill
+            // failures remain fail-closed.
+            const windowsMissingButClosed = platform === 'win32' &&
+                treeKillTargetMissing && leaderExited && stdioClosed;
+            if (leaderExited && (treeKillSucceeded || windowsMissingButClosed) && !groupAlive()) finish();
+        };
+        const onExit = () => {
+            leaderExited = true;
+            maybeFinish();
+        };
+        const onClose = () => {
+            leaderExited = true;
+            stdioClosed = true;
+            maybeFinish();
+        };
+        if (!initiallyExited) {
+            child.once('exit', onExit);
+            child.once('error', onExit);
+        }
+        if (!stdioClosed) {
+            child.once('close', onClose);
+        }
+        if (leaderExited && treeKillSucceeded && !groupAlive()) {
+            finish();
+            return;
+        }
+        try {
+            if (platform === 'win32') {
+                if (pid) {
+                    const killer = spawnTaskkill('taskkill', ['/pid', String(pid), '/t', '/f'], {
+                        stdio: 'ignore',
+                        windowsHide: true,
+                    });
+                    // taskkill owns the descendant-tree guarantee on Windows.
+                    // Leader exit alone is insufficient: wait for successful
+                    // /t completion before Reset may acknowledge quiescence.
+                    killer.once('close', (code) => {
+                        if (code === 0) treeKillSucceeded = true;
+                        else if (code === 128) treeKillTargetMissing = true;
+                        maybeFinish();
+                    });
+                    killer.once('error', () => {});
+                } else {
+                    child.kill();
+                }
+            } else if (pid) {
+                try { process.kill(-pid, 'SIGTERM'); } catch (_) { try { child.kill('SIGTERM'); } catch (_) {} }
+            } else {
+                child.kill('SIGTERM');
+            }
+        } catch (_) {}
+        if (settled) return;
+        // A successful kill() only means that the signal was queued. Reset must
+        // observe process-tree exit before it can promise provider context is gone.
+        killTimer = setTimeout(() => {
+            if (settled) return;
             try {
-                if (process.platform === 'win32') {
+                if (platform === 'win32') {
                     try { child.kill(); } catch (_) {}
                 } else if (pid) {
                     try { process.kill(-pid, 'SIGKILL'); } catch (_) { try { child.kill('SIGKILL'); } catch (_) {} }
@@ -118,9 +194,15 @@ export function terminateChild(child, graceMs = 1000) {
                     try { child.kill('SIGKILL'); } catch (_) {}
                 }
             } catch (_) {}
-            setTimeout(finish, 150);
+            maybeFinish();
+            if (!settled) pollTimer = setInterval(maybeFinish, 20);
         }, waitMs);
-        setTimeout(finish, waitMs + 2000);
+        failureTimer = setTimeout(() => {
+            if (settled) return;
+            settled = true;
+            cleanup();
+            reject(new Error(`child process ${pid || '(unknown pid)'} did not exit after SIGKILL`));
+        }, waitMs + failureWaitMs);
     });
 }
 
@@ -235,7 +317,7 @@ export function validateWorkerHello(msg) {
             }
         }
     }
-    return { ok: true, name: msg.name, capabilities: { surfaces, cmds, agents }, sessions };
+    return { ok: true, name: msg.name, capabilities: { surfaces, cmds, agents, resetSession: capabilities.resetSession === true }, sessions };
 }
 
 export function controllerCommand(surface, msg) {
@@ -291,11 +373,13 @@ export function createReverseWorkerHub({
     maxPayloadBytes,
     maxConnections,
     authTimeoutMs,
+    resetTimeoutMs = 4000,
     sendJson,
     audit = () => {},
 } = {}) {
     const workers = new Map();
     const sessions = { term: null, agent: null };
+    let parkedAgent = null;
     const wss = enabled
         ? new WebSocketServer({ noServer: true, maxPayload: maxPayloadBytes, perMessageDeflate: false })
         : null;
@@ -306,6 +390,7 @@ export function createReverseWorkerHub({
             surfaces: [...worker.capabilities.surfaces],
             cmds: [...worker.capabilities.cmds],
             agents: [...worker.capabilities.agents],
+            resetSession: worker.capabilities.resetSession,
         }));
     }
 
@@ -377,6 +462,14 @@ export function createReverseWorkerHub({
     function dropSession(surface, { notify = false } = {}) {
         const session = sessions[surface];
         if (!session) return;
+        if (surface === 'agent' && session.reset) {
+            const pending = session.reset;
+            session.reset = null;
+            sessions.agent = null;
+            clearTimeout(pending.timer);
+            pending.reject(new Error(`worker '${session.workerName || session.worker?.name || 'unknown'}' disconnected before reset completed`));
+            return;
+        }
         if (notify) notifyWorkerGone(session, surface);
         sessions[surface] = null;
     }
@@ -430,6 +523,7 @@ export function createReverseWorkerHub({
         if (!worker) return;
         if (workers.get(worker.name) !== worker) return;
         workers.delete(worker.name);
+        if (parkedAgent?.worker === worker) parkedAgent = null;
         audit(`worker '${auditSafeIdentity(worker.name)}' disconnected`);
         for (const surface of ['term', 'agent']) {
             const session = sessions[surface];
@@ -442,6 +536,23 @@ export function createReverseWorkerHub({
         const surface = msg.type;
         const session = sessions[surface];
         if (!session || session.worker !== worker) return;
+        if (surface === 'agent' && msg.kind === 'reset') {
+            if (!session.reset || msg.requestId !== session.reset.requestId) return;
+            const pending = session.reset;
+            session.reset = null;
+            clearTimeout(pending.timer);
+            if (msg.ok === true) {
+                sessions.agent = null;
+                parkedAgent = null;
+                pending.resolve();
+                audit(`agent session reset via worker '${auditSafeIdentity(worker.name)}'`);
+            } else {
+                pending.reject(new Error(typeof msg.error === 'string' ? msg.error : 'reverse worker reset failed'));
+            }
+            return;
+        }
+        // Once reset begins, no output from the invalidated child is current.
+        if (surface === 'agent' && session.reset) return;
         const { via: _ignored, ...rest } = msg;
         const outbound = rest.kind === 'started' ? { ...rest, via: worker.name } : rest;
         sendController(session, outbound);
@@ -495,7 +606,7 @@ export function createReverseWorkerHub({
                     authenticated();
                     authed = true;
                     watchWorkerLiveness(ws);
-                    sendJson(ws, { type: 'welcome', protocolVersion, name: parsed.name }, maxPayloadBytes);
+                    sendJson(ws, { type: 'welcome', protocolVersion, name: parsed.name, capabilities: { resetSession: true } }, maxPayloadBytes);
                     return;
                 }
                 if (!authed) return;
@@ -522,6 +633,7 @@ export function createReverseWorkerHub({
 
     function bindAndStart(surface, controllerWs, msg, worker, requested) {
         sessions[surface] = { worker, workerName: worker.name, controllerWs, requested };
+        if (surface === 'agent') parkedAgent = null;
         auditRequested(surface, requested, worker.name);
         const command = controllerCommand(surface, { ...msg, type: 'start' });
         if (command) forwardToWorker(worker, command);
@@ -549,8 +661,22 @@ export function createReverseWorkerHub({
         const requested = surface === 'term'
             ? String(msg.cmd || 'shell').trim()
             : String(msg.agent || 'claude').trim();
+        if (surface === 'agent' && !sessions.agent && parkedAgent) {
+            if (parkedAgent.ownerWs && parkedAgent.ownerWs !== controllerWs && socketOpen(parkedAgent.ownerWs)) {
+                sendJson(controllerWs, { type: 'agent', kind: 'error', text: 'parked agent session is owned by another controller' }, maxPayloadBytes);
+                return true;
+            }
+            sessions.agent = parkedAgent;
+            sessions.agent.controllerWs = controllerWs;
+            sessions.agent.ownerWs = controllerWs;
+            parkedAgent = null;
+        }
         const existing = sessions[surface];
         if (existing) {
+            if (surface === 'agent' && existing.reset) {
+                sendJson(controllerWs, { type: 'agent', kind: 'error', text: 'agent session reset is still in progress' }, maxPayloadBytes);
+                return true;
+            }
             if (existing.requested === requested && workerHandles(existing.worker, surface, requested)) {
                 existing.controllerWs = controllerWs;
                 auditRequested(surface, requested, existing.workerName || existing.worker.name);
@@ -583,6 +709,10 @@ export function createReverseWorkerHub({
         const session = sessions[surface];
         if (!session) return false;
         if (rejectForeignController(surface, controllerWs)) return true;
+        if (surface === 'agent' && session.reset) {
+            sendJson(controllerWs, { type: 'agent', kind: 'error', text: 'agent session reset is still in progress' }, maxPayloadBytes);
+            return true;
+        }
         session.controllerWs = controllerWs;
         if (!session.worker || !socketOpen(session.worker.ws)) {
             dropSession(surface, { notify: true });
@@ -598,25 +728,149 @@ export function createReverseWorkerHub({
         const session = sessions[surface];
         if (!session) return false;
         if (rejectForeignController(surface, controllerWs)) return true;
+        if (surface === 'agent' && session.reset) {
+            sendJson(controllerWs, { type: 'agent', kind: 'error', text: 'agent session reset is still in progress' }, maxPayloadBytes);
+            return true;
+        }
         session.controllerWs = controllerWs;
         if (session.worker && socketOpen(session.worker.ws)) {
             forwardToWorker(session.worker, { type: 'stop', surface });
         }
         auditStopRequested(surface, session.requested, session.workerName);
+        if (surface === 'agent') parkedAgent = { ...session, controllerWs: null, ownerWs: controllerWs };
         sessions[surface] = null;
+        return true;
+    }
+
+    function inspectAgentReset(controllerWs) {
+        if (!enabled) return { present: false, error: null };
+        const session = sessions.agent || parkedAgent;
+        if (!session) return { present: false, error: null };
+        const ownerWs = session.ownerWs || session.controllerWs || session.reset?.controllerWs || null;
+        if (ownerWs && ownerWs !== controllerWs && socketOpen(ownerWs)) {
+            return { present: true, error: 'agent session is already owned by another controller' };
+        }
+        if (session.reset && session.reset.controllerWs && session.reset.controllerWs !== controllerWs) {
+            return { present: true, error: 'another agent session reset is already in progress' };
+        }
+        if (!session.worker || !socketOpen(session.worker.ws)) {
+            return { present: true, error: 'reverse worker disconnected before reset' };
+        }
+        if (!session.worker.capabilities.resetSession) {
+            return { present: true, error: 'reverse worker does not support agent session reset' };
+        }
+        return { present: true, error: null };
+    }
+
+    function beginAgentReset(controllerWs, requestId) {
+        const inspected = inspectAgentReset(controllerWs);
+        if (!inspected.present) return Promise.resolve();
+        if (inspected.error) return Promise.reject(new Error(inspected.error));
+        let session = sessions.agent;
+        if (!session) {
+            session = parkedAgent;
+            parkedAgent = null;
+            sessions.agent = session;
+        }
+        if (session.reset) {
+            if (session.reset.requestId === requestId && session.reset.controllerWs === controllerWs) {
+                return session.reset.promise;
+            }
+            return Promise.reject(new Error('another agent session reset is already in progress'));
+        }
+        session.controllerWs = controllerWs;
+        session.ownerWs = controllerWs;
+        let resolveReset;
+        let rejectReset;
+        const promise = new Promise((resolve, reject) => {
+            resolveReset = resolve;
+            rejectReset = reject;
+        });
+        // Attach a handler immediately because reset may outlive its controller.
+        promise.catch(() => {});
+        session.reset = { requestId, controllerWs, promise, resolve: resolveReset, reject: rejectReset };
+        const reset = session.reset;
+        reset.timer = setTimeout(() => {
+            if (session.reset !== reset) return;
+            session.reset = null;
+            if (sessions.agent === session) sessions.agent = null;
+            if (parkedAgent === session) parkedAgent = null;
+            rejectReset(new Error(`reverse worker reset timed out after ${resetTimeoutMs}ms`));
+            const socket = session.worker?.ws;
+            try { socket?.close(1011, 'agent session reset timed out'); } catch (_) {}
+            setTimeout(() => {
+                if (socketOpen(socket)) {
+                    try { socket.terminate(); } catch (_) {}
+                }
+            }, 100).unref?.();
+        }, resetTimeoutMs);
+        reset.timer.unref?.();
+        if (!forwardToWorker(session.worker, { type: 'reset', surface: 'agent', requestId })) {
+            clearTimeout(reset.timer);
+            session.reset = null;
+            sessions.agent = null;
+            rejectReset(new Error('reverse worker disconnected before reset'));
+        }
+        return promise;
+    }
+
+    function destroyParkedAgent(ownerWs) {
+        if (!parkedAgent || parkedAgent.ownerWs !== ownerWs) return false;
+        const session = parkedAgent;
+        parkedAgent = null;
+        if (!session.worker || !socketOpen(session.worker.ws)) return true;
+        if (!session.worker.capabilities.resetSession) {
+            // An older worker cannot prove that its provider resume token and
+            // process tree were destroyed. Tear down the worker link instead of
+            // silently dropping only the broker-side ticket.
+            try { session.worker.ws.close(1011, 'agent session reset unavailable'); } catch (_) {
+                try { session.worker.ws.terminate(); } catch (_) {}
+            }
+            const socket = session.worker.ws;
+            setTimeout(() => {
+                if (socketOpen(socket)) {
+                    try { socket.terminate(); } catch (_) {}
+                }
+            }, 100).unref?.();
+            return true;
+        }
+        session.controllerWs = null;
+        session.ownerWs = null;
+        sessions.agent = session;
+        const requestId = `disconnect-${crypto.randomUUID()}`;
+        beginAgentReset(null, requestId).catch(() => {
+            // A failed destruction must never become resumable. Closing the worker
+            // invokes its own disconnect cleanup before it can reconnect.
+            if (sessions.agent === session) sessions.agent = null;
+            try { session.worker.ws.close(1011, 'agent session reset failed'); } catch (_) {}
+        });
         return true;
     }
 
     function detach(surface, controllerWs) {
         if (!enabled) return false;
         const session = sessions[surface];
-        if (!session || session.controllerWs !== controllerWs) return false;
+        if (!session || session.controllerWs !== controllerWs) {
+            if (surface === 'agent') return destroyParkedAgent(controllerWs);
+            return false;
+        }
         if (surface === 'agent') {
+            if (session.reset) {
+                const pending = session.reset;
+                session.reset = null;
+                sessions.agent = null;
+                clearTimeout(pending.timer);
+                sendJson(controllerWs, { type: 'agent', kind: 'reset', requestId: pending.requestId, ok: false, error: 'controller disconnected before reset completed' }, maxPayloadBytes);
+                pending.reject(new Error('controller disconnected before reset completed'));
+                return true;
+            }
             if (session.worker && socketOpen(session.worker.ws)) {
                 forwardToWorker(session.worker, { type: 'stop', surface: 'agent' });
             }
             auditStopRequested(surface, session.requested, session.workerName);
+            parkedAgent = { ...session, controllerWs: null, ownerWs: controllerWs };
             sessions.agent = null;
+            destroyParkedAgent(controllerWs);
             return true;
         }
         if (session.worker && socketOpen(session.worker.ws)) {
@@ -645,8 +899,11 @@ export function createReverseWorkerHub({
         tryStart,
         tryRelay,
         tryStop,
+        inspectAgentReset,
+        beginAgentReset,
         detach,
         _workers: workers,
         _sessions: sessions,
+        _parkedAgent: () => parkedAgent,
     };
 }
